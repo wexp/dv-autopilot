@@ -712,6 +712,26 @@ namespace DvMod.Autopilot
                 bool? viaEnd = EndForJunction(viaJunction, destTrack, out var viaError);
                 if (viaError.Length > 0)
                     return Json("error", viaError);
+                // Already standing on the destination, on the VIA side of what the
+                // move is aimed at: the constraint is satisfied by where the train
+                // IS. "Arrive through J-65" is an approach direction, not an order
+                // to leave and come back in - manufacturing a runaround out of it
+                // sent a coupling move on a pointless lap.
+                if (viaEnd != null && destTrack == start)
+                {
+                    double locoSpan = bogies[1].traveller.Span;
+                    double targetSpan = NearestForeignCarSpan(car, start, locoSpan);
+                    if (double.IsNaN(targetSpan))
+                    {
+                        var (lo, hi) = MarkerZone(start);
+                        targetSpan = (lo + hi) / 2.0;
+                    }
+                    bool satisfied = viaEnd.Value
+                        ? locoSpan < targetSpan   // in by the span-0 end, target beyond
+                        : locoSpan > targetSpan;  // in by the far end, target below
+                    if (satisfied)
+                        viaEnd = null; // just drive up the track
+                }
                 if (viaEnd != null)
                 {
                     var viaPath = Routing.FindPath(start, destId, car, viaEnd, arrive, null, reversalPenalty);

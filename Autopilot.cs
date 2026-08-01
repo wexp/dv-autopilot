@@ -142,6 +142,10 @@ namespace DvMod.Autopilot
             /// different ends never block each other.</summary>
             public readonly HashSet<(RailTrack track, RailTrack? via)> claimed =
                 new HashSet<(RailTrack, RailTrack?)>();
+            /// <summary>Junctions this run holds. A junction is ONE exclusive block —
+            /// the frog and all its legs — which is what makes two routes through
+            /// it on different track pairs an actual conflict.</summary>
+            public readonly HashSet<Junction> claimedJunctions = new HashSet<Junction>();
 
             /// <summary>How hard this kind of loco may be driven — see LocoProfiles.
             /// Read once at the start: the settings are edited between runs, not during.</summary>
@@ -209,7 +213,29 @@ namespace DvMod.Autopilot
         // set, short enough that a train crossing the map doesn't lock the whole route.
         // The reservation is a moving window: it follows the train and the rail behind
         // is handed straight back, so a long run holds a few tracks, never its route.
-        private const int ClaimAheadTracks = 8;
+        // Junction blocks: exclusive, one holder. Track claims stay keyed by entry
+        // side; junctions never are — a frog is a frog whichever way you cross it.
+        private static readonly Dictionary<Junction, string> junctionClaims =
+            new Dictionary<Junction, string>();
+
+        // Dispatch-order queueing: a run stopped at a block it could not get says so
+        // here every authority pass; a LATER-dispatched run must not grab that block
+        // out from under it. Entries go stale in a few seconds so a run that moved
+        // on stops blocking anyone.
+        private static readonly Dictionary<object, (int seq, float time)> blockWants =
+            new Dictionary<object, (int, float)>();
+        private const float WantFreshSeconds = 3f;
+
+        // Movement authority: how much rail to hold ahead. Distance-based — enough
+        // to brake from the current speed with headroom — because a count of tracks
+        // means 100 m at a yard throat and 3 km on the main.
+        private const double AuthorityMinMeters = 150.0;
+        private const double AuthorityMaxMeters = 1200.0;
+        private const float AuthorityBrakeFactor = 1.5f;
+        private const double AuthorityPad = 50.0;
+        /// <summary>Stop this far short of the end of held rail, m.</summary>
+        private const double SignalMargin = 10.0;
+
         // A train blocked this long gives its reservations up, so two trains that have
         // each half of a throat cannot sit there holding it against one another, m/s.
         private const float ClaimDeadlockSeconds = 20f;

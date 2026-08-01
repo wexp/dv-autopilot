@@ -379,45 +379,16 @@ namespace DvMod.Autopilot
                     run.detail = $"leg {segment}: rolling on, no direction change";
                 }
 
-                // Queue behind any run that was dispatched earlier and is heading for the
-                // same track. Both driving at one siding ends with them nose to nose in
-                // the throat, each holding rail the other needs; waiting costs a minute
-                // and always resolves.
-                while (RunAheadOfUs(run, out var queuedBehind, out var queueReason))
-                {
-                    overrider.Throttle?.Set(0f);
-                    overrider.Brake?.Set(1f);
-                    run.state = "waiting";
-                    run.detail = $"waiting for {queuedBehind}: {queueReason}";
-                    yield return WaitForSecondsRealtime(1f);
-                }
-                run.state = "driving";
-
-                // Reserve the rail this leg is about to use BEFORE touching a single
-                // switch. Otherwise two autopilots converging on one throat each set it
-                // their own way and meet on the frog.
-                float blockedFor = 0f;
-                while (!ClaimTracks(run, path, s, s + ClaimAheadTracks, out var holder))
-                {
-                    overrider.Throttle?.Set(0f);
-                    overrider.Brake?.Set(1f);
-                    run.state = "waiting";
-                    run.detail = $"waiting for {holder} to clear the junction";
-                    yield return WaitForSecondsRealtime(1f);
-                    if (GamePaused)
-                    {
-                        yield return WaitWhilePaused();
-                        continue; // a pause is not time spent blocked
-                    }
-                    blockedFor += 1f;
-                    // Two trains each holding half a throat would otherwise sit there
-                    // forever: after a while give ours up and let the other move first.
-                    if (blockedFor >= ClaimDeadlockSeconds)
-                    {
-                        ReleaseClaims(run);
-                        blockedFor = 0f;
-                    }
-                }
+                // Signaling model: no waiting at the origin. Take whatever rail is
+                // grantable right now - the drive loop advances to the end of its
+                // authority and creeps forward block by block as the trains ahead
+                // release sections. This one pass is only so the switch-setting
+                // below has something held to set.
+                ExtendAuthority(
+                    run, path, s, track, bogie.traveller.Span,
+                    (reverser >= 0.5f) == (bogie.TrackDirectionSign > 0),
+                    ConsistLengthAhead(car, bogie), AuthorityMinMeters,
+                    out _, out _, out _);
                 run.state = "driving";
 
                 // Set the switches we HOLD, and only those. Setting the whole route at
@@ -428,12 +399,18 @@ namespace DvMod.Autopilot
                 // in DriveLeg, once it is close enough to be ours.
                 bool HeldByUs(int i) =>
                     !claims.TryGetValue((path[i], ViaFor(path, i)), out var g) || g == run.guid;
+                bool JunctionOurs(int i)
+                {
+                    var j = JunctionBetween(path[i], path[i + 1]);
+                    return j == null
+                        || !junctionClaims.TryGetValue(j, out var g) || g == run.guid;
+                }
                 for (int i = s; i < e; i++)
-                    if (HeldByUs(i) && HeldByUs(i + 1))
+                    if (HeldByUs(i) && HeldByUs(i + 1) && JunctionOurs(i))
                         SetSwitchBetween(path[i], path[i + 1]);
                 if (lastLeg)
                     for (int i = 0; i < path.Count - 1; i++)
-                        if (HeldByUs(i) && HeldByUs(i + 1))
+                        if (HeldByUs(i) && HeldByUs(i + 1) && JunctionOurs(i))
                             SetSwitchBetween(path[i], path[i + 1]);
 
                 overrider.Brake?.Set(0f);
@@ -489,6 +466,11 @@ namespace DvMod.Autopilot
             int limitCountdown = 0;
             float cachedLimit = 999f;
             bool cachedNearSwitch = false;
+            double cachedAuthority = double.MaxValue;
+            string cachedAuthorityHolder = "";
+            string cachedAuthorityAt = "";
+            RailTrack? cachedAuthorityBlocked = null;
+            float authorityStallFor = 0f;
             float throttle = 0f;
             float fullPowerFor = 0f;
             float lastSpeedMs = Mathf.Abs(run.car.GetForwardSpeed());
@@ -556,6 +538,23 @@ namespace DvMod.Autopilot
                         track, bogie.traveller.Span, towardOut, ownLeadHint, here, LimitLookahead,
                         run.mode == AutopilotMode.Drive ? DynamicPlanDecel : (float?)null);
                     cachedNearSwitch = NearDivergingSwitch(car, path);
+
+                    // Movement authority: hold enough rail ahead to brake in, with
+                    // headroom; hand back what the tail has cleared and anything an
+                    // older run is stood waiting for. This is the signal aspect the
+                    // speed shaping below drives to.
+                    double needMeters = Math.Min(AuthorityMaxMeters, Math.Max(
+                        AuthorityMinMeters,
+                        (speed / 3.6) * (speed / 3.6) / (2f * StopDecel)
+                            * AuthorityBrakeFactor + AuthorityPad));
+                    int authIdx = IndexNear(path, track, s);
+                    cachedAuthority = ExtendAuthority(
+                        run, path, authIdx, track, bogie.traveller.Span, towardOut,
+                        ownLeadHint, needMeters,
+                        out cachedAuthorityHolder, out cachedAuthorityAt,
+                        out cachedAuthorityBlocked);
+                    ReleaseJunctionsBehind(run, path, Math.Max(0, authIdx));
+                    PreemptWantedBlocks(run);
                 }
                 float limit = cachedLimit;
 
@@ -1004,6 +1003,57 @@ namespace DvMod.Autopilot
                 // Turntables are crossed at walking pace, aligned or not: within
                 // TurntableSlowZone of a bridge (or standing on one), cap hard —
                 // a consist arriving at yard speed cannot stop on a 20 m bridge.
+                // Drive to the end of held rail like a signal at danger: full
+                // speed with authority in hand, braking curve into the boundary,
+                // stand at it, roll again the moment the next block grants.
+                if (cachedAuthority != double.MaxValue)
+                {
+                    float vAuth = ApproachSpeedKmh(
+                        0f, cachedAuthority - SignalMargin, StopDecel);
+                    if (vAuth < target)
+                        target = vAuth;
+                    if (cachedAuthority <= SignalMargin + 2 && speed < 0.5f
+                        && cachedAuthorityAt.Length > 0)
+                    {
+                        run.detail = $"{phase}: held short of {cachedAuthorityAt}"
+                            + (cachedAuthorityHolder.Length > 0
+                                ? $" - {cachedAuthorityHolder} has it" : "");
+                        // A live run ahead releases its blocks as it moves - wait.
+                        // Parked stock fouling the block never will: after a while
+                        // write that road off and go round.
+                        bool liveHolder = false;
+                        foreach (var r in runs.Values)
+                            if (r.coroutine != null && r.id == cachedAuthorityHolder)
+                            {
+                                liveHolder = true;
+                                break;
+                            }
+                        if (!liveHolder)
+                        {
+                            authorityStallFor += DriveTick * LimitRecheckTicks;
+                            if (authorityStallFor >= BlockedGiveUpSeconds
+                                && cachedAuthorityBlocked != null)
+                            {
+                                if (run.avoid.Add(cachedAuthorityBlocked))
+                                {
+                                    run.detail = $"{phase}: {cachedAuthorityAt} is fouled"
+                                        + " - looking for another way round";
+                                    done(true);
+                                    yield break;
+                                }
+                                Finish(run, "error",
+                                    $"{cachedAuthorityAt} is fouled and there is no way round");
+                                done(false);
+                                yield break;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        authorityStallFor = 0f;
+                    }
+                }
+
                 bool nearBridge = lead != null
                     ? Turntables.NearBridge(
                         car, lead.Value.bogie.track, lead.Value.bogie.traveller.Span,
@@ -1087,7 +1137,6 @@ namespace DvMod.Autopilot
                 if (pathIdx >= 0)
                 {
                     run.pathFrom = pathIdx; // rail before this is behind us now
-                    ClaimTracks(run, path, pathIdx, pathIdx + ClaimAheadTracks, out _);
                     ReleaseClaimsBehind(run, path, pathIdx);
                 }
 

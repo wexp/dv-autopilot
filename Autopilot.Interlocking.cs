@@ -20,48 +20,6 @@ namespace DvMod.Autopilot
         /* -------------------------------------------------- interlocking -- */
 
         /// <summary>
-        /// Reserve path tracks [from, to] for this run, all or nothing. Fails naming
-        /// the loco that holds one of them, and takes nothing in that case — a run
-        /// that is waiting holds no track, so two waiting trains can't deadlock on
-        /// each other's partial claims.
-        ///
-        /// Each track is claimed together with the side it is entered from (ViaFor), not
-        /// on its own — otherwise one long yard track could only ever be claimed by a
-        /// single run at a time, and a second loco approaching the SAME track from its
-        /// OTHER end (a different junction entirely) would wait on it for no reason.
-        ///
-        /// The run's OWN destination is skipped while it isn't on its final leg yet —
-        /// otherwise a lookahead window that happens to reach that far freezes the
-        /// train the moment anyone else holds its eventual destination, miles before
-        /// it actually needs it. RunAheadOfUs already gives shared destinations this
-        /// same exemption ("not a moment before"); the window claim needs it too.
-        /// </summary>
-        private static bool ClaimTracks(Run run, List<RailTrack> path, int from, int to, out string holder)
-        {
-            holder = "";
-            int last = Math.Min(to, path.Count - 1);
-            for (int i = Math.Max(0, from); i <= last; i++)
-            {
-                if (!run.finalLeg && path[i] == run.destTrack)
-                    continue;
-                if (claims.TryGetValue((path[i], ViaFor(path, i)), out var guid) && guid != run.guid)
-                {
-                    holder = runs.TryGetValue(guid, out var other) ? other.id : guid;
-                    return false;
-                }
-            }
-            for (int i = Math.Max(0, from); i <= last; i++)
-            {
-                if (!run.finalLeg && path[i] == run.destTrack)
-                    continue;
-                var key = (path[i], ViaFor(path, i));
-                claims[key] = run.guid;
-                run.claimed.Add(key);
-            }
-            return true;
-        }
-
-        /// <summary>
         /// Hand back the track this run has finished with: anything on the path behind
         /// the train that none of its cars is standing on. Without this a run keeps
         /// every track it has ever claimed, so a loco halfway across the yard still
@@ -157,13 +115,257 @@ namespace DvMod.Autopilot
             return false;
         }
 
-        /// <summary>Give up every reservation this run holds.</summary>
+        /// <summary>Give up every reservation this run holds - tracks and junctions.</summary>
         private static void ReleaseClaims(Run run)
         {
             foreach (var key in run.claimed)
                 if (claims.TryGetValue(key, out var guid) && guid == run.guid)
                     claims.Remove(key);
             run.claimed.Clear();
+            foreach (var j in run.claimedJunctions)
+                if (junctionClaims.TryGetValue(j, out var guid) && guid == run.guid)
+                    junctionClaims.Remove(j);
+            run.claimedJunctions.Clear();
+        }
+
+        /* ------------------------------------------- movement authority -- */
+
+        private static string RunNameOf(string guid) =>
+            runs.TryGetValue(guid, out var r) ? r.id : guid;
+
+        /// <summary>An OLDER (earlier-dispatched) run is stopped waiting for this
+        /// block: it said so within the last few seconds. Later runs must leave
+        /// the block for it - that is the whole of the queueing discipline.</summary>
+        private static bool WantedByOlder(object key, Run run, out string byWho)
+        {
+            byWho = "";
+            if (!blockWants.TryGetValue(key, out var want))
+                return false;
+            if (Time.realtimeSinceStartup - want.time > WantFreshSeconds)
+                return false;
+            if (want.seq >= run.seq)
+                return false;
+            foreach (var r in runs.Values)
+                if (r.seq == want.seq)
+                {
+                    byWho = r.id;
+                    return true;
+                }
+            return false; // the wanter is gone; its entry will age out
+        }
+
+        private static void RegisterWant(object key, Run run)
+        {
+            if (blockWants.TryGetValue(key, out var want)
+                && want.seq < run.seq
+                && Time.realtimeSinceStartup - want.time <= WantFreshSeconds)
+                return; // an older run is already queued here
+            blockWants[key] = (run.seq, Time.realtimeSinceStartup);
+        }
+
+        private static bool GrantTrack(Run run, RailTrack track, RailTrack? via, out string holder)
+        {
+            holder = "";
+            var key = (track, via);
+            if (claims.TryGetValue(key, out var guid) && guid != run.guid)
+            {
+                holder = RunNameOf(guid);
+                return false;
+            }
+            if (WantedByOlder(key, run, out holder))
+                return false;
+            claims[key] = run.guid;
+            run.claimed.Add(key);
+            return true;
+        }
+
+        /// <summary>A junction grants to ONE run, and never while foreign stock
+        /// fouls it from any branch - that overhang is what sideswipes trains.</summary>
+        private static bool GrantJunction(Run run, Junction junction, out string holder)
+        {
+            holder = "";
+            if (junctionClaims.TryGetValue(junction, out var guid) && guid != run.guid)
+            {
+                holder = RunNameOf(guid);
+                return false;
+            }
+            if (WantedByOlder(junction, run, out holder))
+                return false;
+            var ours = run.car?.trainset;
+            foreach (var fouler in CarsAround(junction, null))
+            {
+                if (fouler == null || fouler.trainset == ours)
+                    continue;
+                if (BodyDistanceToJunction(junction, fouler) < FoulingTolerance)
+                {
+                    holder = fouler.ID;
+                    return false;
+                }
+            }
+            junctionClaims[junction] = run.guid;
+            run.claimedJunctions.Add(junction);
+            return true;
+        }
+
+        /// <summary>
+        /// Movement authority: hold rail ahead of the train, block by block, up to
+        /// `need` metres past its front - a signalman clearing the road ahead of a
+        /// train section by section. Returns the metres of held rail ahead of the
+        /// FRONT; when the road could not be extended, names what stopped it and
+        /// where. The rail under the train is held by physical fact; everything
+        /// ahead must be granted. Past the end of the plan (a pull drawing clear
+        /// overruns it) the walk follows the live switches, claiming as it goes.
+        /// </summary>
+        private static double ExtendAuthority(
+            Run run, List<RailTrack> path, int idx, RailTrack track, double bogieSpan,
+            bool towardOut, double ownLead, double need,
+            out string heldBy, out string atName, out RailTrack? blockedTrack)
+        {
+            heldBy = "";
+            atName = "";
+            blockedTrack = null;
+
+            if (idx >= 0)
+                ForceHold(run, track, ViaFor(path, idx));
+
+            double granted = towardOut ? PhysicalSpan(track) - bogieSpan : bogieSpan;
+            var t = track;
+            bool outw = towardOut;
+            int i = idx;
+            var seen = new HashSet<RailTrack> { track };
+            for (int step = 0; step < 60 && granted - ownLead < need; step++)
+            {
+                RailTrack? next = null;
+                bool nextOut = true;
+                Junction? junction = null;
+                if (i >= 0 && i + 1 < path.Count)
+                {
+                    next = path[i + 1];
+                    junction = JunctionBetween(t, next);
+                    nextOut = EnterIsIn(next, t);
+                }
+                else
+                {
+                    // Off (or past) the plan: the pull's overrun rail. Follow the
+                    // switches as they lie, like the train will.
+                    var branch = outw ? t.GetOutBranch() : t.GetInBranch();
+                    if (branch?.track != null)
+                    {
+                        next = branch.track;
+                        junction = outw ? t.outJunction : t.inJunction;
+                        nextOut = branch.first;
+                    }
+                }
+                if (next == null || !seen.Add(next))
+                    break; // rail ends, or loops - authority ends with it
+
+                if (junction != null && !GrantJunction(run, junction, out heldBy))
+                {
+                    atName = $"J-{JunctionIndex(junction)}";
+                    blockedTrack = next;
+                    RegisterWant(junction, run);
+                    break;
+                }
+                if (!GrantTrack(run, next, t, out heldBy))
+                {
+                    atName = next.LogicTrack()?.ID?.ToString() ?? "the next track";
+                    blockedTrack = next;
+                    RegisterWant((next, (RailTrack?)t), run);
+                    break;
+                }
+                granted += PhysicalSpan(next);
+                t = next;
+                outw = nextOut;
+                i = i >= 0 && i + 1 < path.Count ? i + 1 : -1;
+            }
+            return Math.Max(0, granted - ownLead);
+        }
+
+        /// <summary>Hold the rail the train physically stands on, without asking:
+        /// stock on the ground beats any reservation. Never steals a key another
+        /// run holds - their claim is already useless with us standing here.</summary>
+        private static void ForceHold(Run run, RailTrack track, RailTrack? via)
+        {
+            var key = (track, via);
+            if (!claims.TryGetValue(key, out var guid) || guid == run.guid)
+            {
+                claims[key] = run.guid;
+                run.claimed.Add(key);
+            }
+        }
+
+        /// <summary>Junctions this run holds that its tail has cleared and its plan
+        /// no longer crosses: hand them back, block by block, as a train clears
+        /// sections behind it.</summary>
+        private static void ReleaseJunctionsBehind(Run run, List<RailTrack> path, int pathIdx)
+        {
+            if (run.claimedJunctions.Count == 0)
+                return;
+            var aheadJunctions = new HashSet<Junction>();
+            for (int i = Math.Max(0, pathIdx); i + 1 < path.Count; i++)
+            {
+                var j = JunctionBetween(path[i], path[i + 1]);
+                if (j != null)
+                    aheadJunctions.Add(j);
+            }
+            var done = new List<Junction>();
+            foreach (var j in run.claimedJunctions)
+            {
+                if (aheadJunctions.Contains(j))
+                    continue;
+                if (run.car != null && ConsistFoulsJunction(j, run.car.trainset))
+                    continue;
+                done.Add(j);
+            }
+            foreach (var j in done)
+            {
+                if (junctionClaims.TryGetValue(j, out var guid) && guid == run.guid)
+                    junctionClaims.Remove(j);
+                run.claimedJunctions.Remove(j);
+            }
+        }
+
+        /// <summary>
+        /// Give unreached blocks to an older run that is stood waiting for them -
+        /// the signalman pulling back a road that was set but never used. Only
+        /// blocks our train has not reached: rail under our wheels is nobody
+        /// else's whatever the ledger says.
+        /// </summary>
+        private static void PreemptWantedBlocks(Run run)
+        {
+            if (run.car == null)
+                return;
+            List<(RailTrack, RailTrack?)>? giveTracks = null;
+            foreach (var key in run.claimed)
+            {
+                if (OurCarsOn(run.car, key.track))
+                    continue;
+                if (WantedByOlder(key, run, out _))
+                    (giveTracks ??= new List<(RailTrack, RailTrack?)>()).Add(key);
+            }
+            if (giveTracks != null)
+                foreach (var key in giveTracks)
+                {
+                    if (claims.TryGetValue(key, out var guid) && guid == run.guid)
+                        claims.Remove(key);
+                    run.claimed.Remove(key);
+                }
+
+            List<Junction>? giveJunctions = null;
+            foreach (var j in run.claimedJunctions)
+            {
+                if (ConsistFoulsJunction(j, run.car.trainset))
+                    continue;
+                if (WantedByOlder(j, run, out _))
+                    (giveJunctions ??= new List<Junction>()).Add(j);
+            }
+            if (giveJunctions != null)
+                foreach (var j in giveJunctions)
+                {
+                    if (junctionClaims.TryGetValue(j, out var guid) && guid == run.guid)
+                        junctionClaims.Remove(j);
+                    run.claimedJunctions.Remove(j);
+                }
         }
 
         /// <summary>

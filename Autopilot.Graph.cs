@@ -145,6 +145,43 @@ namespace DvMod.Autopilot
             return steps;
         }
 
+        /// <summary>
+        /// A junction on the plan that our OWN stock currently runs through on a
+        /// branch the plan does not use — the train's front went down the wrong
+        /// road (shoved past a switch set the other way), and the plan cannot be
+        /// driven until the front backs off it. Null when the train lies along
+        /// its plan.
+        /// </summary>
+        private static Junction? WrongBranchJunction(TrainCar loco, List<RailTrack> path)
+        {
+            var ours = new HashSet<RailTrack>();
+            var cars = loco.trainset?.cars;
+            if (cars == null)
+                return null;
+            foreach (var c in cars)
+                foreach (var b in c.Bogies)
+                    if (b?.track != null)
+                        ours.Add(b.track);
+
+            for (int i = 0; i + 1 < path.Count; i++)
+            {
+                var junction = JunctionBetween(path[i], path[i + 1]);
+                if (junction == null)
+                    continue;
+                var branches = new List<RailTrack?>();
+                if (junction.inBranch?.track != null)
+                    branches.Add(junction.inBranch.track);
+                if (junction.outBranches != null)
+                    foreach (var ob in junction.outBranches)
+                        if (ob?.track != null)
+                            branches.Add(ob.track);
+                foreach (var t in branches)
+                    if (t != null && t != path[i] && t != path[i + 1] && ours.Contains(t))
+                        return junction;
+            }
+            return null;
+        }
+
         /* ------------------------------------------- straight or diverging -- */
 
         // How far along each leg to look when judging which branch runs straight

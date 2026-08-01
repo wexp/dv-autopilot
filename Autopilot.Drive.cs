@@ -253,6 +253,90 @@ namespace DvMod.Autopilot
                     reverser = wantPlusSpan == (bogie.TrackDirectionSign > 0) ? 1f : 0f;
                 }
 
+                // The plan may be UNREACHABLE from where the train physically lies:
+                // its front already ran through a junction on a branch the plan does
+                // not use (shoved past a switch that was set the other way). Driving
+                // on just digs deeper down the wrong road — the only move is a
+                // shunter's: back up until the front is clear of that junction, throw
+                // it, and go again. Detected by our own stock standing on a branch of
+                // a planned junction that the plan itself does not touch.
+                var wrongJ = WrongBranchJunction(car, path);
+                if (wrongJ != null)
+                {
+                    float backRev = ExitIsOut(path[0], path.Count >= 2 ? path[1] : path[0])
+                        == (bogie.TrackDirectionSign > 0) ? 0f : 1f;
+                    run.detail = $"backing clear of J-{JunctionIndex(wrongJ)} — "
+                        + "the front stands on the wrong road";
+                    overrider.Throttle?.Set(0f);
+                    overrider.DynamicBrake?.Set(0f);
+                    overrider.Brake?.Set(1f);
+                    while (Mathf.Abs(car.GetForwardSpeed()) * 3.6f > MovingKmh)
+                        yield return WaitForSecondsRealtime(0.1f);
+                    overrider.Reverser?.Set(backRev);
+                    yield return WaitForSecondsRealtime(0.4f);
+                    prevReverser = backRev;
+
+                    float bThrottle = 0f, bLast = 0f, bAccel = 0f, bSander = 0f, bDyn = 0f;
+                    float backedFor = 0f;
+                    bool backedClear = false;
+                    while (backedFor < 120f)
+                    {
+                        yield return WaitForSecondsRealtime(0.1f);
+                        backedFor += 0.1f;
+                        if (GamePaused)
+                            yield return WaitWhilePaused();
+                        if (car == null)
+                        {
+                            Finish(run, "error", "loco no longer exists");
+                            yield break;
+                        }
+                        if (!ConsistFoulsJunction(wrongJ, car.trainset))
+                        {
+                            backedClear = true;
+                            break;
+                        }
+                        float sp = Mathf.Abs(car.GetForwardSpeed()) * 3.6f;
+                        // Guard the way we are backing: cars or rail-end behind.
+                        double stopIn = double.MaxValue;
+                        var backLead = LeadingEnd(car, backRev >= 0.5f);
+                        if (backLead != null)
+                        {
+                            double clr = ObstacleDistanceRail(
+                                car, backLead.Value.bogie.track,
+                                backLead.Value.bogie.traveller.Span,
+                                backLead.Value.towardOut, 200,
+                                out _, out _, out double rEnd);
+                            if (clr != double.MaxValue)
+                                stopIn = Math.Min(stopIn, clr - ObstacleBuffer);
+                            if (rEnd != double.MaxValue)
+                                stopIn = Math.Min(stopIn, rEnd - RailEndMargin);
+                        }
+                        float tgt = Mathf.Min(ManeuverKmh / 2f,
+                            stopIn == double.MaxValue
+                                ? ManeuverKmh / 2f
+                                : Mathf.Sqrt(2f * ObstacleDecel * (float)Math.Max(0, stopIn)) * 3.6f);
+                        run.detail = $"backing clear of J-{JunctionIndex(wrongJ)}, "
+                            + $"v{sp:F0} tgt{tgt:F0}";
+                        ApplyThrottle(controller, ref bThrottle, car, tgt, sp,
+                            run.profile, ref bLast, ref bAccel, ref run.accelBudget,
+                            ref bSander, ref bDyn, false, false, false);
+                        if (tgt < 0.8f && sp < 0.5f && stopIn < 1)
+                            break; // pinned against something behind — cannot back further
+                    }
+                    overrider.Throttle?.Set(0f);
+                    overrider.Brake?.Set(1f);
+                    while (car != null && Mathf.Abs(car.GetForwardSpeed()) * 3.6f > MovingKmh)
+                        yield return WaitForSecondsRealtime(0.1f);
+                    if (!backedClear)
+                    {
+                        Finish(run, "error",
+                            $"cannot back clear of J-{JunctionIndex(wrongJ)} — "
+                            + "something behind, or the junction never cleared");
+                        yield break;
+                    }
+                    continue; // re-plan: the switch can be thrown now
+                }
+
                 // Only stop for a direction change. A same-direction continuation (the
                 // pull re-routing forward through the throat) rolls straight through —
                 // no full-braking at every junction.

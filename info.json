@@ -1,0 +1,10 @@
+{
+  "Id": "Autopilot",
+  "DisplayName": "Autopilot",
+  "Author": "Andrei-Alexandru Tudor",
+  "Version": "0.1.0",
+  "AssemblyName": "Autopilot.dll",
+  "EntryMethod": "DvMod.Autopilot.Main.Load",
+  "LoadAfter": [ "PersistentJobsMod" ],
+  "ManagerVersion": "0.27.3"
+}

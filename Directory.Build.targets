@@ -1,0 +1,14 @@
+<Project>
+  <!--
+    Per-machine build config. Gitignored: points MSBuild at this install's game
+    assemblies so the bare <Reference> names in RemoteDispatch.csproj resolve.
+  -->
+  <PropertyGroup>
+    <DvInstallDir>F:\Games\SteamLibrary\steamapps\common\Derail Valley</DvInstallDir>
+    <AssemblySearchPaths>
+      $(AssemblySearchPaths);
+      $(DvInstallDir)\DerailValley_Data\Managed;
+      $(DvInstallDir)\Mods\UnityModManager;
+    </AssemblySearchPaths>
+  </PropertyGroup>
+</Project>

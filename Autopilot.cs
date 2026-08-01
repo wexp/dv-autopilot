@@ -1,0 +1,1122 @@
+using DV.Logic.Job;
+using DV.RemoteControls;
+using DV.Simulation.Cars;
+using DV.Utils;
+using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Linq;
+using UnityEngine;
+
+namespace DvMod.Autopilot
+{
+    /// <summary>
+    /// Which of the two jobs a run is doing. They are different jobs, driven
+    /// differently, and conflating them is what made one set of rules serve both
+    /// badly: a road move crawling into a yard for the last kilometre, a shunt
+    /// taking a lap of the valley to avoid changing ends.
+    /// </summary>
+    public enum AutopilotMode
+    {
+        /// <summary>Yard to yard over the road. The train runs at line speed to the
+        /// running line serving the destination yard and stops on it; there is no
+        /// spotting, no shoving and no coupling, because none of that belongs on a
+        /// through move. Reversals are priced high — changing ends on a main line is
+        /// worth a long detour to avoid.</summary>
+        Drive,
+        /// <summary>Moves within a yard. Speed is held to yard pace whatever the
+        /// posted limit, the train is spotted precisely between the markers, and the
+        /// dispatcher chooses which end leads, which junction to come in through and
+        /// whether to couple onto what is already there. Reversals are cheap: a
+        /// runaround is how the job is done.</summary>
+        Shunt,
+    }
+
+    /// <summary>
+    /// Full-route autopilot for a remotely controllable loco: route to a
+    /// destination track (Dijkstra, see <see cref="Routing"/>), then drive it there
+    /// obeying posted limits and stopping at the end.
+    ///
+    /// The route can double back on itself — a yard move from one siding to another
+    /// off the same junction is a runaround: pull the whole train past the junction,
+    /// throw it, then reverse onto the destination. So the path is split into
+    /// <em>legs</em> at each reversal point, and between legs the drive waits until
+    /// the pivot junction is physically clear of every car (a switch can't be thrown
+    /// under a wagon) before throwing it and flipping direction.
+    ///
+    /// Any number of locos can be under autopilot at once — that is the point of
+    /// dispatching from a map: set one train going across the valley and shunt
+    /// another meanwhile. Each has its own run, keyed by car guid, so they start,
+    /// report and stop independently and one erroring out leaves the rest driving.
+    /// The player need not be aboard any of them.
+    ///
+    /// Each run is a coroutine on the mod's persistent object, so it survives scene
+    /// work like the map bake.
+    /// </summary>
+    public static partial class Autopilot
+    {
+        /// <summary>One loco under autopilot: its coroutine, the controls it drives
+        /// and what it is currently doing. Held so Stop brakes the loco this run
+        /// actually took, not whatever car the player happens to be sitting in.</summary>
+        private sealed class Run
+        {
+            public readonly TrainCar car;
+            public readonly RemoteControllerModule controller;
+            public readonly string guid;
+            public readonly string id;
+            public Coroutine? coroutine;
+            public string state = "driving";
+            public string detail = "";
+            /// <summary>Buffer up to the cars standing on the destination and couple
+            /// to them, instead of parking clear of them.</summary>
+            public bool couple;
+            /// <summary>The coupling has taken. What follows is an ordinary spot: shove
+            /// the whole, now longer, train up the track until all of it is inside the
+            /// markers — otherwise adding wagons to a part-full siding leaves half the
+            /// consist hanging out over the switch.</summary>
+            public bool coupledDone;
+            /// <summary>Cars in our consist when the run began — coupling shows up as
+            /// this number growing, which needs no guess about which train we met.</summary>
+            public int carsAtStart;
+            /// <summary>Which end of the destination to come in through: set by a via
+            /// junction, or — when the destination is the track the loco already
+            /// stands on and no via was given — guessed as the far end, meaning out,
+            /// round, and back in. Every re-route must keep the constraint or the
+            /// router would simply turn it back in by the end it just left.</summary>
+            public bool? arriveEnteredIn;
+            /// <summary>The destination track, whether we have actually left it yet
+            /// (standing on it at the start must not count as having arrived), and
+            /// whether we are back on it having come in the far end. The constraint
+            /// has to hold until THAT point: dropping it the moment we left simply
+            /// routed the train back in by the end it had just come out of.</summary>
+            public RailTrack? destTrack;
+            public bool leftDest;
+            public bool reEntered;
+            /// <summary>How the dispatcher wants it to arrive: shoved (wagons first),
+            /// pulled (loco first), or left to the router to decide.</summary>
+            public ArriveMode arrive = ArriveMode.Auto;
+            /// <summary>Road move or yard move — see AutopilotMode. Held on the run
+            /// because every leg re-routes, and the re-route has to be planned by the
+            /// same rules as the first one.</summary>
+            public AutopilotMode mode = AutopilotMode.Drive;
+            /// <summary>What this run pays for a change of ends, m of equivalent rail.</summary>
+            public double reversalPenalty = Routing.LineReversalPenalty;
+            /// <summary>The road this run still has to cover, re-planned at the top of
+            /// every leg. Other runs read it to find out whether their route and ours
+            /// actually touch — which is a different question from whether we happen to
+            /// be going to the same place.</summary>
+            public List<RailTrack> path = new List<RailTrack>();
+            /// <summary>How far along path the train has got, kept up to date every
+            /// drive tick. Rail before this index is already covered, and covered rail
+            /// must not count as "still has to cover": comparing whole paths made a
+            /// run wait on track the other train had left a minute earlier.</summary>
+            public int pathFrom;
+            /// <summary>We are on the last leg: the next thing we do is go into the
+            /// destination. Until then a shared destination costs nobody anything.</summary>
+            public bool finalLeg;
+            /// <summary>What the run means to do from here, in named moves. Rebuilt
+            /// from the live route at the top of every leg, so it always describes the
+            /// plan the drive loop is actually working to and never a stale one.</summary>
+            public List<Step> steps = new List<Step>();
+            /// <summary>Cut the loco (and any MU'd units) off the wagons once the
+            /// shunt is done, leaving the cut tied down and the loco free.</summary>
+            public bool uncoupleOnFinish;
+            /// <summary>Why the run gave up, if a blocked switch defeated it.</summary>
+            public string blockedReason = "";
+            /// <summary>Track we have found we cannot use: a junction there refuses to
+            /// throw because someone has left a wagon on it. Fed back into the router so
+            /// the next plan goes round rather than queueing behind it for ever.</summary>
+            public readonly HashSet<RailTrack> avoid = new HashSet<RailTrack>();
+            /// <summary>Track (and the side it is entered from) this run has reserved.
+            /// Nobody else may drive over or throw a switch into one of these from the
+            /// same side while it holds them — the OPPOSITE side of the same track is a
+            /// separate reservation, so two trains meeting a shared track from its two
+            /// different ends never block each other.</summary>
+            public readonly HashSet<(RailTrack track, RailTrack? via)> claimed =
+                new HashSet<(RailTrack, RailTrack?)>();
+
+            /// <summary>How hard this kind of loco may be driven — see LocoProfiles.
+            /// Read once at the start: the settings are edited between runs, not during.</summary>
+            public readonly LocoProfile profile;
+
+            /// <summary>Acceleration this train is currently allowed, m/s². Lives on the
+            /// run, not on the leg: what the wheels did on the last leg is exactly what
+            /// they will do on the next, so the lesson must survive a reversal.
+            /// Seeded on the first tick from the adhesion sum.</summary>
+            public float accelBudget = float.MaxValue;
+
+            /// <summary>Order this run was dispatched in. When two runs want the same
+            /// rail, the one asked for first goes first — otherwise they take turns
+            /// giving way to each other and neither arrives.</summary>
+            public readonly int seq = ++dispatched;
+
+            public Run(TrainCar car, RemoteControllerModule controller)
+            {
+                this.car = car;
+                this.controller = controller;
+                guid = car.CarGUID;
+                id = car.ID;
+                profile = Main.settings.autopilot.For(car.carLivery?.id);
+            }
+
+            public JObject ToJson() => new JObject
+            {
+                ["state"] = state,
+                ["detail"] = detail,
+                ["loco"] = id,
+                ["guid"] = guid,
+                ["mode"] = mode.ToString().ToLowerInvariant(),
+                ["steps"] = new JArray(steps.Select(s => s.ToJson())),
+            };
+        }
+
+        // Every run, by car guid. Only ever touched on the main thread (every entry
+        // point hops there first), so no locking.
+        private static readonly Dictionary<string, Run> runs = new Dictionary<string, Run>();
+        /// <summary>Counts dispatches, so runs can be ordered by who asked first.</summary>
+        private static int dispatched;
+
+        // Interlocking: which run holds which track, keyed together with the side it is
+        // entered from (the previous track on its path, or null for wherever it is
+        // sitting right now). Two autopilots converging on the same yard throat used to
+        // throw each other's switches and meet on the frog, because each planned as if
+        // it were alone. A run may only drive over, and set switches into, a (track,
+        // side) it holds; anyone else wanting the SAME side waits — a run approaching
+        // the same track from its OTHER end holds a different key and is unaffected.
+        private static readonly Dictionary<(RailTrack track, RailTrack? via), string> claims =
+            new Dictionary<(RailTrack, RailTrack?), string>();
+
+        /// <summary>The neighbour a run enters path[i] from — the "side" half of a claim
+        /// key. Null at the start of the path: wherever the train already is has no
+        /// entry side of its own.</summary>
+        private static RailTrack? ViaFor(List<RailTrack> path, int i) => i > 0 ? path[i - 1] : null;
+
+        // How far ahead to reserve, in path tracks. Enough to cover the switches being
+        // set, short enough that a train crossing the map doesn't lock the whole route.
+        // The reservation is a moving window: it follows the train and the rail behind
+        // is handed straight back, so a long run holds a few tracks, never its route.
+        private const int ClaimAheadTracks = 8;
+        // A train blocked this long gives its reservations up, so two trains that have
+        // each half of a throat cannot sit there holding it against one another, m/s.
+        private const float ClaimDeadlockSeconds = 20f;
+
+        // The longest road a SHUNT may accept, m. Generous — a runaround over a big
+        // yard's own 3 km line is real yard work — but it shuts the door on the
+        // "re-route the long way round the valley" plans a fouled junction invites.
+        private const double ShuntMaxRouteMeters = 8000;
+
+        // Conservative service deceleration used to plan the stop, m/s^2.
+        private const float StopDecel = 0.35f;
+        // What a road run plans its slowing with, m/s^2. Road moves brake on the
+        // DYNAMIC, which pulls far more gently than a service application of air —
+        // planning at air rates meant the dynamic could never make the curve, the
+        // overspeed grew until the air was blended in anyway, and every slowing
+        // ended as an air stop. Plan gentler and the braking starts earlier
+        // instead, far enough out that the dynamic alone usually makes it.
+        private const float DynamicPlanDecel = 0.18f;
+
+        // Never open the throttle past this — a full-power launch spins the wheels
+        // and cooks the traction motors. Notch up/down at these rates per 0.1 s
+        // tick; back off hard the instant the wheels slip.
+        private const float ThrottleUp = 0.012f;
+        private const float ThrottleDown = 0.1f;
+        private const float SlipThreshold = 0.06f;
+        // Slip this bad is a break-away, not an edge case of adhesion: the wheels
+        // are spinning free and a gentle notch-down won't catch them. Cut hard.
+        private const float SevereSlip = 0.25f;
+        // Once the sander triggers it keeps sanding this long after the last slip,
+        // s. The slip signal flickers around the threshold as grip comes and goes,
+        // and following it directly clicked the sander on and off every tick.
+        private const float SanderHoldSeconds = 4f;
+        // Dynamic braking: below this speed a dynamic fades to nothing, km/h.
+        private const float DynamicBrakeMinKmh = 8f;
+        // Overspeed beyond which air is blended in on top of the dynamic straight
+        // away rather than waiting to see whether the dynamic can cope, km/h.
+        private const float DynamicBrakeAirBackupKmh = 12f;
+        // How long the dynamic alone gets to produce ANY deceleration before the
+        // air comes in to help, s.
+        private const float DynamicBrakeStallSeconds = 5f;
+        // Throttle is commanded as a FRACTION of the handle, never in notches. Notch
+        // counts differ between locos, and an eighth — fine on a DE6 — quantises down
+        // to no power at all on a coarser machine, which is why some locos would hardly
+        // move. Fractions land on a sensible notch whatever the loco.
+        // Acceleration budget the wheels are given, m/s². It tracks the adhesion sum
+        // but is cut on real wheelslip at this rate and eased back at that one, so a
+        // wet rail or a wrong μ is corrected by what the train actually does.
+        private const float SlipAccelCut = 0.5f;
+        private const float AccelRecover = 0.05f;
+        // However badly it slips, the train is always allowed to try to move.
+        private const float MinAccelBudget = 0.1f;
+        // Brake pipe pressure at which the brakes count as off, bar. Below this the
+        // train is still being held and no amount of throttle proves anything.
+        private const float BrakeReleasedBar = 5.4f;
+        // Roughly how long the train should take to close the remaining speed gap, s.
+        // This is what makes it ease off as it comes up to the target instead of
+        // arriving at it flat out and overshooting.
+        private const float ApproachSeconds = 6f;
+        // How long the FULL handle may fail to move the train before the run is
+        // written off. Counted only at full power: a heavy rake on a grade spends
+        // the first seconds working up through the gentle-start ceiling, and calling
+        // that "stuck" abandoned trains that had never actually been given power.
+        private const float StuckAtFullPowerSeconds = 6f;
+        // Absolute backstop, s — nothing may sit trying to start for longer.
+        private const float StuckGiveUpSeconds = 60f;
+        // How long to hold for stock ahead that is not moving before treating the road
+        // as blocked, s. Long enough for another train to pull clear, short enough that
+        // a run does not sit in front of a parked rake until somebody notices.
+        private const float BlockedGiveUpSeconds = 30f;
+        // Below this the coarsest loco has no notch at all, so a command to move that
+        // lands under it does nothing.
+        private const float MinMoveThrottle = 0.25f;
+        // Smoothing applied to the measured acceleration, per tick (about a second of
+        // memory), and how far over the adhesion limit counts as really over.
+        private const float AccelSmoothing = 0.1f;
+        private const float AccelOverBand = 1.3f;
+        // Ticks between full re-reads of the speed limits and switch proximity.
+        private const int LimitRecheckTicks = 3;
+        // The drive loop's tick, s — also the interval acceleration is measured over.
+        private const float DriveTick = 0.1f;
+        // Steel wheel on dry steel rail. This is the physical constant the adhesion
+        // limit is built on, not a tuning knob: the force the driven wheels can put
+        // down before they slip is this times the weight on them.
+        private const float AdhesionCoefficient = 0.25f;
+        private const float Gravity = 9.81f;
+        // Service brake ceiling while simply slowing down. A full application at speed
+        // locks wheels and flats them just as thoroughly as a slip does; full brake is
+        // kept for an actual stop.
+        private const float ServiceBrakeMax = 0.6f;
+
+        // Top speed for moving around the yard, km/h (still capped by posted limits
+        // and the obstacle guard).
+        private const float ManeuverKmh = 25f;
+        // Speed a pull creeps at over its last few metres, so the stop that follows is
+        // a couple of metres and not half a siding, km/h.
+        private const float PullCrawlKmh = 4f;
+        // Under this the loco counts as standing still, km/h — the reverser may be
+        // moved and its current motion says nothing about which way it is going.
+        private const float MovingKmh = 0.6f;
+        // Be down to that crawl this far before the clear point, m.
+        private const double PullStopMargin = 3.0;
+        // How far out from the destination track to come down to approach speed, m.
+        // Beyond this the train runs at line speed — the whole point of a long haul.
+        // 200 m of 12 km/h was a minute of crawling before every arrival.
+        private const double ApproachDistance = 120.0;
+        // How far ahead to read posted limits so the train is already slowed when it
+        // reaches a restriction instead of discovering it underneath itself, m.
+        private const double LimitLookahead = 600.0;
+        // Moderate speed on the final leg approaching the destination (before any car
+        // is on it), so the slow-down doesn't overshoot, km/h.
+        private const float SpotApproachKmh = 15f;
+        // Slow crawl once a car is on the destination — accurate spot, minimal coast,
+        // km/h.
+        private const float SpotKmh = 5f;
+        // The same two speeds for a road move, which finishes by stopping on a running
+        // line rather than spotting between markers. A main line is long: held to the
+        // shunting figures, a train that had already arrived spent minutes crawling up
+        // its own destination.
+        private const float DriveApproachKmh = 40f;
+        private const float DriveSpotKmh = 12f;
+        // How far to pull into the destination track before stopping, m.
+        private const float InsertionDepth = 12f;
+        // Once the whole train is on the destination, pull this much DEEPER so the
+        // loco's trailing end clears the throat switch's fouling point, m.
+        private const float ExtraClearance = 20f;
+        // A car this close to a junction (m) still fouls it — can't switch.
+        private const double FoulingTolerance = 7.0;
+        // How clear of a junction OUR OWN cars must be before we may throw it, m.
+        // Bogie distance plus body overhang plus a margin: this one splits our train
+        // if it is wrong.
+        // Clearance between the junction and the nearest point of our own car's BODY,
+        // m (see BodyDistanceToJunction — this is not a bogie distance). A car actually
+        // on the points measures ~0, so this only has to cover the coupler swing and a
+        // little slack; it does not have to guess at overhang any more.
+        private const double OwnSwitchClearance = 2.5;
+        // A pull always draws further forward than the switch check demands. If it
+        // stopped at exactly that distance the train could come to rest in the gap
+        // between "clear enough to finish pulling" and "clear enough to throw the
+        // points", which is a deadlock with no way out: the leg is over, the switch
+        // will not move, and the router has nowhere else to go. Keep this positive.
+        private const double PullClearMargin = 3.0;
+        // Keep at least this much clear of any car ahead, m — generous, because a
+        // 200 t consist coasts well past where it is commanded to stop.
+        private const double ObstacleBuffer = 10.0;
+        // Switch-clearance inset from each physical track end to the parking marker, m.
+        private const double MarkerClearance = 18.0;
+        // Stop this far inside the markers, measured at the bogies — just the car-body
+        // overhang past its end bogie (~2 m). The spot speed is low enough that the
+        // coast is small, so the car ends land right at the markers, not deep past them.
+        private const double ParkMargin = 2.5;
+        // Buffering up: close in at walking pace from this far out, m.
+        private const double CoupleApproach = 25.0;
+        // Speed for the last few metres onto the couplers, km/h. Slow enough not to
+        // shove the standing train down the siding.
+        private const float CoupleKmh = 3f;
+        // How close the obstacle guard may let us get when the "obstacle" is the train
+        // we are deliberately coupling to, m.
+        private const double CoupleBuffer = 0.4;
+        // Deceleration assumed when planning to stop short of something, m/s^2. At the
+        // old 0.12 a car 100 m ahead pinned the train to 17 km/h and one 300 m ahead to
+        // 30, which with the half-kilometre look-ahead meant creeping past every
+        // occupied siding on the route. 0.25 is still well inside what a service
+        // application gives, and the guard still holds 10 m short.
+        private const float ObstacleDecel = 0.25f;
+        // Stop this far short of rail that simply ENDS — an unaligned turntable's
+        // pit edge, a stub with no buffer stop. Measured to the leading bogie, and
+        // a car body overhangs its end bogie by a couple of metres, so 5 keeps the
+        // nose clear of the hole.
+        private const double RailEndMargin = 5.0;
+        // Turntables are taken at walking pace: the crossing cap, km/h, and how far
+        // out (m, to the front of the train) it starts applying.
+        private const float TurntableKmh = 8f;
+        private const double TurntableSlowZone = 50.0;
+        // What another run's rail costs to route over, m of equivalent rail. A track
+        // it has RESERVED is dearer than one merely on its remaining plan: the claim
+        // means it is about to be there, the plan means it will be eventually.
+        internal const double ClaimedRoadPenalty = 400.0;
+        internal const double PlannedRoadPenalty = 120.0;
+        // A spot whose remaining distance GROWS has been overshot. This much growth
+        // is real movement rather than bogie-span jitter, m.
+        private const double OvershootSlack = 0.5;
+        // A stop this far past the marks is accepted as spotted; further back it
+        // out. Within a couple of metres nobody would touch the handle again;
+        // beyond that the spot is simply missed, m.
+        private const double OvershootAcceptMeters = 3.0;
+        // Inside this distance of the marks the crawl drops to walking-onto-the-
+        // marks pace, so a metre-wide marker window is not hit at 5 km/h, m.
+        private const double FinalCreepZone = 10.0;
+        private const float FinalCreepKmh = 2f;
+        // How long the train may read as off its planned road before the leg is
+        // abandoned and re-planned, s. Long enough to ride out the tick or two where a
+        // bogie is crossing a frog and belongs to neither track.
+        private const float OffPathSeconds = 2f;
+        // Wait this long at a switch that will not throw before looking for another
+        // way round, s. Long enough that a shunter about to move clear is worth
+        // waiting for, short enough not to strand the train.
+        private const float SwitchDetourSeconds = 8f;
+        // How far ahead the switches on our path are re-checked every tick, m.
+        private const double JunctionCheckDistance = 300.0;
+        // Speed over a switch taken on the DIVERGING side, km/h. A train can run a
+        // curve at line speed and be fine, then put a wagon on the ground taking a
+        // frog at the same speed — the posted limit says nothing about it.
+        private const float JunctionKmh = 40f;
+        // How close to such a switch counts as being on it, m — enough that the whole
+        // train is slowed over the frog rather than just the loco.
+        private const double SwitchSlowZone = 30.0;
+        // Overspeed bands, matching the HUD's colour grading. Being this far over the
+        // limit that is coming up is acceptable only from this far out:
+        //
+        //   under +7 km/h   red 0-300,  orange 300-600, yellow 600-1000
+        //   +7 to +15 km/h  red 0-600,  orange 600-1000
+        //   over +15 km/h   red at every distance
+        //
+        // The drive aims to sit in orange or yellow and never red, so the allowance is
+        // the most it may be over a limit that is still this far ahead.
+        private const double BandNear = 300.0;
+        private const double BandMid = 600.0;
+        private const float BandOver1 = 7f;
+        private const float BandOver2 = 14f; // just under the +15 that is red everywhere
+        // Within this distance every car ahead counts, on our route or not: it is too
+        // close for a routing question to be worth getting wrong, m.
+        private const float CloseRangeGuard = 60f;
+        // How far off the line of travel a car may be at that range and still count.
+        // Tighter than the ~5 m between parallel tracks, so a neighbouring siding is
+        // still ignored.
+        private const float CloseRangeLateral = 2.5f;
+        // Never scan further ahead than this for obstacles, m. At that decel the
+        // braking distance from line speed is otherwise kilometres of rail walking.
+        private const double MaxObstacleLookahead = 1500.0;
+
+        private static string Json(string status, string info = "") =>
+            new JObject { ["state"] = status, ["detail"] = info }.ToString(Formatting.None);
+
+        /// <summary>Every run, keyed by car guid, so one poll covers however many
+        /// locos are out there. A guid absent from the object is simply not under
+        /// autopilot.</summary>
+        public static string GetStatusJson()
+        {
+            return Updater.RunOnMainThread(() =>
+            {
+                var all = new JObject();
+                foreach (var kv in runs)
+                    all[kv.Key] = kv.Value.ToJson();
+                return all.ToString(Formatting.None);
+            }).Result;
+        }
+
+        /// <summary>
+        /// The loco to drive: the one with the given car GUID, or — only when no GUID
+        /// is supplied — whatever the player is riding. Dispatching a loco from the map
+        /// with nobody aboard is the normal case, so the GUID is the real path and the
+        /// player fallback just a convenience. Main thread only.
+        /// </summary>
+        private static TrainCar? ResolveLoco(string? guid, out string error)
+        {
+            error = "";
+            TrainCar? car;
+            if (!string.IsNullOrEmpty(guid))
+            {
+                car = SingletonBehaviour<TrainCarRegistry>.Instance?.GetTrainCarByCarGuid(guid);
+                if (car == null)
+                {
+                    error = "no car with guid " + guid;
+                    return null;
+                }
+            }
+            else
+            {
+                car = PlayerManager.Car;
+                if (car == null)
+                {
+                    error = "no loco given and player is not in one";
+                    return null;
+                }
+            }
+            if (!car.IsLoco)
+            {
+                error = car.ID + " is not a loco";
+                return null;
+            }
+            return car;
+        }
+
+        /// <summary>
+        /// The junction at one end of a track, as an index into the ordered junction
+        /// list — the numbers the map shows.
+        ///
+        /// A yard track does not touch a junction directly: it runs into a short
+        /// "#Y-#S…#T" frog stub, and the junction is beyond that. So this walks a few
+        /// hops outward from the end in question rather than reading inJunction /
+        /// outJunction off the track itself, which is null for exactly the tracks a
+        /// dispatcher actually names.
+        /// </summary>
+        internal static int? JunctionIndexAtEnd(RailTrack track, bool inEnd, int maxHops = 4)
+        {
+            var ordered = RailTrackRegistry.Instance?.OrderedJunctions?.ToList();
+            if (ordered == null)
+                return null;
+            RailTrack? t = track;
+            bool towardIn = inEnd;
+            for (int hop = 0; hop < maxHops && t != null; hop++)
+            {
+                var junction = towardIn ? t.inJunction : t.outJunction;
+                if (junction != null)
+                {
+                    int index = ordered.IndexOf(junction);
+                    return index >= 0 ? index : (int?)null;
+                }
+                var branch = towardIn ? t.GetInBranch() : t.GetOutBranch();
+                if (branch?.track == null)
+                    return null;
+                t = branch.track;
+                towardIn = !branch.first;
+            }
+            return null;
+        }
+
+        /// <summary>The junctions at each end of a track, for the console's "arrive
+        /// via" picker: { "in": n, "out": m }, either of which may be null.</summary>
+        public static string GetTrackJunctionsJson(string trackId)
+        {
+            return Updater.RunOnMainThread(() =>
+            {
+                var track = Component.FindObjectsOfType<RailTrack>()
+                    .FirstOrDefault(t =>
+                    {
+                        var id = t.LogicTrack()?.ID;
+                        return id != null && (id.ToString() == trackId
+                            || id.FullDisplayID == trackId || id.FullID == trackId);
+                    });
+                if (track == null)
+                    return Json("error", "no such track: " + trackId);
+                int? inEnd = JunctionIndexAtEnd(track, true);
+                int? outEnd = JunctionIndexAtEnd(track, false);
+                return new JObject
+                {
+                    ["track"] = trackId,
+                    ["in"] = inEnd == null ? JValue.CreateNull() : new JValue(inEnd.Value),
+                    ["out"] = outEnd == null ? JValue.CreateNull() : new JValue(outEnd.Value),
+                }.ToString(Formatting.None);
+            }).Result;
+        }
+
+        /// <summary>
+        /// Resolve "arrive through junction J-n" into which end of the destination the
+        /// train must come in by.
+        /// </summary>
+        private static bool? EndForJunction(int? viaJunction, RailTrack destTrack, out string error)
+        {
+            error = "";
+            if (viaJunction == null)
+                return null;
+            if (viaJunction == JunctionIndexAtEnd(destTrack, true))
+                return true;   // entered by the span-0 end
+            if (viaJunction == JunctionIndexAtEnd(destTrack, false))
+                return false;  // entered by the span-max end
+            error = $"J-{viaJunction} is not at either end of the destination";
+            return null;
+        }
+
+        public static string Start(string? locoGuid, string destId, float cruiseKmh,
+            bool couple = false, ArriveMode arrive = ArriveMode.Auto, int? viaJunction = null,
+            AutopilotMode mode = AutopilotMode.Drive, string? yardId = null,
+            bool uncoupleOnFinish = false)
+        {
+            return Updater.RunOnMainThread(() =>
+            {
+                if (!WorldStreamingInit.Instance || !WorldStreamingInit.IsLoaded)
+                    return Json("error", "world not loaded");
+                var car = ResolveLoco(locoGuid, out var resolveError);
+                if (car == null)
+                    return Json("error", resolveError);
+                var controller = car.GetComponent<RemoteControllerModule>();
+                if (controller == null)
+                    return Json("error", car.ID + " is not remote-controllable");
+                var bogies = car.Bogies;
+                if (bogies == null || bogies.Length < 2 || bogies[1].track == null)
+                    return Json("error", "loco not on a track");
+
+                var start = bogies[1].track;
+
+                // The two modes are not the same move with different numbers: each
+                // decides its own destination, its own speed and its own idea of what a
+                // reversal is worth, and each ignores the other's options outright
+                // rather than half-honouring them.
+                double reversalPenalty = mode == AutopilotMode.Shunt
+                    ? Routing.YardReversalPenalty
+                    : Routing.LineReversalPenalty;
+                if (mode == AutopilotMode.Drive)
+                {
+                    // A road move puts the train on the running line and leaves it
+                    // there. Shoving, coupling and picking an approach junction are
+                    // yard work, so they are dropped rather than obeyed halfway.
+                    couple = false;
+                    viaJunction = null;
+                    arrive = ArriveMode.Auto;
+                    if (string.IsNullOrEmpty(destId))
+                    {
+                        destId = Yards.MainLineFor(yardId, start, car, reversalPenalty, out var mainError);
+                        if (destId == null)
+                            return Json("error", mainError);
+                    }
+                }
+                else
+                {
+                    if (string.IsNullOrEmpty(destId))
+                        return Json("error", "a shunt needs a track to move to");
+                    // Yard pace whatever was asked for: a shunt is measured in metres,
+                    // and line speed between two sidings is how stock gets shoved
+                    // through the stop blocks.
+                    cruiseKmh = cruiseKmh <= 0f ? ManeuverKmh : Mathf.Min(cruiseKmh, ManeuverKmh);
+                }
+
+                var path = Routing.FindPath(start, destId, car, null, arrive, null, reversalPenalty);
+                if (path == null)
+                    return Json("error", "no route to " + destId);
+                // The only road found runs through somebody's parked stock. That used
+                // to be refused outright — but refusing is wrong for how a yard is
+                // actually worked: the dispatcher sends this move off and clears the
+                // obstruction with the next one, and stock that gets dispatched away
+                // counts as busy rather than parked from that moment. So the run
+                // starts, drives up, and stands short of the cars; the warning tells
+                // the dispatcher what it will be waiting for. If nothing is done
+                // about it the drive loop gives up on that road by itself.
+                string? warning = null;
+                if (Routing.BlockedRoute)
+                {
+                    var inTheWay = Routing.OccupiedTracks(path, car.trainset)
+                        .Select(t => t.LogicTrack()?.ID?.ToString())
+                        .Where(id => id != null && id != destId)
+                        .ToList();
+                    if (inTheWay.Count > 0)
+                    {
+                        warning = $"the road to {destId} runs through cars standing on "
+                            + string.Join(", ", inTheWay) + " — will pull up short of them";
+                    }
+                }
+
+                var destTrack = path[path.Count - 1];
+
+                // A shunt panel is opened on one yard and lists only that yard's
+                // tracks, so a destination outside it means the request and the picker
+                // have gone out of step — say so instead of quietly sending a yard
+                // pilot across the valley at 25 km/h.
+                if (mode == AutopilotMode.Shunt && !string.IsNullOrEmpty(yardId))
+                {
+                    // The yard's own running lines count as being in the yard: drawing a
+                    // cut out onto the main and putting it back is ordinary yard work,
+                    // and the road belongs to no yard of its own to be checked against.
+                    var destYard = Yards.YardOfTrack(destTrack);
+                    if (destYard != yardId && !Yards.IsMainLineOf(yardId, destId))
+                    {
+                        return Json("error",
+                            $"{destId} is not in {yardId} — send it there on the road first");
+                    }
+                }
+
+                // "Arrive through J-n" is the same constraint as the runaround uses:
+                // come in by that end of the destination.
+                bool? viaEnd = EndForJunction(viaJunction, destTrack, out var viaError);
+                if (viaError.Length > 0)
+                    return Json("error", viaError);
+                if (viaEnd != null)
+                {
+                    var viaPath = Routing.FindPath(start, destId, car, viaEnd, arrive, null, reversalPenalty);
+                    if (viaPath == null)
+                        return Json("error", $"no route into {destId} through J-{viaJunction}");
+                    path = viaPath;
+                    destTrack = path[path.Count - 1];
+                }
+
+                var legs = ComputeLegs(path);
+
+                // Re-routing a loco that is already driving replaces its own run and
+                // leaves every other loco alone. From here on the old run is gone, so
+                // anything that throws must not leave the loco coasting with its
+                // throttle open and nobody driving it — hence the catch below.
+                StopRun(car.CarGUID, brake: false);
+                try
+                {
+                // Asking a loco to go to the track it is already on means "take it to
+                // the other side": out onto the line, round, and back in the far end.
+                // Only when no via junction is given — a via picks the end
+                // deliberately, and the guess must not override it. A coupling move
+                // doesn't go round either: the cars are on this very track, so just
+                // drive up to them and hook on.
+                bool? arriveEnteredIn = viaEnd;
+                if (viaEnd == null && viaJunction == null && !couple && path.Count == 1)
+                {
+                    var (lo, hi) = MarkerZone(start);
+                    bool farEndHigh = bogies[1].traveller.Span < (lo + hi) / 2.0;
+                    // Reaching the high end means entering by the high end, which is
+                    // the track's OUT end, hence enteredIn = false.
+                    arriveEnteredIn = !farEndHigh;
+                    var round = Routing.FindPath(
+                        start, destId, car, arriveEnteredIn, arrive, null, reversalPenalty);
+                    if (round == null)
+                        arriveEnteredIn = null; // no way round: leave it where it is
+                    else
+                        path = round;
+                }
+                var run = new Run(car, controller)
+                {
+                    arriveEnteredIn = arriveEnteredIn,
+                    arrive = arrive,
+                    destTrack = path[path.Count - 1],
+                    detail = $"routing to {destId} ({path.Count} tracks, {legs.Count} leg(s))",
+                    couple = couple,
+                    carsAtStart = car.trainset?.cars?.Count ?? 1,
+                    uncoupleOnFinish = uncoupleOnFinish && mode == AutopilotMode.Shunt,
+                    mode = mode,
+                    reversalPenalty = reversalPenalty,
+                };
+                runs[run.guid] = run;
+                run.coroutine = Updater.Run(Drive(run, destId, cruiseKmh));
+                return new JObject
+                {
+                    ["state"] = "driving",
+                    ["loco"] = car.ID,
+                    ["guid"] = car.CarGUID,
+                    ["to"] = destId,
+                    ["mode"] = mode.ToString().ToLowerInvariant(),
+                    ["yard"] = string.IsNullOrEmpty(yardId) ? JValue.CreateNull() : new JValue(yardId!),
+                    ["couple"] = couple,
+                    ["arrive"] = arrive.ToString().ToLowerInvariant(),
+                    ["via"] = viaJunction == null ? JValue.CreateNull() : new JValue(viaJunction.Value),
+                    ["tracks"] = path.Count,
+                    ["legs"] = legs.Count,
+                    ["length"] = Math.Round(path.Sum(t => t.GetKinkedPointSet().span)),
+                    ["warning"] = warning == null ? JValue.CreateNull() : new JValue(warning),
+                }.ToString(Formatting.None);
+                }
+                catch (Exception e)
+                {
+                    // The old run has already been dropped, so there is nothing left
+                    // driving this loco. Leave it braked rather than rolling.
+                    controller.controlsOverrider.Throttle?.Set(0f);
+                    controller.controlsOverrider.Brake?.Set(1f);
+                    return Json("error", $"could not start: {e.Message}");
+                }
+            }).Result;
+        }
+
+        /// <summary>Read-only diagnostic: compute the route + leg split and dump how
+        /// each track's ends are classified, without moving anything. Lets a wrong
+        /// direction be debugged from data instead of by driving into things.</summary>
+        public static string GetPlanJson(string? locoGuid, string destId,
+            ArriveMode arrive = ArriveMode.Auto)
+        {
+            return Updater.RunOnMainThread(() =>
+            {
+                if (!WorldStreamingInit.Instance || !WorldStreamingInit.IsLoaded)
+                    return Json("error", "world not loaded");
+                var car = ResolveLoco(locoGuid, out var resolveError);
+                if (car == null)
+                    return Json("error", resolveError);
+                var bogies = car.Bogies;
+                if (bogies == null || bogies.Length < 2 || bogies[1].track == null)
+                    return Json("error", "loco not on a track");
+
+                var start = bogies[1].track;
+                var path = Routing.FindPath(start, destId, car, null, arrive);
+                if (path == null)
+                    return Json("error", "no route to " + destId);
+                // Same rule as Start: a destination we already stand on means the
+                // runaround, so the plan must show that and not the empty route.
+                if (path.Count == 1)
+                {
+                    var (mlo, mhi) = MarkerZone(start);
+                    bool high = bogies[1].traveller.Span < (mlo + mhi) / 2.0;
+                    path = Routing.FindPath(start, destId, car, !high, arrive) ?? path;
+                }
+                var legs = ComputeLegs(path);
+
+                string Id(RailTrack t) => t.LogicTrack()?.ID?.ToString() ?? "?";
+
+                // Occupied tracks on the route mean the router had to fall back to an
+                // occupancy-blind path — nothing else can put one here.
+                var occupied = Routing.OccupiedTracks(path, car.trainset);
+
+                var tracks = new JArray();
+                for (int i = 0; i < path.Count; i++)
+                {
+                    bool? entryFirst = i > 0 ? !ExitIsOut(path[i], path[i - 1]) : (bool?)null;
+                    bool? exitFirst = i < path.Count - 1 ? !ExitIsOut(path[i], path[i + 1]) : (bool?)null;
+                    tracks.Add(new JObject
+                    {
+                        ["i"] = i,
+                        ["id"] = Id(path[i]),
+                        ["entryEnd"] = entryFirst == null ? "-" : (entryFirst.Value ? "first" : "last"),
+                        ["exitEnd"] = exitFirst == null ? "-" : (exitFirst.Value ? "first" : "last"),
+                        ["reversal"] = entryFirst != null && exitFirst != null && entryFirst == exitFirst,
+                        ["span"] = Math.Round(path[i].GetKinkedPointSet().span),
+                        ["occupied"] = occupied.Contains(path[i]),
+                    });
+                }
+
+                float reverser = 1f;
+                if (legs.Count > 0 && legs[0].s < path.Count - 1)
+                    reverser = ExitIsOut(path[0], path[1]) == (bogies[1].TrackDirectionSign > 0) ? 1f : 0f;
+                var legArr = new JArray();
+                for (int li = 0; li < legs.Count; li++)
+                {
+                    if (li > 0) reverser = 1f - reverser;
+                    var (s, e) = legs[li];
+                    var pivot = li < legs.Count - 1 ? DivergingJunction(path[e], path[e + 1]) : null;
+                    legArr.Add(new JObject
+                    {
+                        ["leg"] = li,
+                        ["from"] = Id(path[s]),
+                        ["to"] = Id(path[e]),
+                        ["reverser"] = reverser,
+                        ["dir"] = reverser >= 0.5f ? "fwd" : "rev",
+                        ["hasPivot"] = pivot != null,
+                        ["pivotBranch"] = pivot == null ? JValue.CreateNull() : new JValue(pivot.Value.branch),
+                        ["pivotSelected"] = pivot == null ? JValue.CreateNull() : new JValue(pivot.Value.junction.selectedBranch),
+                    });
+                }
+
+                return new JObject
+                {
+                    ["loco"] = car.ID,
+                    ["from"] = Id(start),
+                    ["to"] = destId,
+                    ["trackDirectionSign"] = bogies[1].TrackDirectionSign,
+                    ["steps"] = new JArray(
+                        CompileSteps(path, legs, null, destId).Select(s => s.ToJson())),
+                    ["legs"] = legArr,
+                    ["tracks"] = tracks,
+                }.ToString(Formatting.None);
+            }).Result;
+        }
+
+        /// <summary>Diagnostic: command the reverser to v and trace its Value for
+        /// ~2.5 s while braked, so we can see whether Set latches / how it lerps.
+        /// No motion (throttle 0, brake 1 the whole time).</summary>
+        public static string RevTest(string? locoGuid, float v)
+        {
+            var tcs = new System.Threading.Tasks.TaskCompletionSource<string>();
+            Updater.RunOnMainThread(() =>
+            {
+                if (Updater.Run(RevTestCoro(locoGuid, v, tcs)) == null)
+                    tcs.TrySetResult(Json("error", "no updater"));
+            });
+            return tcs.Task.Result;
+        }
+
+        private static IEnumerator RevTestCoro(string? locoGuid, float v, System.Threading.Tasks.TaskCompletionSource<string> tcs)
+        {
+            var car = ResolveLoco(locoGuid, out var resolveError);
+            if (car == null)
+            {
+                tcs.TrySetResult(Json("error", resolveError));
+                yield break;
+            }
+            var controller = car.GetComponent<RemoteControllerModule>();
+            if (controller == null)
+            {
+                tcs.TrySetResult(Json("error", car.ID + " is not remote-controllable"));
+                yield break;
+            }
+            var o = controller.controlsOverrider;
+            o.Throttle?.Set(0f);
+            o.Brake?.Set(1f);
+            float before = o.Reverser?.Value ?? -99f;
+            o.Reverser?.Set(v);
+            var trace = new JArray();
+            for (int i = 0; i < 25; i++)
+            {
+                trace.Add((double)Math.Round(o.Reverser?.Value ?? -99f, 3));
+                yield return WaitForSecondsRealtime(0.1f);
+            }
+            var sim = car.SimController?.controlsOverrider;
+            tcs.TrySetResult(new JObject
+            {
+                ["set"] = v,
+                ["before"] = (double)Math.Round(before, 3),
+                ["after"] = (double)Math.Round(o.Reverser?.Value ?? -99f, 3),
+                ["trace"] = trace,
+                ["sameOverriderAsSim"] = sim != null && ReferenceEquals(o, sim),
+            }.ToString(Formatting.None));
+        }
+
+        /// <summary>Read-only: find the actual in-game track-sign markers near the
+        /// loco's current track and report their exact span on it, plus the consist's
+        /// bogie spans — so the parking zone is read from the real markers, not guessed.</summary>
+        public static string GetMarkerDebug(string? locoGuid)
+        {
+            return Updater.RunOnMainThread(() =>
+            {
+                var car = ResolveLoco(locoGuid, out var resolveError);
+                if (car == null)
+                    return Json("error", resolveError);
+                if (car.trainset == null || car.Bogies == null || car.Bogies.Length < 2)
+                    return Json("error", "loco has no bogies");
+                var track = car.Bogies[1].track;
+                if (track == null)
+                    return Json("error", "not on a track");
+
+                var pts = track.GetKinkedPointSet().points;
+                Vector3 move = WorldMover.currentMove;
+                double physSpan = track.GetKinkedPointSet().span;
+
+                (double span, float dist) Project(Vector3 wp)
+                {
+                    double best = 0;
+                    float bd = float.MaxValue;
+                    foreach (var p in pts)
+                    {
+                        float d = ((Vector3)p.position + move - wp).magnitude;
+                        if (d < bd) { bd = d; best = p.span; }
+                    }
+                    return (best, bd);
+                }
+
+                string ReadText(object o, string field)
+                {
+                    var tmp = o.GetType().GetField(field)?.GetValue(o);
+                    return tmp?.GetType().GetProperty("text")?.GetValue(tmp) as string ?? "";
+                }
+
+                // Track-sign markers within a few metres of this track.
+                var markers = new JArray();
+                foreach (var sh in Component.FindObjectsOfType<DV.Signs.TrackSignHover>())
+                {
+                    var (span, dist) = Project(sh.transform.position);
+                    if (dist > 12f)
+                        continue;
+                    markers.Add(new JObject
+                    {
+                        ["id"] = ReadText(sh, "trackID"),
+                        ["sub"] = ReadText(sh, "subYardID"),
+                        ["span"] = Math.Round(span, 1),
+                        ["dist"] = Math.Round(dist, 1),
+                    });
+                }
+
+                var bogies = new JArray();
+                foreach (var c in car.trainset.cars)
+                    foreach (var b in c.Bogies)
+                        if (b?.track == track)
+                            bogies.Add(new JObject { ["car"] = c.ID, ["span"] = Math.Round(b.traveller.Span, 1) });
+
+                return new JObject
+                {
+                    ["track"] = track.LogicTrack()?.ID?.ToString(),
+                    ["physSpan"] = Math.Round(physSpan, 1),
+                    ["markers"] = markers,
+                    ["bogies"] = bogies,
+                }.ToString(Formatting.None);
+            }).Result;
+        }
+
+        /// <summary>
+        /// Every named simulation port on a loco, with its live value — a scratch tool
+        /// for finding the ID of whatever drives a specific gauge or fuse (e.g. the TM
+        /// overheat fuse, which is a separate signal from GetEngineTemperatureState)
+        /// so the drive loop can watch it too. Not used by the drive loop itself.
+        /// </summary>
+        public static string GetPortsDebug(string? locoGuid)
+        {
+            return Updater.RunOnMainThread(() =>
+            {
+                var car = ResolveLoco(locoGuid, out var resolveError);
+                if (car == null)
+                    return Json("error", resolveError);
+                var simFlow = car.SimController?.simFlow;
+                if (simFlow == null)
+                    return Json("error", "loco has no simulation flow");
+
+                var ports = new JArray();
+                foreach (var p in simFlow.AllPorts)
+                {
+                    ports.Add(new JObject
+                    {
+                        ["id"] = p.id,
+                        ["value"] = Math.Round(p.Value, 4),
+                        ["type"] = p.type.ToString(),
+                        ["valueType"] = p.valueType.ToString(),
+                    });
+                }
+
+                var wsc = car.SimController?.wheelslipController;
+                JObject? wheelslip = null;
+                if (wsc != null)
+                {
+                    var curveKeys = new JArray();
+                    foreach (var k in wsc.wheelslipToAdhesionDrop.keys)
+                        curveKeys.Add(new JObject { ["time"] = k.time, ["value"] = k.value });
+                    wheelslip = new JObject
+                    {
+                        ["wheelslip"] = wsc.wheelslip,
+                        ["isWheelslipping"] = wsc.IsWheelslipping,
+                        ["maxWheelslipRpm"] = wsc.maxWheelslipRpm,
+                        ["orientedMaxWheelslipRpm"] = wsc.OrientedMaxWheelslipRpm,
+                        ["totalForceLimit"] = wsc.TotalForceLimit,
+                        ["curveKeys"] = curveKeys,
+                    };
+                }
+
+                return new JObject { ["ports"] = ports, ["wheelslip"] = wheelslip }.ToString(Formatting.None);
+            }).Result;
+        }
+
+        /// <summary>
+        /// Every run's reserved path and destination, plus the live track claims —
+        /// the exact data RunAheadOfUs/BlockedByWaitingRun compare to decide who waits
+        /// for whom. A scratch tool for "why is X waiting on Y" questions.
+        /// </summary>
+        public static string GetPathDebug()
+        {
+            return Updater.RunOnMainThread(() =>
+            {
+                var runsJson = new JObject();
+                foreach (var kv in runs)
+                {
+                    var run = kv.Value;
+                    runsJson[kv.Key] = new JObject
+                    {
+                        ["loco"] = run.id,
+                        ["state"] = run.state,
+                        ["destTrack"] = run.destTrack?.LogicTrack()?.ID?.ToString(),
+                        ["finalLeg"] = run.finalLeg,
+                        ["path"] = new JArray(run.path.Select(t => t.LogicTrack()?.ID?.ToString())),
+                        ["claimed"] = new JArray(run.claimed.Select(k =>
+                            $"{k.track.LogicTrack()?.ID}"
+                            + (k.via != null ? $" (via {k.via.LogicTrack()?.ID})" : " (start)"))),
+                    };
+                }
+                var claimsJson = new JObject();
+                foreach (var kv in claims)
+                {
+                    var label = $"{kv.Key.track.LogicTrack()?.ID}"
+                        + (kv.Key.via != null ? $" (via {kv.Key.via.LogicTrack()?.ID})" : " (start)");
+                    claimsJson[label] = kv.Value;
+                }
+
+                return new JObject { ["runs"] = runsJson, ["claims"] = claimsJson }
+                    .ToString(Formatting.None);
+            }).Result;
+        }
+
+        /// <summary>Stop one loco's autopilot, or every one of them when no guid is
+        /// given. Stopping one never disturbs the others.</summary>
+        /// <summary>Brake and forget every run, on the CALLER's thread. For the unload
+        /// path only, which already runs on the main thread: going through
+        /// Updater.RunOnMainThread there deadlocks the game outright, because the wait
+        /// blocks the very thread that would have to tick the updater to do the work.
+        /// </summary>
+        public static void StopAllHere()
+        {
+            foreach (var guid in runs.Keys.ToList())
+                StopRun(guid);
+        }
+
+        public static string Stop(string? locoGuid)
+        {
+            return Updater.RunOnMainThread(() =>
+            {
+                if (!string.IsNullOrEmpty(locoGuid))
+                {
+                    bool had = StopRun(locoGuid!);
+                    return new JObject
+                    {
+                        ["state"] = "stopped",
+                        ["guid"] = locoGuid,
+                        ["wasRunning"] = had,
+                    }.ToString(Formatting.None);
+                }
+
+                int count = runs.Count;
+                foreach (var guid in runs.Keys.ToList())
+                    StopRun(guid);
+                return new JObject { ["state"] = "stopped", ["stopped"] = count }
+                    .ToString(Formatting.None);
+            }).Result;
+        }
+
+        /// <summary>Halt one run's coroutine, brake the loco it was driving and forget
+        /// it. Returns whether there was a run. Main thread only.</summary>
+        /// <summary>
+        /// Stop every run and leave every loco braked, throttle shut, dynamic off —
+        /// called just before a mod reload. The reload kills the drive coroutines
+        /// without any of this, so a train reloaded mid-run kept its last throttle
+        /// with nobody aboard to take it back off, and crashed.
+        /// </summary>
+        public static void SecureAllForReload()
+        {
+            Updater.RunOnMainThread(() =>
+            {
+                foreach (var guid in runs.Keys.ToList())
+                {
+                    if (runs.TryGetValue(guid, out var run)
+                        && run.car != null && run.controller != null)
+                        run.controller.controlsOverrider.DynamicBrake?.Set(0f);
+                    StopRun(guid); // throttle shut, full brake
+                }
+            }).Wait();
+        }
+
+        /// <param name="brake">Leave the loco braked. False only when another run is
+        /// about to take it over in the same tick: grabbing the brake there would
+        /// drag a moving train down just to let the new route start it again.</param>
+        private static bool StopRun(string guid, bool brake = true)
+        {
+            if (!runs.TryGetValue(guid, out var run))
+                return false;
+            runs.Remove(guid);
+            ReleaseClaims(run);
+            if (run.coroutine != null)
+                Updater.StopRun(run.coroutine);
+            // The loco can have been despawned since; a destroyed TrainCar compares
+            // == null through Unity's operator, so this check covers both cases.
+            if (brake && run.car != null && run.controller != null)
+            {
+                run.controller.controlsOverrider.Throttle?.Set(0f);
+                run.controller.controlsOverrider.Brake?.Set(1f);
+            }
+            return true;
+        }
+    }
+}

@@ -1,0 +1,51 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <!--
+      Target the framework the game actually runs (Mono net_4_x, runtime
+      v4.0.30319) rather than netstandard2.0, matching compile-time to runtime.
+    -->
+    <TargetFramework>net48</TargetFramework>
+    <LangVersion>8.0</LangVersion>
+    <Nullable>enable</Nullable>
+    <RootNamespace>DvMod.Autopilot</RootNamespace>
+    <AssemblyName>Autopilot</AssemblyName>
+    <InformationalVersion>0.1.0</InformationalVersion>
+    <!--
+      Give every build its own assembly version, so UMM's reload actually swaps
+      in the new file instead of re-running Load on the one it already has.
+    -->
+    <Deterministic>false</Deterministic>
+    <AssemblyVersion>0.1.0.*</AssemblyVersion>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Krafs.Publicizer" Version="2.2.1"/>
+    <Publicize Include="Assembly-CSharp" IncludeCompilerGeneratedMembers="false"/>
+    <!-- Lets net48 build with only the .NET SDK, no Framework dev pack installed. -->
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="all"/>
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="Assembly-CSharp"/>
+    <Reference Include="DV.BrakeSystem"/>
+    <Reference Include="DV.Simulation"/>
+    <Reference Include="DV.Common"/>
+    <Reference Include="DV.Interaction"/>
+    <Reference Include="DV.PointSet"/>
+    <Reference Include="DV.RailTrack" />
+    <Reference Include="DV.SignPlacer"/>
+    <Reference Include="DV.ThingTypes"/>
+    <Reference Include="DV.Utils"/>
+    <Reference Include="Microsoft.CSharp"/>
+    <Reference Include="Newtonsoft.Json"/>
+    <Reference Include="net.smkd.vector3d"/>
+    <Reference Include="WorldStreamer" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="UnityEngine.CoreModule"/>
+    <Reference Include="UnityEngine.IMGUIModule"/>
+    <Reference Include="UnityEngine.PhysicsModule"/>
+    <PackageReference Include="UnityModManager" Version="0.27.2"/>
+  </ItemGroup>
+</Project>

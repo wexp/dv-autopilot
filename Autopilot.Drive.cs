@@ -75,20 +75,6 @@ namespace DvMod.Autopilot
                     if (run.leftDest && !AllOffTrack(car, run.destTrack))
                         run.reEntered = true;
                 }
-                // A non-couple run that GREW picked something up by buffer contact
-                // - an unplanned coupling. Driving on drags a train nobody asked
-                // for through the yard; stop dead and say so.
-                if (!run.couple && car.trainset?.cars != null
-                    && car.trainset.cars.Count > run.carsAtStart)
-                {
-                    overrider.Throttle?.Set(0f);
-                    overrider.Brake?.Set(1f);
-                    Finish(run, "error",
-                        "coupled onto stock it was never meant to touch - "
-                        + "cut it off and start the move again");
-                    yield break;
-                }
-
                 bool mayArrive;
                 if (run.arriveEnteredIn == null)
                     mayArrive = true;
@@ -531,19 +517,27 @@ namespace DvMod.Autopilot
                     yield break;
                 }
 
-                // Grew without meaning to: buffer contact couples, and a coupled-on
-                // rake must stop the run THIS tick - the once-per-leg check let it
-                // plow a parked train across the yard before anyone noticed.
+                // Grew without meaning to: buffers left touching re-couple on the
+                // slightest contact. Erroring out made a start next to a parked
+                // rake impossible - instead the strangers are cut straight off
+                // (we know exactly which cars are ours) and the move carries on.
                 if (!run.couple && car.trainset?.cars != null
                     && car.trainset.cars.Count > run.carsAtStart)
                 {
                     overrider.Throttle?.Set(0f);
-                    overrider.Brake?.Set(1f);
-                    Finish(run, "error",
-                        "coupled onto stock it was never meant to touch - "
-                        + "cut it off and start the move again");
-                    done(false);
-                    yield break;
+                    foreach (var c in car.trainset.cars.ToList())
+                    {
+                        if (c == null || !run.members.Contains(c.CarGUID))
+                            continue;
+                        foreach (var cp in new[] { c.frontCoupler, c.rearCoupler })
+                        {
+                            var other = cp?.coupledTo?.train;
+                            if (other != null && !run.members.Contains(other.CarGUID))
+                                CouplerLogic.Uncouple(cp);
+                        }
+                    }
+                    EnsureOneBrakeCutIn(car, car);
+                    run.detail = $"{phase}: brushed the stock alongside - cut it loose, carrying on";
                 }
 
                 float speed = Mathf.Abs(car.GetForwardSpeed()) * 3.6f; // km/h

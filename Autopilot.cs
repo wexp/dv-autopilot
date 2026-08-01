@@ -80,6 +80,10 @@ namespace DvMod.Autopilot
             /// <summary>Cars in our consist when the run began — coupling shows up as
             /// this number growing, which needs no guess about which train we met.</summary>
             public int carsAtStart;
+            /// <summary>EXACTLY which cars are ours, from the start. Buffers left
+            /// touching re-couple on the slightest contact; knowing our own lets
+            /// the run cut strangers loose again and carry on.</summary>
+            public readonly HashSet<string> members = new HashSet<string>();
             /// <summary>Which end of the destination to come in through: set by a via
             /// junction, or — when the destination is the track the loco already
             /// stands on and no via was given — guessed as the far end, meaning out,
@@ -172,6 +176,10 @@ namespace DvMod.Autopilot
                 this.controller = controller;
                 guid = car.CarGUID;
                 id = car.ID;
+                if (car.trainset?.cars != null)
+                    foreach (var c in car.trainset.cars)
+                        if (c != null)
+                            members.Add(c.CarGUID);
                 profile = Main.settings.autopilot.For(car.carLivery?.id);
             }
 

@@ -529,6 +529,21 @@ namespace DvMod.Autopilot
                     yield break;
                 }
 
+                // Grew without meaning to: buffer contact couples, and a coupled-on
+                // rake must stop the run THIS tick - the once-per-leg check let it
+                // plow a parked train across the yard before anyone noticed.
+                if (!run.couple && car.trainset?.cars != null
+                    && car.trainset.cars.Count > run.carsAtStart)
+                {
+                    overrider.Throttle?.Set(0f);
+                    overrider.Brake?.Set(1f);
+                    Finish(run, "error",
+                        "coupled onto stock it was never meant to touch - "
+                        + "cut it off and start the move again");
+                    done(false);
+                    yield break;
+                }
+
                 float speed = Mathf.Abs(car.GetForwardSpeed()) * 3.6f; // km/h
                 // How far our own cars reach beyond the reference bogie, so switch and
                 // limit distances are measured from the front of the train.

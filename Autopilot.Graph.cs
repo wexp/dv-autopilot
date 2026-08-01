@@ -177,7 +177,13 @@ namespace DvMod.Autopilot
                             branches.Add(ob.track);
                 foreach (var t in branches)
                     if (t != null && t != path[i] && t != path[i + 1] && ours.Contains(t))
+                    {
+                        Main.mod?.Logger.Log(
+                            $"[WRONGBRANCH] {loco.ID}: plan {path[i].LogicTrack()?.ID}"
+                            + $" -> {path[i + 1].LogicTrack()?.ID} via J-{JunctionIndex(junction)},"
+                            + $" our stock on third leg {t.LogicTrack()?.ID}");
                         return junction;
+                    }
             }
             return null;
         }

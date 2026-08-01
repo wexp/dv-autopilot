@@ -140,8 +140,7 @@ namespace DvMod.Autopilot
             /// same side while it holds them — the OPPOSITE side of the same track is a
             /// separate reservation, so two trains meeting a shared track from its two
             /// different ends never block each other.</summary>
-            public readonly HashSet<(RailTrack track, RailTrack? via)> claimed =
-                new HashSet<(RailTrack, RailTrack?)>();
+            public readonly HashSet<RailTrack> claimed = new HashSet<RailTrack>();
             /// <summary>Junctions this run holds. A junction is ONE exclusive block —
             /// the frog and all its legs — which is what makes two routes through
             /// it on different track pairs an actual conflict.</summary>
@@ -201,13 +200,9 @@ namespace DvMod.Autopilot
         // it were alone. A run may only drive over, and set switches into, a (track,
         // side) it holds; anyone else wanting the SAME side waits — a run approaching
         // the same track from its OTHER end holds a different key and is unaffected.
-        private static readonly Dictionary<(RailTrack track, RailTrack? via), string> claims =
-            new Dictionary<(RailTrack, RailTrack?), string>();
+        private static readonly Dictionary<RailTrack, string> claims =
+            new Dictionary<RailTrack, string>();
 
-        /// <summary>The neighbour a run enters path[i] from — the "side" half of a claim
-        /// key. Null at the start of the path: wherever the train already is has no
-        /// entry side of its own.</summary>
-        private static RailTrack? ViaFor(List<RailTrack> path, int i) => i > 0 ? path[i - 1] : null;
 
         // How far ahead to reserve, in path tracks. Enough to cover the switches being
         // set, short enough that a train crossing the map doesn't lock the whole route.
@@ -235,6 +230,11 @@ namespace DvMod.Autopilot
         private const double AuthorityPad = 50.0;
         /// <summary>Stop this far short of the end of held rail, m.</summary>
         private const double SignalMargin = 10.0;
+        /// <summary>A junction block is only handed back once the tail is THIS far
+        /// past it, m of body clearance. The switch-clearance margin (~5 m) was
+        /// enough to throw points but not to admit the next train: a follower's
+        /// authority extended through a frog the leader's tail had barely left.</summary>
+        private const double JunctionReleaseMargin = 15.0;
 
         // A train blocked this long gives its reservations up, so two trains that have
         // each half of a throat cannot sit there holding it against one another, m/s.
@@ -1061,18 +1061,17 @@ namespace DvMod.Autopilot
                         ["destTrack"] = run.destTrack?.LogicTrack()?.ID?.ToString(),
                         ["finalLeg"] = run.finalLeg,
                         ["path"] = new JArray(run.path.Select(t => t.LogicTrack()?.ID?.ToString())),
-                        ["claimed"] = new JArray(run.claimed.Select(k =>
-                            $"{k.track.LogicTrack()?.ID}"
-                            + (k.via != null ? $" (via {k.via.LogicTrack()?.ID})" : " (start)"))),
+                        ["claimed"] = new JArray(run.claimed.Select(t =>
+                            $"{t.LogicTrack()?.ID}")),
+                        ["junctions"] = new JArray(run.claimedJunctions.Select(j =>
+                            $"J-{JunctionIndex(j)}")),
                     };
                 }
                 var claimsJson = new JObject();
                 foreach (var kv in claims)
-                {
-                    var label = $"{kv.Key.track.LogicTrack()?.ID}"
-                        + (kv.Key.via != null ? $" (via {kv.Key.via.LogicTrack()?.ID})" : " (start)");
-                    claimsJson[label] = kv.Value;
-                }
+                    claimsJson[$"{kv.Key.LogicTrack()?.ID}"] = kv.Value;
+                foreach (var kv in junctionClaims)
+                    claimsJson[$"J-{JunctionIndex(kv.Key)}"] = kv.Value;
 
                 return new JObject { ["runs"] = runsJson, ["claims"] = claimsJson }
                     .ToString(Formatting.None);

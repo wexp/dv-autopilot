@@ -204,6 +204,7 @@ namespace DvMod.Autopilot
                     }
                 }
 
+                ReleaseOffPlan(run, path);
                 var legs = ComputeLegs(path);
                 run.steps = CompileSteps(
                     path, legs,
@@ -398,7 +399,7 @@ namespace DvMod.Autopilot
                 // Everything beyond the reservation is set later by the rolling check
                 // in DriveLeg, once it is close enough to be ours.
                 bool HeldByUs(int i) =>
-                    !claims.TryGetValue((path[i], ViaFor(path, i)), out var g) || g == run.guid;
+                    !claims.TryGetValue(path[i], out var g) || g == run.guid;
                 bool JunctionOurs(int i)
                 {
                     var j = JunctionBetween(path[i], path[i + 1]);
@@ -420,9 +421,9 @@ namespace DvMod.Autopilot
                 if (!ok)
                     yield break; // DriveLeg reported the error and braked
 
-                // Hand the rail back between legs; the next pass re-reserves from
-                // wherever the train actually ended up.
-                ReleaseClaims(run);
+                // Keep our holdings across legs - a full release opened a gap in
+                // which another run could take the rail under our standing train.
+                // The next plan trims anything it no longer uses.
                 prevReverser = reverser;
             }
 

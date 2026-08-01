@@ -30,12 +30,11 @@ namespace DvMod.Autopilot
             for (int i = 0; i < pathIdx && i < path.Count; i++)
             {
                 var track = path[i];
-                var key = (track, ViaFor(path, i));
-                if (!run.claimed.Contains(key) || OurCarsOn(run.car, track))
+                if (!run.claimed.Contains(track) || OurCarsOn(run.car, track))
                     continue;
-                if (claims.TryGetValue(key, out var guid) && guid == run.guid)
-                    claims.Remove(key);
-                run.claimed.Remove(key);
+                if (claims.TryGetValue(track, out var guid) && guid == run.guid)
+                    claims.Remove(track);
+                run.claimed.Remove(track);
             }
         }
 
@@ -163,20 +162,48 @@ namespace DvMod.Autopilot
             blockWants[key] = (run.seq, Time.realtimeSinceStartup);
         }
 
-        private static bool GrantTrack(Run run, RailTrack track, RailTrack? via, out string holder)
+        private static bool GrantTrack(Run run, RailTrack track, out string holder)
         {
             holder = "";
-            var key = (track, via);
-            if (claims.TryGetValue(key, out var guid) && guid != run.guid)
+            if (claims.TryGetValue(track, out var guid) && guid != run.guid)
             {
                 holder = RunNameOf(guid);
                 return false;
             }
-            if (WantedByOlder(key, run, out holder))
+            if (WantedByOlder(track, run, out holder))
                 return false;
-            claims[key] = run.guid;
-            run.claimed.Add(key);
+            // A block with somebody's stock STANDING on it does not grant, however
+            // the ledger reads - the release-margin behind a train is metres, and
+            // authority through a tail is how two locos met on a frog. The
+            // destination is the one exception: pulling up short of (or coupling
+            // to) what stands there is the drive loop's job.
+            if (track != run.destTrack && ForeignStockOn(track, run.car?.trainset))
+            {
+                holder = "stock standing on " + (track.LogicTrack()?.ID?.ToString() ?? "it");
+                return false;
+            }
+            claims[track] = run.guid;
+            run.claimed.Add(track);
             return true;
+        }
+
+        /// <summary>Any bogie of a consist that is not ours on this track.</summary>
+        private static bool ForeignStockOn(RailTrack track, Trainset? ours)
+        {
+            var registry = SingletonBehaviour<TrainCarRegistry>.Instance?.logicCarToTrainCar;
+            if (registry == null)
+                return false;
+            var logicTrack = track.LogicTrack();
+            if (logicTrack == null)
+                return false;
+            foreach (var lc in logicTrack.GetCarsFullyOnTrack().Concat(logicTrack.GetCarsPartiallyOnTrack()))
+            {
+                if (lc == null || !registry.TryGetValue(lc, out var tc) || tc == null)
+                    continue;
+                if (tc.trainset != ours)
+                    return true;
+            }
+            return false;
         }
 
         /// <summary>A junction grants to ONE run, and never while foreign stock
@@ -225,8 +252,7 @@ namespace DvMod.Autopilot
             atName = "";
             blockedTrack = null;
 
-            if (idx >= 0)
-                ForceHold(run, track, ViaFor(path, idx));
+            ForceHold(run, track);
 
             double granted = towardOut ? PhysicalSpan(track) - bogieSpan : bogieSpan;
             var t = track;
@@ -266,11 +292,11 @@ namespace DvMod.Autopilot
                     RegisterWant(junction, run);
                     break;
                 }
-                if (!GrantTrack(run, next, t, out heldBy))
+                if (!GrantTrack(run, next, out heldBy))
                 {
                     atName = next.LogicTrack()?.ID?.ToString() ?? "the next track";
                     blockedTrack = next;
-                    RegisterWant((next, (RailTrack?)t), run);
+                    RegisterWant(next, run);
                     break;
                 }
                 granted += PhysicalSpan(next);
@@ -284,14 +310,58 @@ namespace DvMod.Autopilot
         /// <summary>Hold the rail the train physically stands on, without asking:
         /// stock on the ground beats any reservation. Never steals a key another
         /// run holds - their claim is already useless with us standing here.</summary>
-        private static void ForceHold(Run run, RailTrack track, RailTrack? via)
+        private static void ForceHold(Run run, RailTrack track)
         {
-            var key = (track, via);
-            if (!claims.TryGetValue(key, out var guid) || guid == run.guid)
+            if (!claims.TryGetValue(track, out var guid) || guid == run.guid)
             {
-                claims[key] = run.guid;
-                run.claimed.Add(key);
+                claims[track] = run.guid;
+                run.claimed.Add(track);
             }
+        }
+
+        /// <summary>Hand back everything not on the CURRENT plan and not under our
+        /// wheels. Runs keep their holdings across legs - releasing everything
+        /// between legs opened a gap in which another run could take the rail
+        /// under a standing train - and this trims what a re-plan abandoned.</summary>
+        private static void ReleaseOffPlan(Run run, List<RailTrack> path)
+        {
+            var planned = new HashSet<RailTrack>(path);
+            List<RailTrack>? drop = null;
+            foreach (var track in run.claimed)
+                if (!planned.Contains(track) && !OurCarsOn(run.car, track))
+                    (drop ??= new List<RailTrack>()).Add(track);
+            if (drop != null)
+                foreach (var track in drop)
+                {
+                    if (claims.TryGetValue(track, out var guid) && guid == run.guid)
+                        claims.Remove(track);
+                    run.claimed.Remove(track);
+                }
+
+            var aheadJunctions = new HashSet<Junction>();
+            for (int i = 0; i + 1 < path.Count; i++)
+            {
+                var j = JunctionBetween(path[i], path[i + 1]);
+                if (j != null)
+                    aheadJunctions.Add(j);
+            }
+            List<Junction>? dropJ = null;
+            foreach (var j in run.claimedJunctions)
+            {
+                if (aheadJunctions.Contains(j))
+                    continue;
+                if (run.car != null
+                    && JunctionBlocker(j, run.car.trainset, JunctionReleaseMargin) != null)
+                    continue;
+                (dropJ ??= new List<Junction>()).Add(j);
+            }
+            if (dropJ != null)
+                foreach (var j in dropJ)
+                {
+                    if (junctionClaims.TryGetValue(j, out var guid) && guid == run.guid)
+                        junctionClaims.Remove(j);
+                    run.claimedJunctions.Remove(j);
+                }
         }
 
         /// <summary>Junctions this run holds that its tail has cleared and its plan
@@ -313,7 +383,8 @@ namespace DvMod.Autopilot
             {
                 if (aheadJunctions.Contains(j))
                     continue;
-                if (run.car != null && ConsistFoulsJunction(j, run.car.trainset))
+                if (run.car != null
+                    && JunctionBlocker(j, run.car.trainset, JunctionReleaseMargin) != null)
                     continue;
                 done.Add(j);
             }
@@ -335,20 +406,20 @@ namespace DvMod.Autopilot
         {
             if (run.car == null)
                 return;
-            List<(RailTrack, RailTrack?)>? giveTracks = null;
-            foreach (var key in run.claimed)
+            List<RailTrack>? giveTracks = null;
+            foreach (var track in run.claimed)
             {
-                if (OurCarsOn(run.car, key.track))
+                if (OurCarsOn(run.car, track))
                     continue;
-                if (WantedByOlder(key, run, out _))
-                    (giveTracks ??= new List<(RailTrack, RailTrack?)>()).Add(key);
+                if (WantedByOlder(track, run, out _))
+                    (giveTracks ??= new List<RailTrack>()).Add(track);
             }
             if (giveTracks != null)
-                foreach (var key in giveTracks)
+                foreach (var track in giveTracks)
                 {
-                    if (claims.TryGetValue(key, out var guid) && guid == run.guid)
-                        claims.Remove(key);
-                    run.claimed.Remove(key);
+                    if (claims.TryGetValue(track, out var guid) && guid == run.guid)
+                        claims.Remove(track);
+                    run.claimed.Remove(track);
                 }
 
             List<Junction>? giveJunctions = null;
@@ -406,7 +477,7 @@ namespace DvMod.Autopilot
                 // Someone else's reservation means it is not ours to set OR to enter —
                 // for THIS side of it; entering path[i + 1] from path[i] is a distinct
                 // claim from entering it from its other end.
-                if (claims.TryGetValue((path[i + 1], path[i]), out var holder) && holder != run.guid)
+                if (claims.TryGetValue(path[i + 1], out var holder) && holder != run.guid)
                 {
                     distance = ahead;
                     // Another train's reservation clears by itself; never route round it.
@@ -898,7 +969,7 @@ namespace DvMod.Autopilot
 
             foreach (var kv in claims)
                 if (kv.Value != ourGuid)
-                    Bump(kv.Key.track, ClaimedRoadPenalty);
+                    Bump(kv.Key, ClaimedRoadPenalty);
 
             foreach (var kv in runs)
             {

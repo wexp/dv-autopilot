@@ -56,6 +56,11 @@ namespace DvMod.Autopilot
                     yield break;
                 }
 
+                // Nothing moves with a handbrake pinned, and pins appear mid-run:
+                // our own finishing tie-down leaves one on every cut (including a
+                // split-off loco), so every leg starts by winding them all off.
+                ReleaseHandbrakes(car);
+
                 // Done when the whole consist is fully within the destination — or,
                 // on a coupling run, as soon as our train has grown.
                 // A runaround only counts as arrived once the train has actually left
@@ -76,6 +81,9 @@ namespace DvMod.Autopilot
                     // Hooked on. From here it is an ordinary spot, with the cars we
                     // just joined being shoved up the track ahead of us.
                     run.coupledDone = true;
+                    // The train we just picked up may be tied down — our own
+                    // finishing tie-down pins a handbrake on every cut it leaves.
+                    ReleaseHandbrakes(car);
                     run.detail = $"coupled; tucking the train into {destId}";
                     // If what we just hooked onto includes locos, they must not
                     // fight the lead unit's brake handle.

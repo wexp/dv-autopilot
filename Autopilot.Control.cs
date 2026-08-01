@@ -17,10 +17,12 @@ namespace DvMod.Autopilot
     /// down.</summary>
     public static partial class Autopilot
     {
-        /// <summary>Wind off the handbrakes on the wagons of this consist. A parked rake
-        /// is left with them on, and no amount of throttle moves a train that is still
-        /// tied down — it just reads as "stuck". The locos are left alone: their own
-        /// brakes are the overrider's business.</summary>
+        /// <summary>Wind off the handbrakes on EVERY car of this consist — wagons
+        /// and locos alike. A parked rake is left tied down (our own tie-down pins
+        /// one on each delivered cut), and no amount of throttle moves a train
+        /// that still has one set — it just reads as "stuck". Checked at every
+        /// leg, not once per run: coupling adds cars mid-run and they arrive with
+        /// whatever brakes their last shunter left pinned.</summary>
         private static void ReleaseHandbrakes(TrainCar loco)
         {
             var cars = loco.trainset?.cars;
@@ -28,7 +30,7 @@ namespace DvMod.Autopilot
                 return;
             foreach (var c in cars)
             {
-                if (c == null || c.IsLoco)
+                if (c == null)
                     continue;
                 var brakes = c.brakeSystem;
                 if (brakes != null && brakes.hasHandbrake && brakes.handbrakePosition > 0f)

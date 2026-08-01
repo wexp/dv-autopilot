@@ -556,6 +556,26 @@ namespace DvMod.Autopilot
                         out cachedAuthorityBlocked);
                     ReleaseJunctionsBehind(run, path, Math.Max(0, authIdx));
                     PreemptWantedBlocks(run);
+
+                    // Tripwire: any of our wheels on rail somebody else holds is a
+                    // violation of the whole model - name the moment, the rail, the
+                    // holder and what we thought we were doing, in the mod log.
+                    foreach (var c in car.trainset.cars)
+                    {
+                        if (c == null)
+                            continue;
+                        foreach (var b in c.Bogies)
+                        {
+                            if (b?.track == null)
+                                continue;
+                            if (claims.TryGetValue(b.track, out var vg) && vg != run.guid)
+                                Main.mod?.Logger.Log(
+                                    $"[VIOLATION] {run.id} bogie on "
+                                    + $"{b.track.LogicTrack()?.ID} held by {RunNameOf(vg)}"
+                                    + $" | auth={cachedAuthority:F0} at={cachedAuthorityAt}"
+                                    + $" | {run.detail}");
+                        }
+                    }
                 }
                 float limit = cachedLimit;
 
@@ -1222,7 +1242,8 @@ namespace DvMod.Autopilot
                 run.limitKmh = limit;
                 float signedSpeed = car.GetForwardSpeed() * 3.6f;
                 run.detail += $" [{track.LogicTrack()?.ID} rev{reverser:F0} v{signedSpeed:+0;-0;0} "
-                    + $"tgt{target:F0} lim{limit:F0} th{throttle:F2} clr{(clearAhead == double.MaxValue ? 999 : clearAhead):F0}]";
+                    + $"tgt{target:F0} lim{limit:F0} th{throttle:F2} clr{(clearAhead == double.MaxValue ? 999 : clearAhead):F0}"
+                    + $" auth{(cachedAuthority == double.MaxValue ? 9999 : cachedAuthority):F0}]";
 
                 // Stuck watchdog only while we actually want to move.
                 if (speed < 0.5f && target > 2f)

@@ -75,6 +75,20 @@ namespace DvMod.Autopilot
                     if (run.leftDest && !AllOffTrack(car, run.destTrack))
                         run.reEntered = true;
                 }
+                // A non-couple run that GREW picked something up by buffer contact
+                // - an unplanned coupling. Driving on drags a train nobody asked
+                // for through the yard; stop dead and say so.
+                if (!run.couple && car.trainset?.cars != null
+                    && car.trainset.cars.Count > run.carsAtStart)
+                {
+                    overrider.Throttle?.Set(0f);
+                    overrider.Brake?.Set(1f);
+                    Finish(run, "error",
+                        "coupled onto stock it was never meant to touch - "
+                        + "cut it off and start the move again");
+                    yield break;
+                }
+
                 bool mayArrive;
                 if (run.arriveEnteredIn == null)
                     mayArrive = true;

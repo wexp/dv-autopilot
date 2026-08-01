@@ -454,13 +454,19 @@ namespace DvMod.Autopilot
         /// and holds us for nothing. MaxValue if clear.
         /// </summary>
         private static double ObstacleDistanceWorld(
-            TrainCar loco, Vector3 motion, HashSet<RailTrack> corridor, double maxDist)
+            TrainCar loco, Vector3 motion, HashSet<RailTrack> corridor, double maxDist,
+            TrainCar? front = null)
         {
             var registry = SingletonBehaviour<TrainCarRegistry>.Instance?.logicCarToTrainCar;
             if (registry == null)
                 return double.MaxValue;
             var ours = loco.trainset;
-            Vector3 origin = loco.transform.position;
+            // Measure from the LEADING CAR when the caller knows it. From the loco,
+            // a long consist around a yard curve put the cars its front was about
+            // to hit outside the straight-line lateral window — and the close-range
+            // "anything in front" guard protected the LOCO's surroundings while the
+            // front ran into a parked rake a hundred metres away.
+            Vector3 origin = (front != null ? front : loco).transform.position;
 
             // Where our own train's leading edge is, projected along the motion axis
             // (the train may extend ahead of the loco when reversing).
@@ -618,6 +624,24 @@ namespace DvMod.Autopilot
                 {
                     railEnd = cum;
                     break;
+                }
+                // Stock FOULING the junction we are about to cross, from any of its
+                // branches. Its bogies sit on a track this walk never touches, so
+                // the per-track scan above is blind to it — that is how a consist
+                // sideswiped a parked rake overhanging a frog at SW.
+                var crossing = outward ? t.outJunction : t.inJunction;
+                if (crossing != null)
+                {
+                    foreach (var fouler in CarsAround(crossing, null))
+                    {
+                        if (fouler == null || fouler.trainset == ours)
+                            continue;
+                        if (BodyDistanceToJunction(crossing, fouler) < FoulingTolerance)
+                        {
+                            foreign = Math.Min(foreign, cum);
+                            break;
+                        }
+                    }
                 }
                 t = branch.track;
                 outward = branch.first;

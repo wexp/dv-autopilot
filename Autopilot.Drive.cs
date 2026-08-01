@@ -924,7 +924,9 @@ namespace DvMod.Autopilot
                         car, track, bogie.traveller.Span, towardOut, lookahead,
                         out corridor, out ownLead, out railEnd);
                 double clearAhead = Math.Min(
-                    ObstacleDistanceWorld(car, lookMotion, corridor, lookahead), railAhead);
+                    ObstacleDistanceWorld(car, lookMotion, corridor, lookahead,
+                        lead != null ? lead.Value.car : null),
+                    railAhead);
 
                 // No rail, no driving: brake to a stand short of any end the
                 // connected track ahead comes to — an unaligned turntable, a stub

@@ -147,6 +147,11 @@ namespace DvMod.Autopilot
             /// Read once at the start: the settings are edited between runs, not during.</summary>
             public readonly LocoProfile profile;
 
+            /// <summary>The speed limit binding the train RIGHT NOW, km/h — posted
+            /// limits plus the junction and turntable caps. For the console's
+            /// status line; 0 until the first drive tick writes it.</summary>
+            public float limitKmh;
+
             /// <summary>Acceleration this train is currently allowed, m/s². Lives on the
             /// run, not on the leg: what the wheels did on the last leg is exactly what
             /// they will do on the next, so the lesson must survive a reversal.
@@ -174,6 +179,7 @@ namespace DvMod.Autopilot
                 ["loco"] = id,
                 ["guid"] = guid,
                 ["mode"] = mode.ToString().ToLowerInvariant(),
+                ["limit"] = Math.Round(limitKmh),
                 ["steps"] = new JArray(steps.Select(s => s.ToJson())),
             };
         }

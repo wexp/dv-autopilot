@@ -1037,6 +1037,7 @@ namespace DvMod.Autopilot
                     tempWarning || tmWarning,
                     tempCritical || tmCritical);
 
+                run.limitKmh = limit;
                 float signedSpeed = car.GetForwardSpeed() * 3.6f;
                 run.detail += $" [{track.LogicTrack()?.ID} rev{reverser:F0} v{signedSpeed:+0;-0;0} "
                     + $"tgt{target:F0} lim{limit:F0} th{throttle:F2} clr{(clearAhead == double.MaxValue ? 999 : clearAhead):F0}]";

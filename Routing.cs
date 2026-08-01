@@ -489,7 +489,13 @@ namespace DvMod.Autopilot
                         if (foreignCost != null && foreignCost.TryGetValue(track, out var fc))
                             busy += fc;
                         // Leaving by the end we came in = a reversal: no ground covered,
-                        // but a stop and a change of ends.
+                        // but a stop and a change of ends - and only possible at all
+                        // where the train can draw its whole length clear past the
+                        // pivot. Reversing on a 10 m frog stub overran the ladder
+                        // into a parked rake; a pivot without room is no pivot.
+                        if (exitIn == enteredIn
+                            && !ReversalRoom(track, enteredIn, trainLength, occupancy))
+                            continue;
                         cost = (exitIn == enteredIn ? reversalPenalty : span) + busy;
                     }
 
@@ -522,6 +528,34 @@ namespace DvMod.Autopilot
                 path.Add(c.Value.Item1);
             path.Reverse();
             return path;
+        }
+
+        /// <summary>
+        /// Can a train of this length draw itself fully past a reversal on this
+        /// track? Walks from the track's far end along the switches as they lie,
+        /// accumulating clear rail; any stock in that overrun corridor, or the
+        /// rail simply ending, means the pivot has no room.
+        /// </summary>
+        private static bool ReversalRoom(
+            RailTrack track, bool enteredIn, double trainLength, Occupancy? occupancy)
+        {
+            double room = track.GetKinkedPointSet().span;
+            var current = track;
+            // Entered by the IN end means the far end is the OUT end.
+            bool outward = enteredIn;
+            var seen = new HashSet<RailTrack> { track };
+            while (room < trainLength)
+            {
+                var branch = outward ? current.GetOutBranch() : current.GetInBranch();
+                if (branch?.track == null || !seen.Add(branch.track))
+                    return false;
+                current = branch.track;
+                outward = branch.first;
+                if (occupancy != null && occupancy.Any(current))
+                    return false;
+                room += current.GetKinkedPointSet().span;
+            }
+            return true;
         }
 
         /// <summary>The track the loco with the given car GUID is sitting on — or the

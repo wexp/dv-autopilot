@@ -240,10 +240,29 @@ namespace DvMod.Autopilot
         /// <summary>True once our train has more cars than it set off with — the
         /// plainest possible test that a coupling actually took, with no guessing about
         /// which train we met or which end we met it by.</summary>
+        /// <summary>Did the train we picked up include stock standing on the
+        /// DESTINATION? "Couple to the train there" means there - hooking the
+        /// first rake met along the way is a mistake to undo, not a success.</summary>
+        private static bool GainedTouchesDest(Run run)
+        {
+            var cars = run.car?.trainset?.cars;
+            if (cars == null || run.destTrack == null)
+                return false;
+            foreach (var c in cars)
+            {
+                if (c == null || run.members.Contains(c.CarGUID))
+                    continue;
+                foreach (var b in c.Bogies)
+                    if (b?.track == run.destTrack)
+                        return true;
+            }
+            return false;
+        }
+
         private static bool Coupled(Run run)
         {
             int now = run.car?.trainset?.cars?.Count ?? 0;
-            return now > run.carsAtStart;
+            return now > run.carsAtStart && GainedTouchesDest(run);
         }
 
         /// <summary>True when no bogie of our consist is on the given track.</summary>

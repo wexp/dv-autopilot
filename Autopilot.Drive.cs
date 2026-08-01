@@ -521,8 +521,9 @@ namespace DvMod.Autopilot
                 // slightest contact. Erroring out made a start next to a parked
                 // rake impossible - instead the strangers are cut straight off
                 // (we know exactly which cars are ours) and the move carries on.
-                if (!run.couple && car.trainset?.cars != null
-                    && car.trainset.cars.Count > run.carsAtStart)
+                if (car.trainset?.cars != null
+                    && car.trainset.cars.Count > run.carsAtStart
+                    && !(run.couple && GainedTouchesDest(run)))
                 {
                     overrider.Throttle?.Set(0f);
                     foreach (var c in car.trainset.cars.ToList())
@@ -760,7 +761,15 @@ namespace DvMod.Autopilot
                         yield break;
                     }
 
-                    bool inRange = remote != null
+                    // Only the DESTINATION's train is a coupling target. Anything
+                    // else in range - a rake parked on a leg of the route - is an
+                    // obstacle, and hooking it dragged the D5I train around GF.
+                    bool destTrainNear = run.destTrack != null
+                        && ForeignStockOn(run.destTrack, car.trainset)
+                        && (AnyCarOnTrack(car, destId)
+                            || NextForeignIsOn(run.destTrack, car, track,
+                                bogie.traveller.Span, towardOut));
+                    bool inRange = destTrainNear && remote != null
                         && remote.IsCouplerInRange(ExternalCouplingHandler.COUPLING_RANGE);
                     if (inRange)
                     {
@@ -1114,11 +1123,13 @@ namespace DvMod.Autopilot
                     target = Mathf.Min(target, TurntableKmh);
                 // On a coupling run the train ahead is the target, not a hazard, so the
                 // guard closes right up to buffer contact instead of holding off.
-                double buffer = run.couple && lastLeg ? CoupleBuffer : ObstacleBuffer;
+                bool coupleTarget = run.couple && lastLeg && run.destTrack != null
+                    && NextForeignIsOn(run.destTrack, car, track, bogie.traveller.Span, towardOut);
+                double buffer = coupleTarget ? CoupleBuffer : ObstacleBuffer;
                 if (clearAhead != double.MaxValue)
                 {
                     float vObstacle = Mathf.Sqrt(2f * ObstacleDecel * (float)Math.Max(0, clearAhead - buffer)) * 3.6f;
-                    if (run.couple && lastLeg)
+                    if (coupleTarget)
                         vObstacle = Mathf.Max(vObstacle, CoupleKmh); // creep on regardless
                     if (vObstacle < target)
                         target = vObstacle;

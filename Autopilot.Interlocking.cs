@@ -47,6 +47,69 @@ namespace DvMod.Autopilot
             }
         }
 
+        /// <summary>Is the nearest foreign stock along the rail ahead part of the
+        /// train standing on <paramref name="destTrack"/>? Decides whether what
+        /// the run is closing on is its coupling TARGET or just something parked
+        /// in the way.</summary>
+        private static bool NextForeignIsOn(
+            RailTrack destTrack, TrainCar loco, RailTrack start, double startSpan, bool towardOut)
+        {
+            var registry = SingletonBehaviour<TrainCarRegistry>.Instance?.logicCarToTrainCar;
+            if (registry == null)
+                return false;
+            var ours = loco.trainset;
+            double best = double.MaxValue;
+            TrainCar? nearest = null;
+            double cum = 0;
+            RailTrack? t = start;
+            double refSpan = startSpan;
+            bool outward = towardOut;
+            var seen = new HashSet<RailTrack>();
+            for (int step = 0; step < 40 && cum < 400 && t != null && seen.Add(t); step++)
+            {
+                var logicTrack = t.LogicTrack();
+                if (logicTrack != null)
+                {
+                    foreach (var lc in logicTrack.GetCarsFullyOnTrack().Concat(logicTrack.GetCarsPartiallyOnTrack()))
+                    {
+                        if (lc == null || !registry.TryGetValue(lc, out var tc) || tc == null
+                            || tc.trainset == ours)
+                            continue;
+                        foreach (var b in tc.Bogies)
+                        {
+                            if (b == null || b.track != t)
+                                continue;
+                            double rel = outward ? b.traveller.Span - refSpan : refSpan - b.traveller.Span;
+                            if (rel <= 0)
+                                continue;
+                            if (cum + rel < best)
+                            {
+                                best = cum + rel;
+                                nearest = tc;
+                            }
+                        }
+                    }
+                }
+                cum += outward ? PhysicalSpan(t) - refSpan : refSpan;
+                var branch = outward ? t.GetOutBranch() : t.GetInBranch();
+                if (branch?.track == null)
+                    break;
+                t = branch.track;
+                outward = branch.first;
+                refSpan = branch.first ? 0.0 : PhysicalSpan(t);
+            }
+            if (nearest == null)
+                return false;
+            var cars = nearest.trainset?.cars;
+            if (cars == null)
+                return false;
+            foreach (var c in cars)
+                foreach (var b in c.Bogies)
+                    if (b?.track == destTrack)
+                        return true;
+            return false;
+        }
+
         /// <summary>Span of the nearest bogie on this track belonging to a car OUTSIDE
         /// our consist — the train a same-track coupling move should drive toward.
         /// NaN when the track holds nothing but us.</summary>

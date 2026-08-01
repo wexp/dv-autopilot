@@ -146,44 +146,95 @@ namespace DvMod.Autopilot
         }
 
         /// <summary>
-        /// A junction on the plan that our OWN stock currently runs through on a
-        /// branch the plan does not use — the train's front went down the wrong
-        /// road (shoved past a switch set the other way), and the plan cannot be
-        /// driven until the front backs off it. Null when the train lies along
-        /// its plan.
+        /// A junction on the plan that our train's LEADING END has run through on
+        /// a branch the plan does not use - shoved past a switch set the other
+        /// way. Only the front counts: a long train's TAIL legitimately drapes
+        /// over a junction's other legs while the front is far up the road, and
+        /// treating that as a wrong road sent a full consist backing into parked
+        /// stock. Null when the train lies along its plan.
         /// </summary>
-        private static Junction? WrongBranchJunction(TrainCar loco, List<RailTrack> path)
+        private static Junction? WrongBranchJunction(TrainCar loco, List<RailTrack> path, bool locoForward)
         {
-            var ours = new HashSet<RailTrack>();
             var cars = loco.trainset?.cars;
             if (cars == null)
                 return null;
-            foreach (var c in cars)
-                foreach (var b in c.Bogies)
-                    if (b?.track != null)
-                        ours.Add(b.track);
+
+            // The consist ordered from the LEADING car back to the trailing one.
+            var ordered = new List<TrainCar>();
+            {
+                TrainCar cur = loco;
+                bool fwd = locoForward;
+                var seen = new HashSet<TrainCar> { loco };
+                while (true)
+                {
+                    var exit = fwd ? cur.frontCoupler : cur.rearCoupler;
+                    var next = exit?.coupledTo?.train;
+                    if (next == null || !seen.Add(next))
+                        break;
+                    fwd = exit!.coupledTo == next.rearCoupler;
+                    cur = next;
+                }
+                // cur is the leading car, fwd its orientation along travel; now
+                // walk the whole train from it.
+                ordered.Add(cur);
+                var seen2 = new HashSet<TrainCar> { cur };
+                bool back = !fwd; // walk against travel
+                while (true)
+                {
+                    var exit = back ? cur.frontCoupler : cur.rearCoupler;
+                    var next = exit?.coupledTo?.train;
+                    if (next == null || !seen2.Add(next))
+                        break;
+                    back = exit!.coupledTo == next.frontCoupler;
+                    cur = next;
+                    ordered.Add(cur);
+                }
+            }
 
             for (int i = 0; i + 1 < path.Count; i++)
             {
                 var junction = JunctionBetween(path[i], path[i + 1]);
                 if (junction == null)
                     continue;
-                var branches = new List<RailTrack?>();
-                if (junction.inBranch?.track != null)
-                    branches.Add(junction.inBranch.track);
+                var planLegs = new HashSet<RailTrack> { path[i], path[i + 1] };
+                var thirdLegs = new HashSet<RailTrack>();
+                if (junction.inBranch?.track != null && !planLegs.Contains(junction.inBranch.track))
+                    thirdLegs.Add(junction.inBranch.track);
                 if (junction.outBranches != null)
                     foreach (var ob in junction.outBranches)
-                        if (ob?.track != null)
-                            branches.Add(ob.track);
-                foreach (var t in branches)
-                    if (t != null && t != path[i] && t != path[i + 1] && ours.Contains(t))
+                        if (ob?.track != null && !planLegs.Contains(ob.track))
+                            thirdLegs.Add(ob.track);
+                if (thirdLegs.Count == 0)
+                    continue;
+
+                // First car FROM THE FRONT standing on any leg of this junction
+                // decides: on a third leg only = the front went the wrong way; on
+                // a plan leg = everything behind is tail overhang, not a wrong
+                // road.
+                foreach (var c in ordered)
+                {
+                    bool onPlan = false, onThird = false;
+                    foreach (var b in c.Bogies)
+                    {
+                        if (b?.track == null)
+                            continue;
+                        if (planLegs.Contains(b.track))
+                            onPlan = true;
+                        else if (thirdLegs.Contains(b.track))
+                            onThird = true;
+                    }
+                    if (!onPlan && !onThird)
+                        continue;
+                    if (onThird && !onPlan)
                     {
                         Main.mod?.Logger.Log(
-                            $"[WRONGBRANCH] {loco.ID}: plan {path[i].LogicTrack()?.ID}"
-                            + $" -> {path[i + 1].LogicTrack()?.ID} via J-{JunctionIndex(junction)},"
-                            + $" our stock on third leg {t.LogicTrack()?.ID}");
+                            $"[WRONGBRANCH] {loco.ID}: front car {c.ID} on off-plan leg of "
+                            + $"J-{JunctionIndex(junction)} "
+                            + $"({path[i].LogicTrack()?.ID} -> {path[i + 1].LogicTrack()?.ID})");
                         return junction;
                     }
+                    break; // front-most presence is on the plan: tail overhang
+                }
             }
             return null;
         }

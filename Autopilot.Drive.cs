@@ -261,7 +261,7 @@ namespace DvMod.Autopilot
                 // shunter's: back up until the front is clear of that junction, throw
                 // it, and go again. Detected by our own stock standing on a branch of
                 // a planned junction that the plan itself does not touch.
-                var wrongJ = WrongBranchJunction(car, path);
+                var wrongJ = WrongBranchJunction(car, path, reverser >= 0.5f);
                 if (wrongJ != null)
                 {
                     float backRev = ExitIsOut(path[0], path.Count >= 2 ? path[1] : path[0])

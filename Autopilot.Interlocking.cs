@@ -517,6 +517,40 @@ namespace DvMod.Autopilot
         }
 
         /// <summary>
+        /// The car at the LEADING end of the train in the direction of travel, with
+        /// its reference bogie and which way along that bogie's track the train is
+        /// heading. Walked through the couplers from the loco, flipping orientation
+        /// at each joint. The obstacle walk must start HERE: starting at the loco
+        /// and following the set switches diverged from where a long consist
+        /// actually lay — a junction under the train can be thrown differently
+        /// than the wagons crossed it — and the guard then looked down the wrong
+        /// road while the front of the train ran into parked stock.
+        /// </summary>
+        private static (Bogie bogie, bool towardOut, TrainCar car, bool forward)? LeadingEnd(
+            TrainCar loco, bool locoForward)
+        {
+            TrainCar cur = loco;
+            bool forward = locoForward;
+            var seen = new HashSet<TrainCar> { loco };
+            while (true)
+            {
+                var exit = forward ? cur.frontCoupler : cur.rearCoupler;
+                var next = exit?.coupledTo?.train;
+                if (next == null || !seen.Add(next))
+                    break;
+                // Entering the next car by its REAR coupler means travel runs
+                // toward its front — its forward axis agrees with the motion.
+                forward = exit!.coupledTo == next.rearCoupler;
+                cur = next;
+            }
+            var bogies = cur.Bogies;
+            if (bogies == null || bogies.Length < 2 || bogies[1] == null || bogies[1].track == null)
+                return null;
+            var bogie = bogies[1];
+            return (bogie, forward == (bogie.TrackDirectionSign > 0), cur, forward);
+        }
+
+        /// <summary>
         /// Distance (m) to the nearest car that isn't ours, walking the ACTUAL rail in
         /// the travel direction (following the set switches). Curve-safe, unlike the
         /// straight-line world check that went blind around the yard throat and let us

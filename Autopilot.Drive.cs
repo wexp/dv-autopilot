@@ -823,11 +823,24 @@ namespace DvMod.Autopilot
                 double lookahead = Math.Min(
                     MaxObstacleLookahead,
                     Math.Max(80.0, vMs * vMs / (2f * ObstacleDecel) + ObstacleBuffer * 4));
-                double railAhead = ObstacleDistanceRail(
-                    car, track, bogie.traveller.Span, towardOut, lookahead,
-                    out var corridor, out double ownLead, out double railEnd);
+                // Look ahead from the FRONT CAR of the train, not from the loco:
+                // with a long rake leading, a walk from the loco through the SET
+                // switches can diverge from where the wagons actually lie and
+                // never see the stock they are about to hit.
+                var lead = LeadingEnd(car, reverser >= 0.5f);
+                Vector3 lookMotion = lead != null
+                    ? (lead.Value.forward ? 1f : -1f) * lead.Value.car.transform.forward
+                    : motion;
+                double railAhead = lead != null
+                    ? ObstacleDistanceRail(
+                        car, lead.Value.bogie.track, lead.Value.bogie.traveller.Span,
+                        lead.Value.towardOut, lookahead,
+                        out var corridor, out double ownLead, out double railEnd)
+                    : ObstacleDistanceRail(
+                        car, track, bogie.traveller.Span, towardOut, lookahead,
+                        out corridor, out ownLead, out railEnd);
                 double clearAhead = Math.Min(
-                    ObstacleDistanceWorld(car, motion, corridor, lookahead), railAhead);
+                    ObstacleDistanceWorld(car, lookMotion, corridor, lookahead), railAhead);
 
                 // No rail, no driving: brake to a stand short of any end the
                 // connected track ahead comes to — an unaligned turntable, a stub
@@ -872,6 +885,7 @@ namespace DvMod.Autopilot
                             {
                                 var onBridge = Turntables.AsBridge(track);
                                 int i = IndexNear(path, track, s);
+                                var leadB = lead; // rail ends ahead of the FRONT
                                 // Only turn under our own train when EVERY wheel is
                                 // on the bridge — a car hanging over the joint gets
                                 // dragged off its rails by the turn.
@@ -880,6 +894,12 @@ namespace DvMod.Autopilot
                                 {
                                     Turntables.RotateBridgeTo(onBridge, path[i + 1]);
                                     bridgeAsked = true;
+                                }
+                                else if (leadB != null)
+                                {
+                                    bridgeAsked = Turntables.RequestBridgeAhead(
+                                        leadB.Value.bogie.track, leadB.Value.bogie.traveller.Span,
+                                        leadB.Value.towardOut, TurntableSlowZone + ownLead);
                                 }
                                 else
                                 {
@@ -898,8 +918,13 @@ namespace DvMod.Autopilot
                 // Turntables are crossed at walking pace, aligned or not: within
                 // TurntableSlowZone of a bridge (or standing on one), cap hard —
                 // a consist arriving at yard speed cannot stop on a 20 m bridge.
-                if (Turntables.NearBridge(
-                        car, track, bogie.traveller.Span, towardOut, TurntableSlowZone + ownLead))
+                bool nearBridge = lead != null
+                    ? Turntables.NearBridge(
+                        car, lead.Value.bogie.track, lead.Value.bogie.traveller.Span,
+                        lead.Value.towardOut, TurntableSlowZone + ownLead)
+                    : Turntables.NearBridge(
+                        car, track, bogie.traveller.Span, towardOut, TurntableSlowZone + ownLead);
+                if (nearBridge)
                     target = Mathf.Min(target, TurntableKmh);
                 // On a coupling run the train ahead is the target, not a hazard, so the
                 // guard closes right up to buffer contact instead of holding off.

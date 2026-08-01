@@ -263,6 +263,12 @@ namespace DvMod.Autopilot
             {
                 if (claims.TryGetValue(leg, out var g) && g != run.guid)
                     continue; // the standing follower keeps its own rail
+                // NEVER take a leg somebody's stock is standing on - taking
+                // SW-A2P out from under two queued locos is how the ledger came
+                // to disagree with the ground. The frog itself is safe (fouling
+                // check above); an occupied leg is defended by the stock on it.
+                if (ForeignStockOn(leg, run.car?.trainset))
+                    continue;
                 claims[leg] = run.guid;
                 run.claimed.Add(leg);
             }

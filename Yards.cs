@@ -251,6 +251,62 @@ namespace DvMod.Autopilot
                     yard.mains.Remove(key);
         }
 
+        /// <summary>
+        /// Hand-pinned running lines, by the junction numbers at their ends (the
+        /// map's numbering). Discovery keeps getting individual yards wrong in
+        /// individual ways — SM's parallel B road, FRS naming an arrival loop —
+        /// and where the dispatcher has simply TOLD us the road, that wins: the
+        /// yard's discovered mains are REPLACED by the pinned track(s).
+        /// </summary>
+        private static readonly Dictionary<string, (int a, int b)[]> PinnedMains =
+            new Dictionary<string, (int a, int b)[]>(StringComparer.Ordinal)
+            {
+                ["FRS"] = new[] { (204, 209) },
+            };
+
+        private static void ApplyPinnedMains(YardInfo yard)
+        {
+            if (!PinnedMains.TryGetValue(yard.id, out var pins))
+                return;
+            // Every side the discovery associated with this yard rides along to
+            // the pinned road, so the pickers still show it for each sub-yard.
+            var subs = new SortedSet<string>(
+                yard.mains.Values.SelectMany(v => v), StringComparer.Ordinal);
+            var replacement = new Dictionary<string, SortedSet<string>>(StringComparer.Ordinal);
+            foreach (var (a, b) in pins)
+            {
+                var track = TrackByEndJunctions(a, b);
+                if (track == null)
+                    continue; // pin names a road that can't be found — keep discovery
+                var key = track.LogicTrack().ID.ToString();
+                mainTracks[key] = track;
+                mainSpans[key] = track.GetKinkedPointSet().span;
+                replacement[key] = new SortedSet<string>(subs, StringComparer.Ordinal);
+            }
+            if (replacement.Count == 0)
+                return;
+            yard.mains.Clear();
+            foreach (var kv in replacement)
+                yard.mains[kv.Key] = kv.Value;
+        }
+
+        /// <summary>The generic (unnamed) track whose two ends sit at exactly these
+        /// junction numbers, or null.</summary>
+        private static RailTrack? TrackByEndJunctions(int a, int b)
+        {
+            foreach (var track in Component.FindObjectsOfType<RailTrack>())
+            {
+                var id = track.LogicTrack()?.ID;
+                if (id == null || !id.IsGeneric())
+                    continue;
+                var e1 = Autopilot.JunctionIndexAtEnd(track, true);
+                var e2 = Autopilot.JunctionIndexAtEnd(track, false);
+                if ((e1 == a && e2 == b) || (e1 == b && e2 == a))
+                    return track;
+            }
+            return null;
+        }
+
         /// <summary>Do two discovered mains meet end to end? Consecutive segments of
         /// one road share the junction where a yard entry split them; two genuinely
         /// parallel roads do not. Ends without a junction (plain rail joins,
@@ -302,6 +358,8 @@ namespace DvMod.Autopilot
                 WalkToMainLine(n.track, byId[n.yard], n.sub, collectBeyond: true);
             foreach (var yard in byId.Values)
                 PruneMains(yard);
+            foreach (var yard in byId.Values)
+                ApplyPinnedMains(yard);
 
             samples = points;
             cache = byId;

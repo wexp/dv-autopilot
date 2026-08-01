@@ -647,6 +647,18 @@ namespace DvMod.Autopilot
 
                     double toTrain = ObstacleDistanceRail(
                         car, track, bogie.traveller.Span, towardOut, CoupleApproach * 4, out _, out _, out _);
+                    // "Couple to the train there" with nothing there: chasing a
+                    // train that does not exist drove the spot clean off the far
+                    // end of the siding, "looking for the train" for ever. Bare
+                    // destination = this is an ordinary spot from here on.
+                    if (toTrain == double.MaxValue
+                        && (run.destTrack == null
+                            || !Routing.HasForeignCars(run.destTrack, car.trainset)))
+                    {
+                        run.couple = false;
+                        run.detail = $"{phase}: nothing on {destId} to couple to — spotting instead";
+                        continue;
+                    }
                     target = toTrain <= CoupleApproach
                         ? Mathf.Min(cruiseKmh, CoupleKmh)
                         : Mathf.Min(Mathf.Min(cruiseKmh, SpotApproachKmh), limit);

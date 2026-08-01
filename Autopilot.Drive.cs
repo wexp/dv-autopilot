@@ -1105,6 +1105,24 @@ namespace DvMod.Autopilot
                             continue;
                         }
 
+                        // The end of the line for a finished move: on the final leg,
+                        // not coupling, stood against stock that is not moving, with
+                        // part of the train already on the destination - that IS the
+                        // arrival. Park here, short of what stands ahead, and hand the
+                        // road back so the queue behind can stack in the same way.
+                        if (lastLeg && !run.couple && speed < 0.5f
+                            && blockedFor >= 5f
+                            && AnyCarOnTrack(car, destId)
+                            && !AutopilotStockAhead(corridor, car.trainset))
+                        {
+                            overrider.Throttle?.Set(0f);
+                            overrider.Brake?.Set(1f);
+                            Finish(run, "arrived",
+                                destId + " - pulled up behind the stock standing there");
+                            done(false);
+                            yield break;
+                        }
+
                         // Stock that is not going anywhere. The route was planned through
                         // it — routing falls back to an occupancy-blind path when nothing
                         // clear exists, and the guard then refuses to drive it — so the

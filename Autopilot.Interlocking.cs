@@ -206,8 +206,25 @@ namespace DvMod.Autopilot
             return false;
         }
 
-        /// <summary>A junction grants to ONE run, and never while foreign stock
-        /// fouls it from any branch - that overhang is what sideswipes trains.</summary>
+        /// <summary>Every track attached to a junction: the stem and each branch.</summary>
+        private static IEnumerable<RailTrack> JunctionLegs(Junction junction)
+        {
+            if (junction.inBranch?.track != null)
+                yield return junction.inBranch.track;
+            if (junction.outBranches != null)
+                foreach (var b in junction.outBranches)
+                    if (b?.track != null)
+                        yield return b.track;
+        }
+
+        /// <summary>
+        /// A junction grants to ONE run and takes the WHOLE junction: the node and
+        /// every attached leg track. A follower is then denied at the START of a
+        /// leg, a full block out, instead of creeping to the frog's edge. Never
+        /// grants while foreign stock fouls it from any branch. A leg that another
+        /// run merely STANDS on does not fail the grant (that run is behind the
+        /// frog and cannot cross - the node is ours), it is simply not taken.
+        /// </summary>
         private static bool GrantJunction(Run run, Junction junction, out string holder)
         {
             holder = "";
@@ -229,8 +246,26 @@ namespace DvMod.Autopilot
                     return false;
                 }
             }
+            // Legs: all free (or standing-only) before any is taken.
+            foreach (var leg in JunctionLegs(junction))
+            {
+                if (!claims.TryGetValue(leg, out var g) || g == run.guid)
+                    continue;
+                if (runs.TryGetValue(g, out var other)
+                    && other.car != null && OurCarsOn(other.car, leg))
+                    continue; // standing on its own rail behind the frog
+                holder = RunNameOf(g);
+                return false;
+            }
             junctionClaims[junction] = run.guid;
             run.claimedJunctions.Add(junction);
+            foreach (var leg in JunctionLegs(junction))
+            {
+                if (claims.TryGetValue(leg, out var g) && g != run.guid)
+                    continue; // the standing follower keeps its own rail
+                claims[leg] = run.guid;
+                run.claimed.Add(leg);
+            }
             return true;
         }
 
@@ -326,6 +361,9 @@ namespace DvMod.Autopilot
         private static void ReleaseOffPlan(Run run, List<RailTrack> path)
         {
             var planned = new HashSet<RailTrack>(path);
+            foreach (var held in run.claimedJunctions)
+                foreach (var leg in JunctionLegs(held))
+                    planned.Add(leg); // held junctions keep their legs
             List<RailTrack>? drop = null;
             foreach (var track in run.claimed)
                 if (!planned.Contains(track) && !OurCarsOn(run.car, track))
@@ -361,6 +399,7 @@ namespace DvMod.Autopilot
                     if (junctionClaims.TryGetValue(j, out var guid) && guid == run.guid)
                         junctionClaims.Remove(j);
                     run.claimedJunctions.Remove(j);
+                    ReleaseJunctionLegs(run, j);
                 }
         }
 
@@ -393,6 +432,34 @@ namespace DvMod.Autopilot
                 if (junctionClaims.TryGetValue(j, out var guid) && guid == run.guid)
                     junctionClaims.Remove(j);
                 run.claimedJunctions.Remove(j);
+                ReleaseJunctionLegs(run, j);
+            }
+        }
+
+        /// <summary>Release the leg tracks of a junction this run no longer holds -
+        /// each leg individually, and only once our own cars are off it.</summary>
+        private static void ReleaseJunctionLegs(Run run, Junction junction)
+        {
+            foreach (var leg in JunctionLegs(junction))
+            {
+                if (!run.claimed.Contains(leg) || OurCarsOn(run.car, leg))
+                    continue;
+                // A leg may also belong to a junction we STILL hold, or lie on the
+                // road ahead - keep those.
+                bool stillNeeded = false;
+                foreach (var held in run.claimedJunctions)
+                    if (held != junction)
+                        foreach (var l in JunctionLegs(held))
+                            if (l == leg)
+                            {
+                                stillNeeded = true;
+                                break;
+                            }
+                if (stillNeeded)
+                    continue;
+                if (claims.TryGetValue(leg, out var guid) && guid == run.guid)
+                    claims.Remove(leg);
+                run.claimed.Remove(leg);
             }
         }
 

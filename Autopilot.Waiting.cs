@@ -76,6 +76,25 @@ namespace DvMod.Autopilot
         /// <summary>Is this trainset being driven by an autopilot that is still working?
         /// Routing asks, so it can price a track a train is passing over as a delay
         /// rather than shutting the road: the train will be gone shortly.</summary>
+        /// <summary>Any car of an ACTIVE run standing in this corridor. A stopped
+        /// convoy member ahead is someone to queue behind, never something to
+        /// park against.</summary>
+        private static bool AutopilotStockAhead(HashSet<RailTrack> corridor, Trainset? ours)
+        {
+            var registry = SingletonBehaviour<TrainCarRegistry>.Instance?.logicCarToTrainCar;
+            if (registry == null)
+                return false;
+            foreach (var other in registry.Values)
+            {
+                if (other == null || other.trainset == ours || !IsUnderAutopilot(other.trainset))
+                    continue;
+                foreach (var b in other.Bogies)
+                    if (b?.track != null && corridor.Contains(b.track))
+                        return true;
+            }
+            return false;
+        }
+
         public static bool IsUnderAutopilot(Trainset? set)
         {
             if (set == null)

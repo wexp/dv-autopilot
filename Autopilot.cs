@@ -190,6 +190,7 @@ namespace DvMod.Autopilot
                 ["loco"] = id,
                 ["guid"] = guid,
                 ["mode"] = mode.ToString().ToLowerInvariant(),
+                ["couple"] = couple,
                 ["limit"] = Math.Round(limitKmh),
                 ["steps"] = new JArray(steps.Select(s => s.ToJson())),
             };

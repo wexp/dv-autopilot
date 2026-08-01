@@ -1079,7 +1079,7 @@ namespace DvMod.Autopilot
                         overrider.Brake?.Set(1f);
                         throttle = 0f;
                         stuckFor = 0f;
-                        run.detail = $"{phase}: HOLDING — car {clearAhead:F0} m ahead";
+                        run.detail = $"{phase}: HOLDING - car {clearAhead:F0} m ahead ({blockedFor:F0}s)";
                         // Two autopilots can block each other outright: ours is stopped by
                         // their cars, theirs is stopped waiting for rail we hold. Neither
                         // can ever move, because each is the other's reason for standing
@@ -1110,9 +1110,12 @@ namespace DvMod.Autopilot
                         // part of the train already on the destination - that IS the
                         // arrival. Park here, short of what stands ahead, and hand the
                         // road back so the queue behind can stack in the same way.
+                        bool roadComplete = AnyCarOnTrack(car, destId)
+                            || (run.destTrack != null
+                                && ForeignStockOn(run.destTrack, car.trainset));
                         if (lastLeg && !run.couple && speed < 0.5f
                             && blockedFor >= 5f
-                            && AnyCarOnTrack(car, destId)
+                            && roadComplete
                             && !AutopilotStockAhead(corridor, car.trainset))
                         {
                             overrider.Throttle?.Set(0f);

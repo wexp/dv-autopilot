@@ -60,8 +60,10 @@ namespace DvMod.Autopilot
             {
                 if (other == null || other.trainset == ours)
                     continue;
-                bool moving = Mathf.Abs(other.GetForwardSpeed()) > 0.3f
-                    || IsUnderAutopilot(other.trainset);
+                // ACTUAL motion only. Counting any autopilot train as "moving"
+                // meant two stopped runs each holding for the other reset their
+                // give-up clocks for ever - a livelock with both lights green.
+                bool moving = Mathf.Abs(other.GetForwardSpeed()) > 0.3f;
                 if (!moving)
                     continue;
                 foreach (var b in other.Bogies)

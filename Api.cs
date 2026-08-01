@@ -44,6 +44,10 @@ namespace DvMod.Autopilot
         /// each, and which yard the given loco stands in.</summary>
         public static string YardsJson(string? locoGuid) => Yards.GetYardsJson(locoGuid);
 
+        /// <summary>Debug: every run's plan, plus the full block ledger - who holds
+        /// which track and junction.</summary>
+        public static string PathsJson() => Autopilot.GetPathDebug();
+
         /// <summary>Brake every run to a stand, synchronously. For anyone about to
         /// do something that would freeze or kill the drive coroutines.</summary>
         public static void SecureAll() => Autopilot.SecureAllForReload();

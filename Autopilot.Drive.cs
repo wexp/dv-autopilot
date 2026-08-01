@@ -65,7 +65,7 @@ namespace DvMod.Autopilot
                 // on a coupling run, as soon as our train has grown.
                 // A runaround only counts as arrived once the train has actually left
                 // the destination and come back in the other way.
-                if (run.arriveEnteredIn != null && run.destTrack != null)
+                if (!run.viaLocked && run.arriveEnteredIn != null && run.destTrack != null)
                 {
                     if (!run.leftDest && AllOffTrack(car, run.destTrack))
                         run.leftDest = true;
@@ -75,7 +75,19 @@ namespace DvMod.Autopilot
                     if (run.leftDest && !AllOffTrack(car, run.destTrack))
                         run.reEntered = true;
                 }
-                bool mayArrive = run.arriveEnteredIn == null || run.leftDest;
+                bool mayArrive;
+                if (run.arriveEnteredIn == null)
+                    mayArrive = true;
+                else if (run.viaLocked)
+                    // A via move may legitimately CROSS its destination on the way
+                    // round; being fully inside it then is passing through, not
+                    // arriving. Arrived = the CURRENT plan ends on the destination
+                    // and comes in by the demanded end.
+                    mayArrive = run.path.Count > 0
+                        && run.path[run.path.Count - 1] == run.destTrack
+                        && EntryEndIsIn(run.path, run.destTrack) == run.arriveEnteredIn;
+                else
+                    mayArrive = run.leftDest;
                 if (run.couple && !run.coupledDone && Coupled(run))
                 {
                     // Hooked on. From here it is an ordinary spot, with the cars we
@@ -101,7 +113,8 @@ namespace DvMod.Autopilot
                 }
 
                 var path = Routing.FindPath(
-                    track, destId, car, run.reEntered ? null : run.arriveEnteredIn,
+                    track, destId, car,
+                    run.reEntered && !run.viaLocked ? null : run.arriveEnteredIn,
                     run.arrive, run.avoid, run.reversalPenalty);
                 if (path == null)
                 {
@@ -193,7 +206,8 @@ namespace DvMod.Autopilot
 
                 var legs = ComputeLegs(path);
                 run.steps = CompileSteps(
-                    path, legs, run.reEntered ? null : run.arriveEnteredIn, destId);
+                    path, legs,
+                    run.reEntered && !run.viaLocked ? null : run.arriveEnteredIn, destId);
                 var (s, e) = legs[0];
                 bool lastLeg = legs.Count == 1;
                 // Publish what we still have to cover, so the other runs can tell a

@@ -94,6 +94,12 @@ namespace DvMod.Autopilot
             public RailTrack? destTrack;
             public bool leftDest;
             public bool reEntered;
+            /// <summary>The arrive-end came from an EXPLICIT via junction. Then the
+            /// constraint holds for the whole run: the leftDest/reEntered machinery
+            /// belongs to the same-track runaround, and letting it clear the end
+            /// just because a pull leg happened to CROSS the destination sent a
+            /// "via J-204" move in through J-209.</summary>
+            public bool viaLocked;
             /// <summary>How the dispatcher wants it to arrive: shoved (wagons first),
             /// pulled (loco first), or left to the router to decide.</summary>
             public ArriveMode arrive = ArriveMode.Auto;
@@ -702,6 +708,7 @@ namespace DvMod.Autopilot
                 var run = new Run(car, controller)
                 {
                     arriveEnteredIn = arriveEnteredIn,
+                    viaLocked = viaEnd != null,
                     arrive = arrive,
                     destTrack = path[path.Count - 1],
                     detail = $"routing to {destId} ({path.Count} tracks, {legs.Count} leg(s))",

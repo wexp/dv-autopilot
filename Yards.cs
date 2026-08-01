@@ -258,36 +258,62 @@ namespace DvMod.Autopilot
         /// and where the dispatcher has simply TOLD us the road, that wins: the
         /// yard's discovered mains are REPLACED by the pinned track(s).
         /// </summary>
-        private static readonly Dictionary<string, (int a, int b)[]> PinnedMains =
-            new Dictionary<string, (int a, int b)[]>(StringComparer.Ordinal)
+        // Each pin: "SUB=SPEC" or just "SPEC". SPEC is either "a-b" — the generic
+        // road between those two junction numbers — or a literal generic track id,
+        // for a road with a junction-less end (FRS-A dead-ends at the turntable).
+        // A SUB names the side of the yard the road serves; without one the road
+        // carries every side discovery found.
+        private static readonly Dictionary<string, string[]> PinnedMains =
+            new Dictionary<string, string[]>(StringComparer.Ordinal)
             {
-                ["FRS"] = new[] { (204, 209) },
+                ["FRS"] = new[] { "B=204-209", "A=#Y-#S93#T" },
             };
 
         private static void ApplyPinnedMains(YardInfo yard)
         {
             if (!PinnedMains.TryGetValue(yard.id, out var pins))
                 return;
-            // Every side the discovery associated with this yard rides along to
-            // the pinned road, so the pickers still show it for each sub-yard.
-            var subs = new SortedSet<string>(
+            var allSubs = new SortedSet<string>(
                 yard.mains.Values.SelectMany(v => v), StringComparer.Ordinal);
             var replacement = new Dictionary<string, SortedSet<string>>(StringComparer.Ordinal);
-            foreach (var (a, b) in pins)
+            foreach (var pin in pins)
             {
-                var track = TrackByEndJunctions(a, b);
+                var parts = pin.Split('=');
+                string? sub = parts.Length == 2 ? parts[0] : null;
+                string spec = parts[parts.Length - 1];
+
+                RailTrack? track = null;
+                var dash = spec.Split('-');
+                if (dash.Length == 2
+                    && int.TryParse(dash[0], out var a) && int.TryParse(dash[1], out var b))
+                    track = TrackByEndJunctions(a, b);
+                else
+                    track = TrackByGenericId(spec);
                 if (track == null)
                     continue; // pin names a road that can't be found — keep discovery
                 var key = track.LogicTrack().ID.ToString();
                 mainTracks[key] = track;
                 mainSpans[key] = track.GetKinkedPointSet().span;
-                replacement[key] = new SortedSet<string>(subs, StringComparer.Ordinal);
+                replacement[key] = sub != null
+                    ? new SortedSet<string>(StringComparer.Ordinal) { sub }
+                    : new SortedSet<string>(allSubs, StringComparer.Ordinal);
             }
             if (replacement.Count == 0)
                 return;
             yard.mains.Clear();
             foreach (var kv in replacement)
                 yard.mains[kv.Key] = kv.Value;
+        }
+
+        private static RailTrack? TrackByGenericId(string id)
+        {
+            foreach (var track in Component.FindObjectsOfType<RailTrack>())
+            {
+                var tid = track.LogicTrack()?.ID;
+                if (tid != null && tid.IsGeneric() && tid.ToString() == id)
+                    return track;
+            }
+            return null;
         }
 
         /// <summary>The generic (unnamed) track whose two ends sit at exactly these

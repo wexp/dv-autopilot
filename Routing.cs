@@ -152,6 +152,10 @@ namespace DvMod.Autopilot
             }
         }
 
+        /// <summary>Id of the car coupled across this coupler — seed diagnostics.</summary>
+        private static string NameAcross(Coupler? coupler) =>
+            coupler?.coupledTo?.train?.ID ?? "?";
+
         private static bool Matches(RailTrack track, string destId)
         {
             var id = track.LogicTrack()?.ID;
@@ -309,12 +313,15 @@ namespace DvMod.Autopilot
 
             var plain = Try(null);
 
-            // Asked for outright: honour it whatever the detour, and only fall back to
-            // the ordinary route when no such approach exists at all.
+            // An explicit facing is an ORDER, not a preference. Falling back to the
+            // plain route when no such approach exists sent a commanded shove in
+            // loco-first without a word — the dispatcher found out when the cut was
+            // already in the track the wrong way round. No route with the demanded
+            // facing = no route at all; the caller names the reason.
             if (arrive == ArriveMode.Shove)
-                return Chosen(Try(true) ?? plain, occupancy);
+                return Chosen(Try(true), occupancy);
             if (arrive == ArriveMode.Pull)
-                return Chosen(Try(false) ?? plain, occupancy);
+                return Chosen(Try(false), occupancy);
 
             // Auto: shoving is worth a runaround only to put wagons behind stock that
             // is already there, and only if the detour is modest.
@@ -398,7 +405,11 @@ namespace DvMod.Autopilot
             // no longer closes the door on coming back to that same end later.
             // Are the wagons ahead of the loco or behind it? Leaving by the low end
             // with the loco at the high end of the consist means the wagons lead: a
-            // shove. Every reversal thereafter swaps it.
+            // shove. Every reversal thereafter swaps it. Judged from the WAGONS' own
+            // bogies on the start track — the old consist-midpoint test used only
+            // the bogies on this track, and lied whenever the rake straddled a
+            // junction: half the train off the track pulled the midpoint onto the
+            // loco and a commanded shove planned as if the wagons were both sides.
             double locoSpan = ownLo;
             if (loco != null)
             {
@@ -406,9 +417,39 @@ namespace DvMod.Autopilot
                 if (lb != null && lb.Length >= 2 && lb[1] != null)
                     locoSpan = lb[1].traveller.Span;
             }
-            double consistMid = (ownLo + ownHi) / 2.0;
-            bool pushLeavingLow = locoSpan >= consistMid;   // wagons below us
-            bool pushLeavingHigh = locoSpan <= consistMid;  // wagons above us
+            // No geometry guessing: the wagons hang off the loco's FRONT or REAR
+            // coupler, and TrackDirectionSign says which end of the start track the
+            // loco's front points at (>0 = toward the high/out end — same reading
+            // the drive loop steers by). Every span-comparison version of this
+            // seed was a coin flip whenever the rake stood across the little
+            // stub tracks around a turntable pit, and the coin kept losing.
+            bool pushLeavingLow, pushLeavingHigh;
+            var lb1 = loco != null && loco.Bogies != null && loco.Bogies.Length >= 2
+                ? loco.Bogies[1] : null;
+            bool wagonsFront = loco?.frontCoupler?.coupledTo != null;
+            bool wagonsRear = loco?.rearCoupler?.coupledTo != null;
+            if (lb1?.track == start && (wagonsFront || wagonsRear))
+            {
+                bool frontHigh = lb1.TrackDirectionSign > 0;
+                bool wagonsAbove = (wagonsFront && frontHigh) || (wagonsRear && !frontHigh);
+                bool wagonsBelow = (wagonsFront && !frontHigh) || (wagonsRear && frontHigh);
+                pushLeavingHigh = wagonsAbove;
+                pushLeavingLow = wagonsBelow;
+                Main.mod?.Logger.Log(
+                    $"[SEED] {loco!.ID} start={start.LogicTrack()?.ID} sign={lb1.TrackDirectionSign} "
+                    + $"front={(wagonsFront ? NameAcross(loco.frontCoupler) : "-")} "
+                    + $"rear={(wagonsRear ? NameAcross(loco.rearCoupler) : "-")} "
+                    + $"spanLoco={lb1.traveller.Span:F0} "
+                    + $"pushHigh={pushLeavingHigh} pushLow={pushLeavingLow}");
+            }
+            else
+            {
+                // Light engine: facing is moot, keep the old guess so the seed
+                // pair still differs.
+                double consistMid = (ownLo + ownHi) / 2.0;
+                pushLeavingLow = locoSpan >= consistMid;
+                pushLeavingHigh = locoSpan <= consistMid;
+            }
 
             // Seed (start, enteredIn: true) leaves by the HIGH end, (…, false) by the low.
             var seeds = new[]
@@ -493,10 +534,15 @@ namespace DvMod.Autopilot
                         // where the train can draw its whole length clear past the
                         // pivot. Reversing on a 10 m frog stub overran the ladder
                         // into a parked rake; a pivot without room is no pivot.
-                        if (exitIn == enteredIn
+                        // A turntable bridge is the exception on both counts: the
+                        // WIND swaps the ends, no room needed and no shunt to pay
+                        // for — its cost is already on the virtual hops.
+                        bool onBridgeTrack = Turntables.AsBridge(track) != null;
+                        if (exitIn == enteredIn && !onBridgeTrack
                             && !ReversalRoom(track, enteredIn, trainLength, occupancy))
                             continue;
-                        cost = (exitIn == enteredIn ? reversalPenalty : span) + busy;
+                        cost = (exitIn == enteredIn ? (onBridgeTrack ? 0.0 : reversalPenalty) : span)
+                            + busy;
                     }
 
                     // Leaving by the end we came in turns the train round, so the end
@@ -522,6 +568,10 @@ namespace DvMod.Autopilot
 
             if (goal == null)
                 return null;
+            if (requireFacing != null)
+                Main.mod?.Logger.Log(
+                    $"[SEED] goal {destId}: pushing={goal.Value.Item4} "
+                    + $"enteredIn={goal.Value.Item2} want={requireFacing}");
             totalCost = dist[goal.Value];
             var path = new List<RailTrack>();
             for ((RailTrack, bool, bool, bool)? c = goal; c != null; c = prev[c.Value])

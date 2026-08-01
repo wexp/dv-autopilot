@@ -1,4 +1,5 @@
 using DV.Logic.Job;
+using DV.MultipleUnit;
 using DV.RemoteControls;
 using DV.Simulation.Cars;
 using DV.Utils;
@@ -55,14 +56,97 @@ namespace DvMod.Autopilot
             return Mathf.Sqrt(endMs * endMs + 2f * decel * d) * 3.6f;
         }
 
+        /// <summary>
+        /// The locos actually driven from this one: the lead plus every unit
+        /// reachable over CONNECTED MU cables. A loco merely coupled into the rake
+        /// with no MU cable is freight — its weight puts no grip on the rail for
+        /// us, its wheels take no throttle, and its engine stays cold — so every
+        /// per-loco read (slip, adhesion mass, temperatures) walks this group, not
+        /// IsLoco across the trainset.
+        /// </summary>
+        private static HashSet<TrainCar> MuGroup(TrainCar lead)
+        {
+            var group = new HashSet<TrainCar> { lead };
+            var queue = new Queue<TrainCar>();
+            queue.Enqueue(lead);
+            while (queue.Count > 0)
+            {
+                var mu = queue.Dequeue().GetComponent<MultipleUnitModule>();
+                if (mu == null)
+                    continue;
+                foreach (var cable in new[] { mu.frontCable, mu.rearCable })
+                {
+                    var other = cable?.connectedTo?.muModule?.train;
+                    if (other != null && group.Add(other))
+                        queue.Enqueue(other);
+                }
+            }
+            return group;
+        }
+
+        /// <summary>
+        /// On this track, do the NON-driven cars (wagons, dead locos) sit toward
+        /// its out end relative to the driven units? null when either half has no
+        /// bogie on the track. This is what a turntable ride steers by: the bridge
+        /// end the wagons occupy is the end a SHOVE must hand to the stall.
+        /// </summary>
+        private static bool? WagonsTowardOut(TrainCar loco, RailTrack track)
+        {
+            var driven = MuGroup(loco);
+            double wagonSum = 0, drivenSum = 0;
+            int wagonN = 0, drivenN = 0;
+            foreach (var c in loco.trainset.cars)
+            {
+                if (c == null)
+                    continue;
+                foreach (var b in c.Bogies)
+                {
+                    if (b?.track != track)
+                        continue;
+                    if (driven.Contains(c)) { drivenSum += b.traveller.Span; drivenN++; }
+                    else { wagonSum += b.traveller.Span; wagonN++; }
+                }
+            }
+            if (wagonN == 0 || drivenN == 0)
+                return null;
+            return wagonSum / wagonN > drivenSum / drivenN;
+        }
+
+        /// <summary>Metres from a bogie to the FAR end of the given bridge track,
+        /// walking the rail in its direction of travel. MaxValue when the walk
+        /// does not reach the bridge within a few tracks.</summary>
+        private static double DistanceToBridgeExit(
+            RailTrack from, double span, bool towardOut, RailTrack bridge)
+        {
+            double d = 0;
+            RailTrack? t = from;
+            bool outw = towardOut;
+            double s = span;
+            for (int k = 0; k < 4 && t != null; k++)
+            {
+                double len = t.GetKinkedPointSet().span;
+                d += outw ? len - s : s;
+                if (t == bridge)
+                    return d;
+                var br = outw ? t.GetOutBranch() : t.GetInBranch();
+                if (br?.track == null)
+                    return double.MaxValue;
+                t = br.track;
+                outw = br.first;
+                s = br.first ? 0 : t.GetKinkedPointSet().span;
+            }
+            return double.MaxValue;
+        }
+
         private static float MaxSafeAccel(TrainCar loco)
         {
+            var driven = MuGroup(loco);
             float drivenKg = 0, trainKg = 0;
             foreach (var c in loco.trainset.cars)
             {
                 float kg = c.massController?.TotalMass ?? 0f;
                 trainKg += kg;
-                if (c.IsLoco)
+                if (driven.Contains(c))
                     drivenKg += kg;
             }
             if (trainKg <= 0f || drivenKg <= 0f)
@@ -83,9 +167,9 @@ namespace DvMod.Autopilot
         private static (bool warning, bool critical) EngineTempState(TrainCar loco)
         {
             bool warning = false, critical = false;
-            foreach (var c in loco.trainset.cars)
+            foreach (var c in MuGroup(loco))
             {
-                if (c == null || !c.IsLoco)
+                if (c == null)
                     continue;
                 var observer = c.GetComponentInChildren<MultipleUnitStateObserver>();
                 var simFlow = c.SimController?.simFlow;
@@ -106,8 +190,8 @@ namespace DvMod.Autopilot
         private static float MaxSlip(TrainCar loco)
         {
             float slip = 0f;
-            foreach (var c in loco.trainset.cars)
-                if (c != null && c.IsLoco)
+            foreach (var c in MuGroup(loco))
+                if (c != null)
                     slip = Mathf.Max(slip, c.SimController?.wheelslipController?.wheelslip ?? 0f);
             return slip;
         }
@@ -120,20 +204,30 @@ namespace DvMod.Autopilot
         /// TM (steam, hydraulic) simply lack these ports and read as never overheating.
         /// Checked on every loco of the consist, like the engine temperature.
         /// </summary>
+        /// <summary>Locos known to have no TM ports at all (hydraulics like the
+        /// DH4). Asking their sim for the ports every drive tick wrote a "Port not
+        /// defined" line into Player.log ten times a second — ask once, remember.</summary>
+        private static readonly HashSet<string> noTmPorts = new HashSet<string>();
+
         private static (bool warning, bool critical) TmOverheatState(TrainCar loco)
         {
             bool warning = false, critical = false;
-            foreach (var c in loco.trainset.cars)
+            foreach (var c in MuGroup(loco))
             {
-                if (c == null || !c.IsLoco)
+                if (c == null || noTmPorts.Contains(c.CarGUID))
                     continue;
                 var simFlow = c.SimController?.simFlow;
                 if (simFlow == null)
                     continue;
-                warning |= simFlow.TryGetPort("tmOverheatLamp.LAMP_STATE", out var lamp, true)
-                    && lamp.Value > 0.5f;
-                critical |= simFlow.TryGetPort("tm.OVERHEAT_POWER_FUSE_OFF", out var fuse, true)
-                    && fuse.Value > 0.5f;
+                bool hasLamp = simFlow.TryGetPort("tmOverheatLamp.LAMP_STATE", out var lamp, true);
+                bool hasFuse = simFlow.TryGetPort("tm.OVERHEAT_POWER_FUSE_OFF", out var fuse, true);
+                if (!hasLamp && !hasFuse)
+                {
+                    noTmPorts.Add(c.CarGUID);
+                    continue;
+                }
+                warning |= hasLamp && lamp.Value > 0.5f;
+                critical |= hasFuse && fuse.Value > 0.5f;
             }
             return (warning, critical);
         }
@@ -142,7 +236,8 @@ namespace DvMod.Autopilot
             RemoteControllerModule controller, ref float throttle, TrainCar car,
             float target, float speed, LocoProfile profile,
             ref float lastSpeedMs, ref float accelFilter, ref float accelBudget,
-            ref float sanderHold, ref float dynStallFor, bool allowDynamic,
+            ref float sanderHold, ref float dynStallFor,
+            ref float dynHandle, ref float dynCap, bool allowDynamic,
             bool tempWarning, bool tempCritical)
         {
             var overrider = controller.controlsOverrider;
@@ -152,6 +247,7 @@ namespace DvMod.Autopilot
             if (target < 0.8f)
             {
                 throttle = 0f;
+                dynHandle = 0f;
                 overrider.Throttle?.Set(0f);
                 overrider.DynamicBrake?.Set(0f);
                 overrider.Brake?.Set(1f);
@@ -177,9 +273,17 @@ namespace DvMod.Autopilot
             // budget like this rather than a computed one.
             float safeAccel = MaxSafeAccel(car);
             if (slip > SlipThreshold)
+            {
                 accelBudget = Mathf.Max(MinAccelBudget, accelBudget - SlipAccelCut * DriveTick);
+                // The dynamic caused this slip as much as the throttle could have —
+                // cut its cap too, so the retry settles under what the rail holds.
+                dynCap = Mathf.Max(DynamicCapFloor, dynCap - DynamicSlipCut);
+            }
             else
+            {
                 accelBudget = Mathf.Min(safeAccel, accelBudget + AccelRecover * DriveTick);
+                dynCap = Mathf.Min(1f, dynCap + DynamicCapRecover * DriveTick);
+            }
 
             // How hard we actually WANT to accelerate right now: enough to close the
             // remaining speed gap over the next few seconds, and never more than the
@@ -217,14 +321,23 @@ namespace DvMod.Autopilot
                 float cut = slip > SevereSlip ? ThrottleDown : profile.throttleUp * 2f;
                 throttle = Mathf.Max(0f, throttle - cut);
                 overrider.Throttle?.Set(throttle);
+                dynHandle = 0f;
                 overrider.DynamicBrake?.Set(0f); // braking slipping wheels locks them
-                overrider.Brake?.Set(0f);
+                // Slip is a TRACTION event — the loco's wheels breaking loose. The
+                // train air acts on every axle of the rake and is what holds the
+                // speed on a wet grade; releasing it on each slip tick let L-066 run
+                // 11 km/h past its limit downhill and derail on stress. Keep the
+                // service air the overspeed asks for; only loco-side handles ease.
+                overrider.Brake?.Set(error < -1.0f
+                    ? Mathf.Min(ServiceBrakeMax, Mathf.Clamp01(-error / 8f))
+                    : 0f);
             }
             else if (tempCritical)
             {
                 // Engine over temperature: come off power whatever the speed error.
                 throttle = Mathf.Max(0f, throttle - ThrottleDown);
                 overrider.Throttle?.Set(throttle);
+                dynHandle = 0f;
                 overrider.DynamicBrake?.Set(0f);
                 overrider.Brake?.Set(0f);
             }
@@ -261,6 +374,7 @@ namespace DvMod.Autopilot
                 if (speed < 1f && throttle < profile.minMoveThrottle)
                     throttle = Mathf.Min(profile.minMoveThrottle, throttle + profile.throttleUp);
                 overrider.Throttle?.Set(throttle);
+                dynHandle = 0f;
                 overrider.DynamicBrake?.Set(0f);
                 overrider.Brake?.Set(0f);
             }
@@ -278,7 +392,15 @@ namespace DvMod.Autopilot
                 var dynamic = overrider.DynamicBrake;
                 if (allowDynamic && dynamic != null && speed > DynamicBrakeMinKmh && throttle <= 0.01f)
                 {
-                    dynamic.Set(Mathf.Clamp01(-error / 10f));
+                    // Ramp toward what the error asks, capped by what the rail has
+                    // shown it will hold. Setting the error straight onto the handle
+                    // slid wet wheels, zeroed on the slip tick, then slammed back on
+                    // the next — continuous wheelslip all the way down a rainy grade.
+                    float want = Mathf.Min(Mathf.Clamp01(-error / 10f), dynCap);
+                    dynHandle = want > dynHandle
+                        ? Mathf.Min(want, dynHandle + DynamicRampUp)
+                        : Mathf.Max(want, dynHandle - DynamicRampDown);
+                    dynamic.Set(dynHandle);
                     // Give the dynamic a fair chance, then stop pretending: if the
                     // train is STILL not slowing after a few seconds of it (heavy
                     // rake, falling grade), blend the air in on top. Air also comes
@@ -294,6 +416,7 @@ namespace DvMod.Autopilot
                 else
                 {
                     dynamic?.Set(0f);
+                    dynHandle = 0f;
                     dynStallFor = 0f;
                     overrider.Brake?.Set(throttle <= 0.01f ? service : 0f);
                 }
@@ -301,6 +424,7 @@ namespace DvMod.Autopilot
             else
             {
                 overrider.DynamicBrake?.Set(0f);
+                dynHandle = 0f;
                 dynStallFor = 0f;
                 overrider.Throttle?.Set(throttle);
                 overrider.Brake?.Set(0f);
@@ -432,14 +556,15 @@ namespace DvMod.Autopilot
         private static string? JobKeyOf(TrainCar car) => JobData.JobForCar(car)?.ID;
 
         /// <summary>
-        /// The first NON-loco car reachable from this loco, walking the couplers
-        /// outward (front side first), and the coupler whose parting separates every
-        /// loco unit from the wagons. MU'd units between the loco and the wagons stay
-        /// together — the cut lands exactly where the last engine meets the first
-        /// wagon.
+        /// The first car outside the driven MU group reachable from this loco,
+        /// walking the couplers outward (front side first), and the coupler whose
+        /// parting separates the driven units from the rest. MU-cabled units stay
+        /// together; a loco that is merely COUPLED — no MU cable — is freight and
+        /// the cut lands in front of it like any wagon.
         /// </summary>
         private static (TrainCar? wagon, Coupler? cutAt) FirstWagonOut(TrainCar loco)
         {
+            var driven = MuGroup(loco);
             foreach (var start in new[] { loco.frontCoupler, loco.rearCoupler })
             {
                 var coupler = start;
@@ -448,7 +573,7 @@ namespace DvMod.Autopilot
                     var next = coupler.coupledTo.train;
                     if (next == null)
                         break;
-                    if (!next.IsLoco)
+                    if (!driven.Contains(next))
                         return (next, coupler);
                     coupler = coupler.coupledTo.GetOppositeCoupler();
                 }

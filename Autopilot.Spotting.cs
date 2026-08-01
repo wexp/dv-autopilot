@@ -208,9 +208,13 @@ namespace DvMod.Autopilot
         /// </summary>
         private static IEnumerable<TrainCar> CarsToSpot(TrainCar loco)
         {
+            // A dead loco hauled in the rake — coupled, no MU cable — is freight
+            // and must fit inside the markers with the wagons; only the driven
+            // units get to hang out over the throat.
+            var driven = MuGroup(loco);
             var wagons = new List<TrainCar>();
             foreach (var c in loco.trainset.cars)
-                if (c != null && !c.IsLoco)
+                if (c != null && !driven.Contains(c))
                     wagons.Add(c);
             return wagons.Count > 0 ? wagons : loco.trainset.cars;
         }

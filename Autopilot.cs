@@ -191,6 +191,7 @@ namespace DvMod.Autopilot
                 ["guid"] = guid,
                 ["mode"] = mode.ToString().ToLowerInvariant(),
                 ["couple"] = couple,
+                ["arrive"] = arrive.ToString().ToLowerInvariant(),
                 ["limit"] = Math.Round(limitKmh),
                 ["steps"] = new JArray(steps.Select(s => s.ToJson())),
             };
@@ -284,6 +285,18 @@ namespace DvMod.Autopilot
         private const float SanderHoldSeconds = 4f;
         // Dynamic braking: below this speed a dynamic fades to nothing, km/h.
         private const float DynamicBrakeMinKmh = 8f;
+        // The dynamic handle RAMPS instead of snapping to the speed error. Snapping
+        // broke wet wheels straight into slide, the slip tick zeroed the handle, and
+        // the next tick snapped it right back — continuous wheelslip in rain. Per
+        // 0.1 s drive tick.
+        private const float DynamicRampUp = 0.04f;
+        private const float DynamicRampDown = 0.12f;
+        // Each slip also cuts a CAP on the handle (the dynamic's version of the
+        // throttle's accel budget), so it settles just under what the rail actually
+        // holds instead of retrying full force every time. The cap creeps back up.
+        private const float DynamicSlipCut = 0.2f;
+        private const float DynamicCapFloor = 0.15f;
+        private const float DynamicCapRecover = 0.03f; // per second
         // Overspeed beyond which air is blended in on top of the dynamic straight
         // away rather than waiting to see whether the dynamic can cope, km/h.
         private const float DynamicBrakeAirBackupKmh = 12f;
@@ -419,6 +432,11 @@ namespace DvMod.Autopilot
         // a car body overhangs its end bogie by a couple of metres, so 5 keeps the
         // nose clear of the hole.
         private const double RailEndMargin = 5.0;
+        // Boarding a turntable bridge is the one place the nose must go CLOSER to
+        // the end of rail than RailEndMargin allows: the whole consist has to get
+        // its bogies aboard before the wind, and the game is happy with the body
+        // overhanging the pit. Metres from the bridge end the leading bogie stops.
+        private const double BridgeBoardMargin = 1.0;
         // Turntables are taken at walking pace: the crossing cap, km/h, and how far
         // out (m, to the front of the train) it starts applying.
         private const float TurntableKmh = 8f;
@@ -665,7 +683,17 @@ namespace DvMod.Autopilot
 
                 var path = Routing.FindPath(start, destId, car, null, arrive, null, reversalPenalty);
                 if (path == null)
-                    return Json("error", "no route to " + destId);
+                {
+                    return Json("error", arrive switch
+                    {
+                        ArriveMode.Shove => $"no route to {destId} arriving wagons first — "
+                            + "nowhere to swap ends on the way (a turntable only takes "
+                            + "a train shorter than its bridge)",
+                        ArriveMode.Pull => $"no route to {destId} arriving loco first — "
+                            + "nowhere to swap ends on the way",
+                        _ => "no route to " + destId,
+                    });
+                }
                 // The only road found runs through somebody's parked stock. That used
                 // to be refused outright — but refusing is wrong for how a yard is
                 // actually worked: the dispatcher sends this move off and clears the
@@ -689,6 +717,12 @@ namespace DvMod.Autopilot
                 }
 
                 var destTrack = path[path.Count - 1];
+
+                // One line per dispatch naming what was actually received — every
+                // "the arrive was ignored" hunt so far has died for want of this.
+                Main.mod?.Logger.Log($"[PLAN] {car.ID} -> {destId} arrive={arrive} via="
+                    + $"{(viaJunction?.ToString() ?? "-")} couple={couple} mode={mode} "
+                    + $"tracks={path.Count} cars={car.trainset?.cars?.Count ?? 1}");
 
                 // A shunt panel is opened on one yard and lists only that yard's
                 // tracks, so a destination outside it means the request and the picker

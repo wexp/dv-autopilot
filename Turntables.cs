@@ -79,6 +79,15 @@ namespace DvMod.Autopilot
         public const double CrossPenalty = 200.0;
         /// <summary>Clearance the consist must leave to the bridge ends, m.</summary>
         private const double BridgeFitMargin = 1.5;
+        /// <summary>The game holds a consist on the bridge by its BOGIES — the car
+        /// bodies and couplers may overhang the pit (two DH4s, 26 m coupler to
+        /// coupler, stand fine on the 24.6 m CS bridge). The outermost axles sit
+        /// roughly this far in from each end of the consist, so the fit test gets
+        /// that much back before comparing against the bridge.</summary>
+        private const double BridgeEndOverhang = 2.5; // per end, m
+
+        private static double FitLength(double trainLength) =>
+            Math.Max(0, trainLength - 2 * BridgeEndOverhang);
 
         private static void EnsureIndex()
         {
@@ -165,7 +174,7 @@ namespace DvMod.Autopilot
             if (bridges!.TryGetValue(track, out var asBridge))
             {
                 var tt = asBridge.turntable;
-                if (trainLength > tt.Track.GetKinkedPointSet().span - BridgeFitMargin)
+                if (FitLength(trainLength) > tt.Track.GetKinkedPointSet().span - BridgeFitMargin)
                     yield break;
                 // Either end of the bridge can be brought to any stall, so the exit
                 // end does not constrain the reachable set.
@@ -178,7 +187,7 @@ namespace DvMod.Autopilot
             {
                 var tt = viaStall.turntable;
                 if (tt.Track == null
-                    || trainLength > tt.Track.GetKinkedPointSet().span - BridgeFitMargin)
+                    || FitLength(trainLength) > tt.Track.GetKinkedPointSet().span - BridgeFitMargin)
                     yield break;
                 var end = tt.GetTrackEnd(track);
                 // Only the pit-facing end of a stall leads to the bridge. isFirst
@@ -250,6 +259,15 @@ namespace DvMod.Autopilot
             float goal = Mathf.Abs(TurntableRailTrack.AngleRangeNeg180To180(a - current))
                 <= Mathf.Abs(TurntableRailTrack.AngleRangeNeg180To180(b - current)) ? a : b;
             Rotate(IdOf(tt), goal);
+        }
+
+        /// <summary>Wind the bridge half a turn from where it stands — the other
+        /// bridge end comes round to whatever the current end faces. This is how a
+        /// facing order (shove/pull) is honoured on a table: the join decides which
+        /// end of the CONSIST meets the stall, and half a turn swaps it.</summary>
+        public static void RotateBy180(TurntableRailTrack tt)
+        {
+            Rotate(IdOf(tt), TurntableRailTrack.AngleRange0To360(tt.currentYRotation + 180f));
         }
 
         /* ---------------------------------------------------------- watch -- */

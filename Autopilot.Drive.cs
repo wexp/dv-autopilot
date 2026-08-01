@@ -185,6 +185,51 @@ namespace DvMod.Autopilot
                     }
                 }
 
+                // Standing ON a bridge that is already joined to the road ahead,
+                // with an explicit facing: the joined end must be the one the
+                // facing demands — shove hands the stall the dead weight's end,
+                // pull the loco's. Wrong end: wind half a turn first. Without this
+                // a pre-aligned bridge simply rolled off loco-first and the arrive
+                // order meant nothing.
+                if (path.Count >= 2 && run.arrive != ArriveMode.Auto
+                    && Turntables.AsBridge(path[0]) is TurntableRailTrack tt0
+                    && AllOnTrack(car, path[0])
+                    && (ExitIsOut(path[0], path[1]) || EnterIsIn(path[0], path[1])))
+                {
+                    bool stallAtOut = ExitIsOut(path[0], path[1]);
+                    bool? wagonsOut = WagonsTowardOut(car, path[0]);
+                    bool wantWagons = run.arrive == ArriveMode.Shove;
+                    if (wagonsOut != null && (wagonsOut.Value == stallAtOut) != wantWagons)
+                    {
+                        overrider.Throttle?.Set(0f);
+                        overrider.Brake?.Set(1f);
+                        while (car != null && Mathf.Abs(car.GetForwardSpeed()) * 3.6f > 0.3f)
+                            yield return WaitForSecondsRealtime(0.2f);
+                        run.detail = "winding the table half round — "
+                            + (wantWagons ? "the dead weight" : "the loco")
+                            + $" must meet {path[1].LogicTrack()?.ID}";
+                        Turntables.RotateBy180(tt0);
+                        yield return WaitForSecondsRealtime(2f);
+                        float wound = 0f;
+                        while (!ExitIsOut(path[0], path[1]) && !EnterIsIn(path[0], path[1]))
+                        {
+                            if (GamePaused)
+                            {
+                                yield return WaitWhilePaused();
+                                continue;
+                            }
+                            yield return WaitForSecondsRealtime(0.25f);
+                            wound += 0.25f;
+                            if (wound >= 90f)
+                            {
+                                Finish(run, "error", "the turntable would not line up");
+                                yield break;
+                            }
+                        }
+                        continue; // joined the right way round now — plan and drive off
+                    }
+                }
+
                 // A shunt is yard work. A re-plan can still hand back a road right
                 // out of the yard — a junction fouled (or thrown by hand) at the
                 // wrong moment re-routes "the long way round", which at yard speed
@@ -278,6 +323,7 @@ namespace DvMod.Autopilot
                     prevReverser = backRev;
 
                     float bThrottle = 0f, bLast = 0f, bAccel = 0f, bSander = 0f, bDyn = 0f;
+                    float bDynHandle = 0f, bDynCap = 1f;
                     float backedFor = 0f;
                     bool backedClear = false;
                     while (backedFor < 120f)
@@ -320,7 +366,8 @@ namespace DvMod.Autopilot
                             + $"v{sp:F0} tgt{tgt:F0}";
                         ApplyThrottle(controller, ref bThrottle, car, tgt, sp,
                             run.profile, ref bLast, ref bAccel, ref run.accelBudget,
-                            ref bSander, ref bDyn, false, false, false);
+                            ref bSander, ref bDyn, ref bDynHandle, ref bDynCap,
+                            false, false, false);
                         if (tgt < 0.8f && sp < 0.5f && stopIn < 1)
                             break; // pinned against something behind — cannot back further
                     }
@@ -478,6 +525,9 @@ namespace DvMod.Autopilot
             float accelFilter = 0f;
             float sanderHold = 0f;
             float dynStallFor = 0f;
+            // Ramped dynamic-brake handle and its slip-taught cap (see ApplyThrottle).
+            float dynHandle = 0f;
+            float dynCap = 1f;
             // One bridge request per leg — the rotate coroutine must not be
             // restarted ten times a second while the train waits at the pit.
             bool bridgeAsked = false;
@@ -983,17 +1033,118 @@ namespace DvMod.Autopilot
                         lead != null ? lead.Value.car : null),
                     railAhead);
 
+                // Riding a table: while the plan's hop OFF the bridge still needs a
+                // wind, the far end of the bridge is a stop boundary even when the
+                // rail happens to continue into some other stall — the pair sailed
+                // straight across into M11P because the joined rail hid the end of
+                // the bridge. Synthesizing a rail end here makes every boarding
+                // rule below (margin, band, all-aboard, wind, facing) apply as if
+                // the far end were open pit.
+                bool windPending = false;
+                {
+                    int ci = IndexNear(path, track, s);
+                    int bi = -1;
+                    if (ci >= 0)
+                    {
+                        if (Turntables.AsBridge(track) != null)
+                            bi = ci;
+                        else if (ci + 1 < path.Count && Turntables.AsBridge(path[ci + 1]) != null)
+                            bi = ci + 1;
+                    }
+                    if (bi >= 0 && bi + 1 < path.Count
+                        && !ExitIsOut(path[bi], path[bi + 1])
+                        && !EnterIsIn(path[bi], path[bi + 1])
+                        && lead != null)
+                    {
+                        windPending = true;
+                        double toExit = DistanceToBridgeExit(
+                            lead.Value.bogie.track, lead.Value.bogie.traveller.Span,
+                            lead.Value.towardOut, path[bi]);
+                        if (toExit != double.MaxValue)
+                            railEnd = Math.Min(railEnd, toExit);
+
+                        // Boarding is done the moment EVERY bogie is aboard — stop
+                        // there and wind, instead of creeping on toward the edge.
+                        // The razor margin below is only for consists that barely
+                        // fit; a light engine braking late at it went into the pit.
+                        if (Turntables.AsBridge(track) != null && AllOnTrack(car, track))
+                        {
+                            target = 0f;
+                            if (speed < 0.5f && !bridgeAsked)
+                            {
+                                var ttHere = Turntables.AsBridge(track);
+                                if (ttHere != null)
+                                {
+                                    Turntables.RotateBridgeTo(ttHere, path[bi + 1]);
+                                    bridgeAsked = true;
+                                }
+                            }
+                            if (bridgeAsked)
+                                run.detail = $"{phase}: waiting for the turntable bridge";
+                        }
+                        else
+                        {
+                            // Still boarding: walking pace, and a crawl for the
+                            // last metres before the end of the bridge.
+                            target = Mathf.Min(target, TurntableKmh);
+                            if (railEnd < 12)
+                                target = Mathf.Min(target, 4f);
+                        }
+                    }
+                }
+
+                // A wind was asked for and the rails have joined: check WHICH bridge
+                // end took the stall. Shove must hand the stall the wagons' end,
+                // pull the loco's — that choice IS the facing order on a turntable.
+                // Wrong end: wind on half a turn and wait for the next join. Right
+                // end: restart the leg, so direction, claims and the drive-off all
+                // recompute from the rail as it now lies.
+                if (bridgeAsked && Turntables.AsBridge(track) is TurntableRailTrack joinedTt)
+                {
+                    int ji = IndexNear(path, track, s);
+                    if (ji >= 0 && ji + 1 < path.Count
+                        && (ExitIsOut(track, path[ji + 1]) || EnterIsIn(track, path[ji + 1])))
+                    {
+                        bool stallAtOut = ExitIsOut(track, path[ji + 1]);
+                        bool? wagonsOut = WagonsTowardOut(car, track);
+                        bool? wantWagons =
+                            run.arrive == ArriveMode.Shove ? true
+                            : run.arrive == ArriveMode.Pull ? (bool?)false
+                            : null;
+                        if (wantWagons != null && wagonsOut != null
+                            && (wagonsOut.Value == stallAtOut) != wantWagons.Value
+                            && AllOnTrack(car, track))
+                        {
+                            run.detail = $"{phase}: half a turn more — "
+                                + (wantWagons.Value ? "the dead weight" : "the loco")
+                                + $" must meet {path[ji + 1].LogicTrack()?.ID}";
+                            Turntables.RotateBy180(joinedTt);
+                            // bridgeAsked stays latched; the next join is the other end
+                        }
+                        else
+                        {
+                            done(true); // rails joined the right way round — drive off
+                            yield break;
+                        }
+                    }
+                }
+
                 // No rail, no driving: brake to a stand short of any end the
                 // connected track ahead comes to — an unaligned turntable, a stub
                 // with no buffer. This is what actually keeps wheels out of the
                 // pit; everything below only knows about CARS ahead.
                 if (railEnd != double.MaxValue)
                 {
+                    // Boarding a bridge mid-plan: the nose must go beyond the usual
+                    // rail-end margin so EVERY bogie gets aboard before the wind.
+                    bool boarding = windPending;
+                    double endMargin = boarding ? BridgeBoardMargin : RailEndMargin;
+                    double endBand = boarding ? 1.5 : 3.0;
                     float vEnd = Mathf.Sqrt(
-                        2f * ObstacleDecel * (float)Math.Max(0, railEnd - RailEndMargin)) * 3.6f;
+                        2f * ObstacleDecel * (float)Math.Max(0, railEnd - endMargin)) * 3.6f;
                     if (vEnd < target)
                         target = vEnd;
-                    if (railEnd < RailEndMargin + 3)
+                    if (railEnd < endMargin + endBand)
                     {
                         // Close enough. A 2 km/h "creep target" here had ApplyThrottle
                         // winding the handle to full against a train it had just braked
@@ -1035,7 +1186,19 @@ namespace DvMod.Autopilot
                                 // on the bridge — a car hanging over the joint gets
                                 // dragged off its rails by the turn.
                                 if (onBridge != null && i >= 0 && i + 1 < path.Count
-                                    && AllOnTrack(car, track))
+                                    && !AllOnTrack(car, track))
+                                {
+                                    // Stood as deep as the boarding margin allows and
+                                    // a bogie is STILL off the bridge: it does not
+                                    // fit, and turning would drag it into the pit.
+                                    overrider.Throttle?.Set(0f);
+                                    overrider.Brake?.Set(1f);
+                                    Finish(run, "error",
+                                        "the consist does not fit on the turntable bridge");
+                                    done(false);
+                                    yield break;
+                                }
+                                if (onBridge != null && i >= 0 && i + 1 < path.Count)
                                 {
                                     Turntables.RotateBridgeTo(onBridge, path[i + 1]);
                                     bridgeAsked = true;
@@ -1066,7 +1229,13 @@ namespace DvMod.Autopilot
                 // Drive to the end of held rail like a signal at danger: full
                 // speed with authority in hand, braking curve into the boundary,
                 // stand at it, roll again the moment the next block grants.
-                if (cachedAuthority != double.MaxValue)
+                // Only when the walk stopped at somebody's BLOCK (atName set). When it
+                // merely ran out of rail — a stub, an unaligned turntable — the
+                // rail-end guard above owns the approach, and its margin (5 m) is
+                // deliberately tighter than the signal margin (10 m): capping on
+                // authority there pinned a spot to a dead stand 8 m short of the pit,
+                // which is exactly where the bridge request would have fired.
+                if (cachedAuthority != double.MaxValue && cachedAuthorityAt.Length > 0)
                 {
                     float vAuth = ApproachSpeedKmh(
                         0f, cachedAuthority - SignalMargin, StopDecel);
@@ -1277,7 +1446,7 @@ namespace DvMod.Autopilot
                 var (tmWarning, tmCritical) = TmOverheatState(car);
                 ApplyThrottle(controller, ref throttle, car, target, speed,
                     run.profile, ref lastSpeedMs, ref accelFilter, ref run.accelBudget,
-                    ref sanderHold, ref dynStallFor,
+                    ref sanderHold, ref dynStallFor, ref dynHandle, ref dynCap,
                     // The dynamic is a ROAD tool: long descents, speed
                     // restrictions at line speed. A shunt never gets fast enough
                     // for it to bite and just wants the air — and even on the

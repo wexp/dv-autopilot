@@ -191,6 +191,12 @@ namespace DvMod.Autopilot
                 }
             }
 
+            // A leg that appears ANYWHERE on the path is the plan's business - a
+            // runaround enters and leaves a junction by different legs on
+            // different hops, and judging each hop alone read the previous hop's
+            // leg as a wrong road.
+            var pathSet = new HashSet<RailTrack>(path);
+
             for (int i = 0; i + 1 < path.Count; i++)
             {
                 var junction = JunctionBetween(path[i], path[i + 1]);
@@ -198,11 +204,11 @@ namespace DvMod.Autopilot
                     continue;
                 var planLegs = new HashSet<RailTrack> { path[i], path[i + 1] };
                 var thirdLegs = new HashSet<RailTrack>();
-                if (junction.inBranch?.track != null && !planLegs.Contains(junction.inBranch.track))
+                if (junction.inBranch?.track != null && !pathSet.Contains(junction.inBranch.track))
                     thirdLegs.Add(junction.inBranch.track);
                 if (junction.outBranches != null)
                     foreach (var ob in junction.outBranches)
-                        if (ob?.track != null && !planLegs.Contains(ob.track))
+                        if (ob?.track != null && !pathSet.Contains(ob.track))
                             thirdLegs.Add(ob.track);
                 if (thirdLegs.Count == 0)
                     continue;
@@ -218,7 +224,7 @@ namespace DvMod.Autopilot
                     {
                         if (b?.track == null)
                             continue;
-                        if (planLegs.Contains(b.track))
+                        if (pathSet.Contains(b.track))
                             onPlan = true;
                         else if (thirdLegs.Contains(b.track))
                             onThird = true;

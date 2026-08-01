@@ -983,7 +983,11 @@ namespace DvMod.Autopilot
                         // Stopped at the end of the rail ON the destination: that IS
                         // the spot, wherever the markers think the train should be —
                         // the marker depth cannot be bought on a track this short.
+                        // A via move must still have come in by its demanded end.
                         if (lastLeg && speed < 0.5f && !run.couple
+                            && (!run.viaLocked
+                                || (path.Count > 0 && path[path.Count - 1] == run.destTrack
+                                    && EntryEndIsIn(path, run.destTrack) == run.arriveEnteredIn))
                             && (LocoOnTrack(car, destId) || AnyCarOnTrack(car, destId)))
                         {
                             overrider.Throttle?.Set(0f);
@@ -1147,9 +1151,15 @@ namespace DvMod.Autopilot
                         bool roadComplete = AnyCarOnTrack(car, destId)
                             || (run.destTrack != null
                                 && ForeignStockOn(run.destTrack, car.trainset));
+                        // A via move only ever arrives by its demanded end: parking
+                        // short from the WRONG side is not arrival, it is the via
+                        // being quietly thrown away.
+                        bool viaOk = !run.viaLocked
+                            || (path.Count > 0 && path[path.Count - 1] == run.destTrack
+                                && EntryEndIsIn(path, run.destTrack) == run.arriveEnteredIn);
                         if (lastLeg && !run.couple && speed < 0.5f
                             && blockedFor >= 5f
-                            && roadComplete
+                            && roadComplete && viaOk
                             && !AutopilotStockAhead(corridor, car.trainset))
                         {
                             overrider.Throttle?.Set(0f);

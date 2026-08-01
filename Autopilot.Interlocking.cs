@@ -27,7 +27,16 @@ namespace DvMod.Autopilot
         /// </summary>
         private static void ReleaseClaimsBehind(Run run, List<RailTrack> path, int pathIdx)
         {
+            // Block-signaling release: the most recently CLEARED block stays held
+            // as the buffer behind the tail - a bogie leaving a track still leaves
+            // the body overhanging it, and handing the block back that instant put
+            // a follower's nose right at the tail. Everything behind the buffer
+            // block goes back to the pool.
+            int newestClear = -1;
             for (int i = 0; i < pathIdx && i < path.Count; i++)
+                if (run.claimed.Contains(path[i]) && !OurCarsOn(run.car, path[i]))
+                    newestClear = i;
+            for (int i = 0; i < newestClear && i < path.Count; i++)
             {
                 var track = path[i];
                 if (!run.claimed.Contains(track) || OurCarsOn(run.car, track))

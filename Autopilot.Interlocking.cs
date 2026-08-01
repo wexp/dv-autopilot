@@ -249,7 +249,7 @@ namespace DvMod.Autopilot
             {
                 if (fouler == null || fouler.trainset == ours)
                     continue;
-                if (BodyDistanceToJunction(junction, fouler) < FoulingTolerance)
+                if (BodyDistanceToJunction(junction, fouler) < JunctionGrantClearance)
                 {
                     holder = fouler.ID;
                     return false;

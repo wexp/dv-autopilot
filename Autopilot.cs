@@ -235,6 +235,11 @@ namespace DvMod.Autopilot
         /// enough to throw points but not to admit the next train: a follower's
         /// authority extended through a frog the leader's tail had barely left.</summary>
         private const double JunctionReleaseMargin = 15.0;
+        /// <summary>No junction grants while anyone's body is within this of the
+        /// frog, m. Two legs of a junction converge long before the frog itself:
+        /// at the old 7 m a leader was cleared to swing through with a queued
+        /// follower's nose just off the points, and they traded paint.</summary>
+        private const double JunctionGrantClearance = 15.0;
 
         // A train blocked this long gives its reservations up, so two trains that have
         // each half of a throat cannot sit there holding it against one another, m/s.

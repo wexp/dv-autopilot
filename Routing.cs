@@ -286,6 +286,12 @@ namespace DvMod.Autopilot
             // costs already answered, so there is no ladder to descend.)
             List<RailTrack> Divert(List<RailTrack> path, double cost, bool? facing)
             {
+                // A forced entry end (via) or facing (shove/pull) IS the corridor:
+                // rerouting around live traffic under those constraints produced
+                // looping nonsense. Traffic on a constrained road is met with the
+                // block system, not a detour.
+                if (arriveEnteredIn != null || facing != null)
+                    return path;
                 var conflicted = Conflicts(path);
                 if (conflicted.Count == 0)
                     return path;

@@ -389,7 +389,7 @@ namespace DvMod.Autopilot
                     run, path, s, track, bogie.traveller.Span,
                     (reverser >= 0.5f) == (bogie.TrackDirectionSign > 0),
                     ConsistLengthAhead(car, bogie), AuthorityMinMeters,
-                    out _, out _, out _);
+                    out _, out _, out _, lastLeg ? int.MaxValue : e);
                 run.state = "driving";
 
                 // Set the switches we HOLD, and only those. Setting the whole route at
@@ -579,7 +579,8 @@ namespace DvMod.Autopilot
                         run, path, authIdx, track, bogie.traveller.Span, towardOut,
                         ownLeadHint, needMeters,
                         out cachedAuthorityHolder, out cachedAuthorityAt,
-                        out cachedAuthorityBlocked);
+                        out cachedAuthorityBlocked,
+                        lastLeg ? int.MaxValue : e);
                     ReleaseJunctionsBehind(run, path, Math.Max(0, authIdx));
                     PreemptWantedBlocks(run);
 

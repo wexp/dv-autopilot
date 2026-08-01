@@ -359,7 +359,8 @@ namespace DvMod.Autopilot
         private static double ExtendAuthority(
             Run run, List<RailTrack> path, int idx, RailTrack track, double bogieSpan,
             bool towardOut, double ownLead, double need,
-            out string heldBy, out string atName, out RailTrack? blockedTrack)
+            out string heldBy, out string atName, out RailTrack? blockedTrack,
+            int legEnd = int.MaxValue)
         {
             heldBy = "";
             atName = "";
@@ -377,6 +378,13 @@ namespace DvMod.Autopilot
                 RailTrack? next = null;
                 bool nextOut = true;
                 Junction? junction = null;
+                // Past the current LEG the plan is the NEXT leg's business - a
+                // pull's road ahead is its live overrun, not the reversal's
+                // return hop. Chasing the return hop froze a pull at zero
+                // authority because the junction back in was fouled by the very
+                // train it was sent to couple to.
+                if (i >= legEnd)
+                    i = -1;
                 if (i >= 0 && i + 1 < path.Count)
                 {
                     next = path[i + 1];

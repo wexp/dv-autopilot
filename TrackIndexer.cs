@@ -71,6 +71,17 @@ namespace DvMod.Autopilot
             }
         }
 
+        /// <summary>Every indexed speed sign on a track: where it stands, which
+        /// travel direction it faces (true = toward increasing span), and its
+        /// limit. For callers that need the ZONES — a sign binds from where it
+        /// stands to the next sign its way, not the whole track.</summary>
+        public static IEnumerable<(double span, bool direction, int limit)> SpeedSigns(RailTrack track)
+        {
+            foreach (var ev in GetTrackEvents(track))
+                if (ev is SpeedLimitEvent s && s.limit > 0)
+                    yield return (ev.span, s.Direction, s.limit);
+        }
+
         /// <summary>The tightest posted speed limit on a track, km/h — 0 if the
         /// track has no speed sign indexed yet. With <paramref name="direction"/>
         /// given, only signs FACING that travel direction count (true = toward

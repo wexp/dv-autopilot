@@ -111,6 +111,22 @@ namespace DvMod.Autopilot
                 }
             }
 
+            // A sign binds from where it STANDS to the next sign its way — not
+            // the whole track. Track-wide binding pinned a kilometre-long yard
+            // approach to yard speed the moment the train rolled onto it, a
+            // kilometre before the sign: the "+7 at 1000 m instead of 300" bug.
+            void ScanSigns(RailTrack tr, bool fwd, double entryDist)
+            {
+                double total = PhysicalSpan(tr);
+                foreach (var sgn in TrackIndexer.SpeedSigns(tr))
+                {
+                    if (sgn.direction != fwd || sgn.limit > here + 0.5f)
+                        continue;
+                    allowed = Mathf.Min(allowed,
+                        sgn.limit + Allow(entryDist + (fwd ? sgn.span : total - sgn.span)));
+                }
+            }
+
             // The rest of the track we are ON: `here` only covers what is under
             // the train, so a tight bend further along the same track has to be
             // planned for like any other.
@@ -129,6 +145,16 @@ namespace DvMod.Autopilot
                         continue;
                     if (seg[0] > 0f && seg[0] <= here + 0.5f)
                         allowed = Mathf.Min(allowed, seg[0] + Allow(dist - ownLead));
+                }
+                // Signs still ahead of the front on this same track.
+                foreach (var sgn in TrackIndexer.SpeedSigns(startTrack))
+                {
+                    if (sgn.direction != towardOut || sgn.limit > here + 0.5f)
+                        continue;
+                    double dist = towardOut ? sgn.span - startSpan : startSpan - sgn.span;
+                    if (dist <= 0)
+                        continue; // behind or under the train: the zoned `here` covers it
+                    allowed = Mathf.Min(allowed, sgn.limit + Allow(dist - ownLead));
                 }
             }
 
@@ -154,10 +180,7 @@ namespace DvMod.Autopilot
                     higherAhead = true;
                     continue;
                 }
-                // A posted sign binds its whole track from the entry on.
-                float sign = TrackIndexer.MinSpeedLimit(t, outward);
-                if (sign > 0f && sign <= here + 0.5f)
-                    allowed = Mathf.Min(allowed, sign + Allow(cum));
+                ScanSigns(t, outward, cum);
                 ScanSegments(t, outward, cum);
             }
 
@@ -344,15 +367,58 @@ namespace DvMod.Autopilot
         }
 
         /// <summary>
+        /// The tightest sign limit whose ZONE overlaps [lo, hi] for the given travel
+        /// direction, km/h (0 = none). A sign binds from where it stands to the next
+        /// sign facing the same way, or the end of the track; before the first sign
+        /// nothing binds. Track-wide binding pinned a kilometre-long approach road to
+        /// the yard limit posted at its far end. Unknown direction takes both ways.
+        /// </summary>
+        private static float SignLimitBetween(RailTrack track, double lo, double hi, bool? dir)
+        {
+            float min = 0f;
+            void Scan(bool d)
+            {
+                var list = new List<(double span, int limit)>();
+                foreach (var s in TrackIndexer.SpeedSigns(track))
+                    if (s.direction == d)
+                        list.Add((s.span, s.limit));
+                if (list.Count == 0)
+                    return;
+                list.Sort((a, b) => a.span.CompareTo(b.span));
+                double end = PhysicalSpan(track);
+                for (int i = 0; i < list.Count; i++)
+                {
+                    // Travelling toward increasing span the zone runs from the sign
+                    // UP to the next one; the other way it runs from the sign DOWN.
+                    double zLo = d ? list[i].span : (i > 0 ? list[i - 1].span : 0);
+                    double zHi = d ? (i + 1 < list.Count ? list[i + 1].span : end) : list[i].span;
+                    if (zHi < lo || zLo > hi)
+                        continue;
+                    if (min == 0f || list[i].limit < min)
+                        min = list[i].limit;
+                }
+            }
+            if (dir == null)
+            {
+                Scan(true);
+                Scan(false);
+            }
+            else
+            {
+                Scan(dir.Value);
+            }
+            return min;
+        }
+
+        /// <summary>
         /// The limit over the stretch of a track between two spans, km/h. A track can
         /// be a kilometre long with one tight curve in it; taking the minimum over the
         /// whole thing — as TrackLimit does — then held the train to that curve's speed
-        /// for the entire length. Signs still apply track-wide, since a posted limit
-        /// does.
+        /// for the entire length. Signs bind by their zones (see SignLimitBetween).
         /// </summary>
         private static float TrackLimitBetween(RailTrack track, double lo, double hi, bool? dir = null)
         {
-            float sign = TrackIndexer.MinSpeedLimit(track, dir);
+            float sign = SignLimitBetween(track, lo, hi, dir);
             float geometry = 999f;
             double cursor = 0;
             foreach (var seg in SpeedZones.SegmentsFor(track))

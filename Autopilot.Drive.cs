@@ -495,6 +495,8 @@ namespace DvMod.Autopilot
             // One bridge request per leg — the rotate coroutine must not be
             // restarted ten times a second while the train waits at the pit.
             bool bridgeAsked = false;
+            // Independent brake pinned while the train pipe recharges at a stand.
+            bool indepPinned = false;
             // Whether the train is creeping back onto marks it drove past, and
             // which way along the destination the spot was travelling (true =
             // toward increasing span), learned while moving.
@@ -1301,7 +1303,19 @@ namespace DvMod.Autopilot
                     bool brakesHolding = pipe < BrakeReleasedBar;
                     fullPowerFor = throttle >= 0.95f && !brakesHolding ? fullPowerFor + 0.1f : 0f;
                     if (brakesHolding)
+                    {
                         run.detail = $"{phase}: waiting for the brakes to release ({pipe:F1} bar)";
+                        // Pin the loco while the pipe charges: on a grade the rake
+                        // drifts during this wait, and a metre of drift into the
+                        // stock behind is a coupling nobody asked for.
+                        overrider.IndependentBrake?.Set(1f);
+                        indepPinned = true;
+                    }
+                    else if (indepPinned)
+                    {
+                        overrider.IndependentBrake?.Set(0f);
+                        indepPinned = false;
+                    }
                     if (run.coupledDone && stuckFor > 10f)
                     {
                         // The train is coupled and being shoved in, but has stopped

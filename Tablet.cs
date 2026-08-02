@@ -574,6 +574,13 @@ namespace DvMod.Autopilot
                 text.enableWordWrapping = true;
                 text.overflowMode = TextOverflowModes.Truncate;
                 text.rectTransform.sizeDelta = new Vector2(worldWidth * S, worldHeight * S);
+                // Glyphs are meshes and were casting sundial shadows on the glass.
+                var mr = textGo.GetComponent<MeshRenderer>();
+                if (mr != null)
+                {
+                    mr.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
+                    mr.receiveShadows = false;
+                }
                 // World-unit scale regardless of the item's own scaling.
                 textGo.transform.localScale = new Vector3(
                     1f / Mathf.Max(0.0001f, pl.x),

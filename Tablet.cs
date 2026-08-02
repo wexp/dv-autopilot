@@ -522,16 +522,14 @@ namespace DvMod.Autopilot
                         new Vector3(sx * (0.145f / 2 - cr), 0f, sz * (0.105f / 2 - cr)),
                         bodyColor, shape: PrimitiveType.Cylinder);
             var screenPiece = Piece("TabletScreen",
-                World(0.118f, 0.002f, 0.082f), new Vector3(0, 0.0022f, 0f),
+                World(0.1315f, 0.002f, 0.0935f), new Vector3(0, 0.0022f, 0f),
                 new Color(0.02f, 0.03f, 0.05f), new Color(0.02f, 0.05f, 0.09f),
                 keepCollider: true);
             // Trigger, not solid — a solid collider 26 cm from the camera shoves
             // the player backwards whenever they glance at the screen.
             screenPiece.GetComponent<Collider>().isTrigger = true;
-            Piece("TabletSpeaker", World(0.03f, 0.0015f, 0.003f), new Vector3(0, 0.0022f, 0.0465f),
-                new Color(0.05f, 0.05f, 0.05f));
-            Piece("TabletHome", World(0.008f, 0.0015f, 0.008f), new Vector3(0, 0.0022f, -0.0465f),
-                new Color(0.32f, 0.33f, 0.35f));
+            Piece("TabletHome", World(0.005f, 0.0015f, 0.005f), new Vector3(0, 0.0022f, -0.0497f),
+                new Color(0.32f, 0.33f, 0.35f), shape: PrimitiveType.Cylinder);
 
             var marker = go.AddComponent<TabletMarker>();
             marker.model = model;
@@ -563,7 +561,7 @@ namespace DvMod.Autopilot
                 // Hard clip at the rect: overflow was billboarding half a
                 // sentence across the night sky.
                 text.overflowMode = TextOverflowModes.Truncate;
-                text.rectTransform.sizeDelta = new Vector2(worldWidth * S, 0.082f * S);
+                text.rectTransform.sizeDelta = new Vector2(worldWidth * S, 0.0935f * S);
                 // World-unit scale regardless of the item's own scaling.
                 textGo.transform.localScale = new Vector3(
                     1f / Mathf.Max(0.0001f, pl.x),
@@ -572,14 +570,14 @@ namespace DvMod.Autopilot
                 return text;
             }
 
-            const float colWidth = 0.118f / TabletPins.Max;
+            const float colWidth = 0.1315f / TabletPins.Max;
             for (int i = 0; i < TabletPins.Max; i++)
             {
                 float x = (i - (TabletPins.Max - 1) / 2f) * colWidth;
                 marker.windows[i] = MakeText($"TabletWindow{i}", x, colWidth - 0.004f,
                     0.012f, TextAlignmentOptions.Top);
             }
-            marker.emptyMsg = MakeText("TabletEmpty", 0f, 0.112f, 0.04f,
+            marker.emptyMsg = MakeText("TabletEmpty", 0f, 0.128f, 0.04f,
                 TextAlignmentOptions.Center);
 
             tablets.Add(marker);

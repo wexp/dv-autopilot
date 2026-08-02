@@ -575,9 +575,9 @@ namespace DvMod.Autopilot
             {
                 float x = (i - (TabletPins.Max - 1) / 2f) * colWidth;
                 marker.windows[i] = MakeText($"TabletWindow{i}", x, colWidth - 0.004f,
-                    0.1f, TextAlignmentOptions.Top);
+                    0.012f, TextAlignmentOptions.Top);
             }
-            marker.emptyMsg = MakeText("TabletEmpty", 0f, 0.112f, 0.22f,
+            marker.emptyMsg = MakeText("TabletEmpty", 0f, 0.112f, 0.04f,
                 TextAlignmentOptions.Center);
 
             tablets.Add(marker);

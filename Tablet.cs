@@ -150,8 +150,8 @@ namespace DvMod.Autopilot
                 // Looking ahead: tucked low. Looking down at it: close reading
                 // pose covering about half the view. Continuous blend.
                 float down = Mathf.Clamp01((-cam.transform.forward.y - 0.05f) / 0.30f);
-                float dist = Mathf.Lerp(0.34f, 0.20f, down);
-                float drop = Mathf.Lerp(0.12f, 0.01f, down);
+                float dist = Mathf.Lerp(0.26f, 0.11f, down);
+                float drop = Mathf.Lerp(0.09f, 0.01f, down);
                 var pos = cam.transform.position
                     + cam.transform.forward * dist
                     - cam.transform.up * drop;

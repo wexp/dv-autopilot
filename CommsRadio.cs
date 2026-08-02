@@ -39,7 +39,13 @@ namespace DvMod.Autopilot
         {
             if (created)
                 return;
-            CommsRadioMode.Create(new Home(null), LaserColor);
+            var mode = CommsRadioMode.Create(new Home(null), LaserColor);
+            // The API's default signal origin is the controller object on the
+            // player, whose forward is wherever the BODY faces — not the laser.
+            // Vanilla modes carry the radio muzzle transform; borrow one.
+            var deleter = ControllerAPI.GetVanillaMode(VanillaMode.Clear) as CommsRadioCarDeleter;
+            if (deleter != null && deleter.signalOrigin != null)
+                mode.OverrideSignalOrigin(deleter.signalOrigin);
             created = true;
             Main.mod?.Logger.Log("Comms radio AUTOPILOT mode attached");
         }

@@ -152,6 +152,43 @@ namespace DvMod.Autopilot
             Updater.Destroy();
         }
 
+        /// <summary>Hot-reload this mod — what UMM's Ctrl+F10 dialog does, on a
+        /// hotkey. The runner lives on a detached object because the reload
+        /// unloads this assembly's own scene objects mid-flight.</summary>
+        internal static void RequestReload()
+        {
+            var entry = mod;
+            if (entry == null || !entry.CanReload)
+            {
+                mod?.Logger.Log("Reload not available for this build");
+                return;
+            }
+            mod?.Logger.Log("Reloading by hotkey...");
+            ReloadRunner.Begin(entry);
+        }
+
+        private sealed class ReloadRunner : UnityEngine.MonoBehaviour
+        {
+            private UnityModManager.ModEntry? entry;
+
+            public static void Begin(UnityModManager.ModEntry modEntry)
+            {
+                var host = new UnityEngine.GameObject("AutopilotReload");
+                UnityEngine.Object.DontDestroyOnLoad(host);
+                host.AddComponent<ReloadRunner>().entry = modEntry;
+            }
+
+            private System.Collections.IEnumerator Start()
+            {
+                yield return null;
+                var reload = entry?.GetType().GetMethod(
+                    "Reload",
+                    BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+                reload?.Invoke(entry, null);
+                Destroy(gameObject);
+            }
+        }
+
         public static void DebugLog(TrainCar car, Func<string> message)
         {
             if (car == PlayerManager.Car)

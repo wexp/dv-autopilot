@@ -108,6 +108,9 @@ namespace DvMod.Autopilot
             }
             if (Input.GetKeyDown(Main.settings.tabletKey))
                 GiveTablet();
+            if (Input.GetKeyDown(KeyCode.F10)
+                && (Input.GetKey(KeyCode.LeftShift) || Input.GetKey(KeyCode.RightShift)))
+                Main.RequestReload();
 
             if (Cursor.visible)
                 HandleMouse();

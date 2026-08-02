@@ -19,8 +19,15 @@ namespace DvMod.Autopilot
         public void Start()
         {
             instance = this;
-            mainThreadId = System.Threading.Thread.CurrentThread.ManagedThreadId;
             StartCoroutine(DeferredEventsCoro());
+        }
+
+        /// <summary>Called from Main.Load (always the main thread), so the inline
+        /// path below works from the first frame — a caller blocking on Result
+        /// before the Updater exists would otherwise hang forever.</summary>
+        public static void CaptureMainThread()
+        {
+            mainThreadId = System.Threading.Thread.CurrentThread.ManagedThreadId;
         }
 
         /// <summary>Already on the game's main thread? Then a queued task would

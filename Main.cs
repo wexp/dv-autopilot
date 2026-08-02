@@ -17,6 +17,7 @@ namespace DvMod.Autopilot
         public static bool Load(UnityModManager.ModEntry modEntry)
         {
             mod = modEntry;
+            Updater.CaptureMainThread();
 
             try
             {

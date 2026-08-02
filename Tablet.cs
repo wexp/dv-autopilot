@@ -76,6 +76,11 @@ namespace DvMod.Autopilot
 
         public void Update()
         {
+            // Nothing here may poke game singletons while the world is still
+            // loading — an innocent Inventory.Instance mid-load forces creation
+            // at the wrong moment.
+            if (!WorldStreamingInit.IsLoaded)
+                return;
             var settings = Main.settings;
             if (Input.GetKeyDown(settings.tabletKey))
                 GiveTablet();

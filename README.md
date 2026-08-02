@@ -37,7 +37,7 @@ The Unity Mod Manager settings panel holds one driving profile per locomotive ty
 
 This project reuses and adapts code from two excellent Derail Valley mods:
 
-- [dv-remote-dispatch](https://github.com/mspielberg/dv-remote-dispatch) by mspielberg — the mod this engine grew out of: world/track plumbing, job data handling and the updater scaffolding started there. The maintained fork with the autopilot console is [Alexand3r/dv-remote-dispatch](https://github.com/Alexand3r/dv-remote-dispatch).
+- [dv-remote-dispatch](https://github.com/mspielberg/dv-remote-dispatch) by mspielberg — the mod this engine grew out of: world/track plumbing, job data handling and the updater scaffolding started there, and its web console is the intended front end for this engine.
 - [dv-hud](https://github.com/koteq/dv-hud) by koteq — track following and speed/grade indexing ideas.
 
 Thanks to both authors for publishing their work under permissive licences.

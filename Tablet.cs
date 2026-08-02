@@ -2,7 +2,6 @@ using DV.InventorySystem;
 using System;
 using System.Collections.Generic;
 using System.Linq;
-using TMPro;
 using UnityEngine;
 
 namespace DvMod.Autopilot
@@ -30,8 +29,8 @@ namespace DvMod.Autopilot
     /// <summary>Marker + screen references on a spawned dispatcher tablet.</summary>
     public class TabletMarker : MonoBehaviour
     {
-        public TextMeshPro?[] windows = new TextMeshPro?[TabletPins.Max];
-        public TextMeshPro? emptyMsg;
+        public TextMesh?[] windows = new TextMesh?[TabletPins.Max];
+        public TextMesh? emptyMsg;
         /// <summary>The visual model child, moved into a reading pose while held.</summary>
         public Transform? model;
         /// <summary>The glass — the piece the cursor-mode mouse ray hits.</summary>
@@ -97,7 +96,6 @@ namespace DvMod.Autopilot
         private float nextScan;
         private List<string> yards = new List<string>();
         private bool sweptStale;
-        private static TMP_FontAsset? font;
 
         public void Update()
         {
@@ -494,35 +492,6 @@ namespace DvMod.Autopilot
             }
         }
 
-        private static TMP_FontAsset? Font()
-        {
-            if (font == null)
-                font = Resources.FindObjectsOfTypeAll<TMP_FontAsset>().FirstOrDefault();
-            return font;
-        }
-
-        private static Material? cleanFontMat;
-
-        /// <summary>The font's material minus its preset effects — the underlay
-        /// (the "shadow" under every glyph) and the glow halo. Assigned as the
-        /// SHARED material: TMP rebinds the shared material on every text change,
-        /// so per-instance stripping silently reverted each repaint.</summary>
-        private static Material? CleanFontMaterial()
-        {
-            var f = Font();
-            if (f == null)
-                return null;
-            if (cleanFontMat == null)
-            {
-                cleanFontMat = new Material(f.material);
-                cleanFontMat.DisableKeyword("UNDERLAY_ON");
-                cleanFontMat.DisableKeyword("UNDERLAY_INNER");
-                cleanFontMat.DisableKeyword("GLOW_ON");
-                cleanFontMat.DisableKeyword("OUTLINE_ON");
-            }
-            return cleanFontMat;
-        }
-
         private void GiveTablet()
         {
             if (tablets.Any(m => m != null))
@@ -606,6 +575,8 @@ namespace DvMod.Autopilot
                     + dial.forward * (worldOffset.z * S);
                 piece.transform.localScale = size;
                 var m = new Material(Shader.Find("Standard")) { color = color };
+                piece.GetComponent<Renderer>().motionVectorGenerationMode =
+                    MotionVectorGenerationMode.ForceNoMotion;
                 // Fully matte. The glossy default reflected the bright glyphs in
                 // the glass as a dark offset copy — the "shadow" that survived
                 // every shadow fix, because it never was one.
@@ -645,98 +616,53 @@ namespace DvMod.Autopilot
             marker.homeLocalPos = model.localPosition;
             marker.homeLocalRot = model.localRotation;
 
-            // Four window texts across the glass plus the empty-board message.
-            // TMP, not TextMesh: TMP's shader tests depth, so the text no longer
-            // shines through walls.
-            // The game's own plate text (the wagon number boards) is the known-good
-            // TMP setup: right font, clean material, no underlay ghost, no glow —
-            // clone it instead of assembling text from found parts (the
-            // dv-wagon-destination recipe).
-            var plateText = Resources.FindObjectsOfTypeAll<TrainCarPlate>()
-                .Select(pl => pl != null ? pl.cargoMassJobId : null)
-                .FirstOrDefault(src => src != null);
-
-            TextMeshPro MakeText(string name, float worldX, float worldZ,
-                float worldWidth, float worldHeight, TextAlignmentOptions align,
-                bool wrap = false)
+            // Window texts: the DVBonusTimer recipe verbatim — a plain
+            // TextMesh with the default font. It is the one text setup proven
+            // clean on a held DV item; every TMP variant grew new artifacts.
+            TextMesh MakeText(string name, float worldX, float worldZ,
+                float charSize, TextAnchor anchor)
             {
-                GameObject textGo;
-                if (plateText != null)
-                {
-                    textGo = UnityEngine.Object.Instantiate(plateText.gameObject);
-                    textGo.name = name;
-                }
-                else
-                {
-                    textGo = new GameObject(name);
-                }
+                var textGo = new GameObject(name);
                 textGo.transform.SetParent(model, true);
                 textGo.layer = layer;
-                // Clear of the glass: the screen slab's top face sits ~3.7 mm up
-                // and TMP tests depth — text below that line is inside the slab.
                 textGo.transform.position = dial.position
-                    + dial.up * 0.007f + dial.right * (worldX * S)
+                    + dial.up * 0.004f + dial.right * (worldX * S)
                     + dial.forward * (worldZ * S);
                 textGo.transform.rotation = dial.rotation * Quaternion.Euler(90f, 0f, 0f);
-                var text = textGo.GetComponent<TextMeshPro>();
-                bool cloned = text != null;
-                if (text == null)
-                    text = textGo.AddComponent<TextMeshPro>();
-                if (!cloned)
-                {
-                    // Built from scratch: fall back to a found font, effects
-                    // stripped. The clone keeps its own — that's its value.
-                    text.font = Font();
-                    var clean = CleanFontMaterial();
-                    if (clean != null)
-                        text.fontSharedMaterial = clean;
-                }
-                text.text = "";
-                // Auto-size to the rect — every hand-picked size was wrong on
-                // some screen; let TMP fit the text to the window.
-                text.enableAutoSizing = true;
-                text.fontSizeMin = 0.05f;
-                text.fontSizeMax = 8f;
-                text.alignment = align;
-                text.richText = true;
-                text.color = Color.white;
-                // Window rows must stay ONE line each or the click grid lies;
-                // only the empty-board message wraps.
-                text.enableWordWrapping = wrap;
-                text.overflowMode = TextOverflowModes.Truncate;
-                // The plate clone brings the plate's off-centre pivot along —
-                // centre it or the text hangs off the right edge of the glass.
-                text.rectTransform.pivot = new Vector2(0.5f, 0.5f);
-                text.rectTransform.anchorMin = new Vector2(0.5f, 0.5f);
-                text.rectTransform.anchorMax = new Vector2(0.5f, 0.5f);
-                text.rectTransform.sizeDelta = new Vector2(worldWidth * S, worldHeight * S);
-                // Glyphs are meshes and were casting sundial shadows on the glass.
-                var mr = textGo.GetComponent<MeshRenderer>();
-                if (mr != null)
-                {
-                    mr.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
-                    mr.receiveShadows = false;
-                }
                 // World-unit scale regardless of the item's own scaling.
                 textGo.transform.localScale = new Vector3(
                     1f / Mathf.Max(0.0001f, pl.x),
                     1f / Mathf.Max(0.0001f, pl.y),
                     1f / Mathf.Max(0.0001f, pl.z));
-                return text;
+                var tm = textGo.AddComponent<TextMesh>();
+                tm.anchor = anchor;
+                tm.alignment = TextAlignment.Center;
+                tm.fontSize = 80;
+                tm.characterSize = charSize * S;
+                tm.richText = true;
+                tm.color = Color.white;
+                var mr = textGo.GetComponent<MeshRenderer>();
+                if (mr != null)
+                {
+                    mr.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
+                    mr.receiveShadows = false;
+                    mr.motionVectorGenerationMode = MotionVectorGenerationMode.ForceNoMotion;
+                }
+                return tm;
             }
 
-            // 2 x 2 grid: each window takes a quarter of the glass.
+            // 2 x 2 grid: each window is anchored at the TOP of its quarter.
             const float halfW = 0.1315f / 2f;
             const float halfH = 0.0935f / 2f;
             for (int i = 0; i < TabletPins.Max; i++)
             {
                 float x = (i % 2 == 0 ? -1 : 1) * halfW / 2f;
-                float z = (i < 2 ? 1 : -1) * halfH / 2f;
+                float z = (i < 2 ? 1 : -1) * halfH / 2f + halfH / 2f - 0.002f;
                 marker.windows[i] = MakeText($"TabletWindow{i}", x, z,
-                    halfW - 0.006f, halfH - 0.004f, TextAlignmentOptions.Top);
+                    0.00050f, TextAnchor.UpperCenter);
             }
-            marker.emptyMsg = MakeText("TabletEmpty", 0f, 0f, 0.128f, 0.05f,
-                TextAlignmentOptions.Center, wrap: true);
+            marker.emptyMsg = MakeText("TabletEmpty", 0f, 0f,
+                0.00110f, TextAnchor.MiddleCenter);
 
             tablets.Add(marker);
             int result = inv.AddItemToInventory(go, slot, false);

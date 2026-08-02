@@ -128,8 +128,8 @@ namespace DvMod.Autopilot
             if (held && cam != null)
             {
                 var pos = cam.transform.position
-                    + cam.transform.forward * 0.42f
-                    - cam.transform.up * 0.10f;
+                    + cam.transform.forward * 0.26f
+                    - cam.transform.up * 0.06f;
                 var rot = Quaternion.LookRotation(cam.transform.up, -cam.transform.forward);
                 t.model.SetPositionAndRotation(pos, rot);
             }
@@ -445,10 +445,13 @@ namespace DvMod.Autopilot
             // All primitives, all sized in WORLD units then divided by the
             // parent's scale (localScale multiplies by it).
             var pl = model.lossyScale;
+            // Overall tablet size: 1 was a pocket phone; this matches the job
+            // booklet (~15 x 21 cm).
+            const float S = 1.45f;
             Vector3 World(float x, float y, float z) => new Vector3(
-                x / Mathf.Max(0.0001f, pl.x),
-                y / Mathf.Max(0.0001f, pl.y),
-                z / Mathf.Max(0.0001f, pl.z));
+                x * S / Mathf.Max(0.0001f, pl.x),
+                y * S / Mathf.Max(0.0001f, pl.y),
+                z * S / Mathf.Max(0.0001f, pl.z));
             GameObject Piece(string name, Vector3 size, Vector3 worldOffset, Color color, Color? glow = null, bool keepCollider = false)
             {
                 var piece = GameObject.CreatePrimitive(PrimitiveType.Cube);
@@ -459,8 +462,8 @@ namespace DvMod.Autopilot
                 piece.layer = layer;
                 piece.transform.rotation = dial.rotation;
                 piece.transform.position = dial.position
-                    + dial.right * worldOffset.x + dial.up * worldOffset.y
-                    + dial.forward * worldOffset.z;
+                    + dial.right * (worldOffset.x * S) + dial.up * worldOffset.y
+                    + dial.forward * (worldOffset.z * S);
                 piece.transform.localScale = size;
                 var m = new Material(Shader.Find("Standard")) { color = color };
                 if (glow != null)
@@ -495,7 +498,7 @@ namespace DvMod.Autopilot
             tm.anchor = TextAnchor.MiddleCenter;
             tm.alignment = TextAlignment.Center;
             tm.fontSize = 64;
-            tm.characterSize = 0.00075f;
+            tm.characterSize = 0.00075f * 1.45f;
             // SetParent(worldPositionStays) already compensated this transform's
             // localScale for the parent — forcing it back to world unit keeps the
             // glyph size authored above true regardless of the item's scale.

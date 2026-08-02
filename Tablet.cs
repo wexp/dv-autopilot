@@ -379,6 +379,19 @@ namespace DvMod.Autopilot
 
         private void Repaint(TabletMarker t)
         {
+            // TMP spawns extra sub-mesh renderers for fallback glyphs, and each
+            // one casts shadows again — sweep them all, every repaint, so even a
+            // tablet from an older build goes shadow-free.
+            foreach (var text in t.windows.Append(t.emptyMsg))
+            {
+                if (text == null)
+                    continue;
+                foreach (var r in text.GetComponentsInChildren<Renderer>(true))
+                {
+                    r.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
+                    r.receiveShadows = false;
+                }
+            }
             bool empty = TabletPins.Guids.Count == 0;
             if (t.emptyMsg != null)
                 t.emptyMsg.text = empty

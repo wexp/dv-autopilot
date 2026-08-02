@@ -490,6 +490,40 @@ namespace DvMod.Autopilot
         private static double SpanOf(string trackId) =>
             mainSpans.TryGetValue(trackId, out var span) ? span : 0;
 
+        /// <summary>
+        /// Everywhere a road move may be told to pull up at this yard, in the order
+        /// the web console lists them: the nearest running line (empty id — the
+        /// server picks), then each named running line, then the yard's own tracks.
+        /// A running line carries a generic #Y-#S…#T id that means nothing to a
+        /// dispatcher, so it is named by the sub-yards it serves and the switches at
+        /// its ends, as the console names it.
+        /// </summary>
+        public static List<(string id, string label)> DriveTargets(string? yardId)
+        {
+            // Labels are kept short on purpose: the tablet shows them in a column
+            // about a third of a quadrant wide, where the console's full
+            // "Main line FF/A · J-218 → J-221 · 640 m" would run into its neighbour.
+            var list = new List<(string, string)> { ("", "Nearest main") };
+            if (string.IsNullOrEmpty(yardId) || !All().TryGetValue(yardId!, out var yard))
+                return list;
+            foreach (var m in yard.mains.OrderBy(k => k.Key, StringComparer.Ordinal))
+            {
+                string serves = m.Value.Count > 0 ? string.Join("/", m.Value) : "-";
+                string ends = "";
+                if (mainTracks.TryGetValue(m.Key, out var rail))
+                {
+                    int? from = Autopilot.JunctionIndexAtEnd(rail, true);
+                    int? to = Autopilot.JunctionIndexAtEnd(rail, false);
+                    if (from != null && to != null)
+                        ends = $" J{from}-{to}";
+                }
+                list.Add((m.Key, $"Main {serves}{ends}"));
+            }
+            foreach (var track in yard.tracks)
+                list.Add((track, track));
+            return list;
+        }
+
         /// <summary>Is this track one of the running lines serving that yard? A shunt
         /// may be sent onto its own yard's road — pulling a cut out onto the main is
         /// ordinary yard work — even though the road belongs to no yard itself.</summary>

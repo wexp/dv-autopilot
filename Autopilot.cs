@@ -256,9 +256,9 @@ namespace DvMod.Autopilot
         private const float ClaimDeadlockSeconds = 20f;
 
         // The longest road a SHUNT may accept, m. Generous — a runaround over a big
-        // yard's own 3 km line is real yard work — but it shuts the door on the
+        // yard's own 8 km line is real yard work — but it shuts the door on the
         // "re-route the long way round the valley" plans a fouled junction invites.
-        private const double ShuntMaxRouteMeters = 3000;
+        private const double ShuntMaxRouteMeters = 8000;
 
         // Conservative service deceleration used to plan the stop, m/s^2.
         private const float StopDecel = 0.35f;
@@ -413,6 +413,9 @@ namespace DvMod.Autopilot
         // overhang past its end bogie (~2 m). The spot speed is low enough that the
         // coast is small, so the car ends land right at the markers, not deep past them.
         private const double ParkMargin = 2.5;
+        // Car body past its end bogie, m. Only used to turn a coupler-to-coupler
+        // consist length into a bogie-to-bogie one, which is what spans measure.
+        private const double CarEndOverhang = 2.0;
         // Buffering up: close in at walking pace from this far out, m.
         private const double CoupleApproach = 25.0;
         // Speed for the last few metres onto the couplers, km/h. Slow enough not to
@@ -508,6 +511,14 @@ namespace DvMod.Autopilot
         /// null when it has none — for in-game UIs that don't want JSON.</summary>
         internal static string? RunStateOf(string carGuid) =>
             runs.TryGetValue(carGuid, out var run) ? run.state : null;
+
+        /// <summary>The run's live detail line, or null without a run.</summary>
+        internal static string? RunDetailOf(string carGuid) =>
+            runs.TryGetValue(carGuid, out var run) ? run.detail : null;
+
+        /// <summary>The run's current speed limit, km/h; 0 without a run.</summary>
+        internal static float RunLimitOf(string carGuid) =>
+            runs.TryGetValue(carGuid, out var run) ? run.limitKmh : 0f;
 
         public static string GetStatusJson()
         {

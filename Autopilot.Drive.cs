@@ -901,8 +901,13 @@ namespace DvMod.Autopilot
                             // crawl. Dropping to 5 km/h the moment the first wagon
                             // touched the destination meant creeping the whole length
                             // of a 300 m siding — minutes of it.
+                            // Direction first: the distance itself needs it to
+                            // measure the tail of a cut that is still coming on,
+                            // and reading it live answers nothing at a stand.
+                            if (run.destTrack != null && !backingUp)
+                                spotTowardHigh = SpotDirection(car, run.destTrack) ?? spotTowardHigh;
                             double toSpot = run.destTrack != null
-                                ? DistanceToSpot(car, run.destTrack)
+                                ? DistanceToSpot(car, run.destTrack, spotTowardHigh)
                                 : 0;
                             airStop = true;
                             // Overshoot is measured, not inferred: the spotted set
@@ -916,8 +921,6 @@ namespace DvMod.Autopilot
                             // but which way it was going decides which marker counts.
                             // FROZEN while backing: the overrun is measured against
                             // the direction the spot came in by, not the creep back.
-                            if (run.destTrack != null && !backingUp)
-                                spotTowardHigh = SpotDirection(car, run.destTrack) ?? spotTowardHigh;
                             double overrun = run.destTrack != null && spotTowardHigh != null
                                 ? SpotOverrun(car, run.destTrack, spotTowardHigh.Value)
                                 : 0;

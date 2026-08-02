@@ -113,7 +113,12 @@ namespace DvMod.Autopilot
         /// came in by, one of the two conditions is the outstanding one: the tail short
         /// of the near marker, or the front past the far one.
         /// </summary>
-        private static double DistanceToSpot(TrainCar loco, RailTrack destTrack)
+        /// <param name="towardHigh">Which way the spot is travelling, as the run
+        /// remembers it. Only consulted while part of the train is still off the
+        /// destination, and only because the live reading goes blank at a stand —
+        /// which is precisely when the train is braking into its spot.</param>
+        private static double DistanceToSpot(
+            TrainCar loco, RailTrack destTrack, bool? towardHigh = null)
         {
             var (lo, hi) = MarkerZone(destTrack);
             double m = hi - lo > 2 * ParkMargin ? ParkMargin : 0;
@@ -134,6 +139,24 @@ namespace DvMod.Autopilot
                 }
             if (mn > mx)
                 return double.MaxValue; // nothing on it yet
+            // While the cut is still running in, the rearmost bogie ON the track is
+            // whichever one last crossed the joint: it climbs a few metres and then
+            // the next one crosses and puts the reading back at the entry. Measured
+            // that way the outstanding distance reset once per bogie — the run
+            // dropped into its final crawl, braked, powered up again and repeated it
+            // for every wagon instead of pulling in once and spotting the tail.
+            // The tail that matters is the END of the train, so while any of it is
+            // still outside, it is measured from the leading bogie back over the
+            // length of the cut, which shortens smoothly as the train comes on.
+            if (off)
+            {
+                double bogieSpan = Math.Max(0, ConsistLength(loco) - 2 * CarEndOverhang);
+                bool? way = towardHigh ?? SpotDirection(loco, destTrack);
+                if (way == true)
+                    mn = Math.Min(mn, mx - bogieSpan);
+                else if (way == false)
+                    mx = Math.Max(mx, mn + bogieSpan);
+            }
             double needUp = (lo + m) - mn;   // tail not yet past the low marker
             double needDown = mx - (hi - m); // front beyond the high marker
             // A train longer than the track can never satisfy both markers, so it is

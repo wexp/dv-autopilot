@@ -340,11 +340,18 @@ namespace DvMod.Autopilot
             else if (tempCritical)
             {
                 // Engine over temperature: come off power whatever the speed error.
+                // Heat condemns only the handles that MAKE heat — throttle and
+                // dynamic (the DH4's retarder churns the same transmission oil the
+                // gauge reads). The train air heats nothing on the loco, so any
+                // overspeed still gets the service application; releasing it here
+                // left a hot loco freewheeling down the grade with no brake at all.
                 throttle = Mathf.Max(0f, throttle - ThrottleDown);
                 overrider.Throttle?.Set(throttle);
                 dynHandle = 0f;
                 overrider.DynamicBrake?.Set(0f);
-                overrider.Brake?.Set(0f);
+                overrider.Brake?.Set(error < -1.0f
+                    ? Mathf.Min(ServiceBrakeMax, Mathf.Clamp01(-error / 8f))
+                    : 0f);
             }
             else if (tempWarning && throttle > 0f)
             {
@@ -353,10 +360,13 @@ namespace DvMod.Autopilot
                 // — kept a flat-out loco sitting on its red line, still heating,
                 // until it crossed into critical and got damaged anyway. Backing off
                 // at the ramp rate settles the temperature just under the line and
-                // picks the speed back up once it drops.
+                // picks the speed back up once it drops. Air stays available for
+                // overspeed here too — it costs no heat.
                 throttle = Mathf.Max(0f, throttle - profile.throttleUp);
                 overrider.Throttle?.Set(throttle);
-                overrider.Brake?.Set(0f);
+                overrider.Brake?.Set(error < -1.0f
+                    ? Mathf.Min(ServiceBrakeMax, Mathf.Clamp01(-error / 8f))
+                    : 0f);
             }
             else if (error > 1.0f)
             {

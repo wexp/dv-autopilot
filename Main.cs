@@ -1,6 +1,7 @@
 using DV.Logic.Job;
 using HarmonyLib;
 using System;
+using System.Linq;
 using System.Reflection;
 using UnityModManagerNet;
 
@@ -77,7 +78,34 @@ namespace DvMod.Autopilot
                 UnloadWatcher.UnloadRequested -= Stop;
                 WorldStreamingInit.LoadingFinished -= Start;
                 DisconnectFromPersistentJobs();
-                harmony.UnpatchAll(modEntry.Info.Id);
+                // NOT harmony.UnpatchAll: that walks EVERY patched method in the
+                // process and resolves every patch entry on each — other mods'
+                // included. One entry Harmony cannot resolve (a mod built for a
+                // different game version, a hot-swapped assembly) throws and
+                // cancelled the whole reload. Touch only methods that carry one
+                // of OUR patches, and survive the ones that still blow up.
+                string id = modEntry.Info.Id;
+                foreach (var original in Harmony.GetAllPatchedMethods().ToList())
+                {
+                    try
+                    {
+                        var info = Harmony.GetPatchInfo(original);
+                        if (info == null)
+                            continue;
+                        bool ours = info.Prefixes.Any(p => p.owner == id)
+                            || info.Postfixes.Any(p => p.owner == id)
+                            || info.Transpilers.Any(p => p.owner == id)
+                            || info.Finalizers.Any(p => p.owner == id);
+                        if (ours)
+                            harmony.Unpatch(original, HarmonyPatchType.All, id);
+                    }
+                    catch (Exception e)
+                    {
+                        mod?.Logger.Log(
+                            $"Could not unpatch {original?.DeclaringType?.Name}.{original?.Name}: "
+                            + $"{e.GetType().Name} — skipped");
+                    }
+                }
             }
             return true;
         }

@@ -6,11 +6,11 @@ namespace DvMod.Autopilot
 {
     /// <summary>
     /// The radio face of the autopilot: an AUTOPILOT mode on the comms radio.
-    /// Point the laser at rolling stock and press the action button — a popup
-    /// says what is under the laser (which locomotive, or that it is not a
-    /// locomotive at all). The mode only exists when the CommsRadioAPI and
-    /// MessageBox mods are installed; Main checks for both before calling into
-    /// this class, so the references here never load without them.
+    /// Point the laser at a locomotive — it gets the game's cyan hologram box —
+    /// and press the action button to pin it to (or remove it from) the
+    /// dispatcher tablet. Feedback is a three-second line on the radio's own
+    /// LCD, not a popup. Requires the CommsRadioAPI mod; Main checks before
+    /// touching this class.
     /// </summary>
     public static class CommsRadio
     {
@@ -18,6 +18,12 @@ namespace DvMod.Autopilot
 
         /// <summary>The laser colour of the mode — the console's accent blue.</summary>
         private static readonly Color LaserColor = new Color(0.25f, 0.75f, 1f);
+
+        private static readonly Vector3 HighlightBoundsExtension = new Vector3(0.25f, 0.8f, 0f);
+
+        /// <summary>The vanilla car-deleter mode: we borrow its laser muzzle, its
+        /// hologram highlighter object and its selection material.</summary>
+        private static DV.CommsRadioCarDeleter? deleter;
 
         public static void Attach()
         {
@@ -41,11 +47,8 @@ namespace DvMod.Autopilot
             if (created)
                 return;
             // A hot reload leaves the PREVIOUS assembly's mode on the radio and
-            // this one becomes a duplicate — the player then pins locos into a
-            // dead assembly's list and the tablet shows nothing. Strip stale API
-            // modes before adding ours (we are the only API-based mode here).
-            // Not FindObjectOfType: a stowed radio is an INACTIVE object and gets
-            // skipped, which is how seven AUTOPILOT entries piled up.
+            // this one becomes a duplicate — strip stale API modes first. Not
+            // FindObjectOfType: a stowed radio is INACTIVE and gets skipped.
             var controller = Resources.FindObjectsOfTypeAll<DV.CommsRadioController>()
                 .FirstOrDefault(c => c != null && c.gameObject.scene.IsValid());
             if (controller != null)
@@ -59,11 +62,8 @@ namespace DvMod.Autopilot
                     controller.ReactivateModes();
                 }
             }
-            var mode = CommsRadioMode.Create(new Home(null), LaserColor);
-            // The API's default signal origin is the controller object on the
-            // player, whose forward is wherever the BODY faces — not the laser.
-            // Vanilla modes carry the radio muzzle transform; borrow one.
-            var deleter = ControllerAPI.GetVanillaMode(VanillaMode.Clear) as DV.CommsRadioCarDeleter;
+            var mode = CommsRadioMode.Create(new Home(null, "", 0f), LaserColor);
+            deleter = ControllerAPI.GetVanillaMode(VanillaMode.Clear) as DV.CommsRadioCarDeleter;
             if (deleter != null && deleter.signalOrigin != null)
                 mode.OverrideSignalOrigin(deleter.signalOrigin);
             created = true;
@@ -84,26 +84,72 @@ namespace DvMod.Autopilot
             return hit.collider.GetComponentInParent<TrainCar>();
         }
 
-        /// <summary>The one state: follow the laser, and identify on action.</summary>
+        /// <summary>The game's own cyan hologram box, borrowed from the deleter
+        /// mode (modes are exclusive, so it is idle while ours is active).</summary>
+        private static void Highlight(TrainCar? car)
+        {
+            if (deleter == null || deleter.trainHighlighter == null)
+                return;
+            var holo = deleter.trainHighlighter;
+            if (car == null)
+            {
+                holo.SetActive(false);
+                holo.transform.SetParent(null);
+                return;
+            }
+            var render = holo.GetComponentInChildren<MeshRenderer>(true);
+            if (render != null)
+                render.material = deleter.selectionMaterial;
+            holo.transform.localScale = car.Bounds.size + HighlightBoundsExtension;
+            Vector3 up = car.transform.up * (holo.transform.localScale.y / 2f);
+            Vector3 fwd = car.transform.forward * car.Bounds.center.z;
+            holo.transform.SetPositionAndRotation(
+                car.transform.position + up + fwd, car.transform.rotation);
+            holo.SetActive(true);
+            holo.transform.SetParent(car.transform, worldPositionStays: true);
+        }
+
+        /// <summary>The one state: follow the laser (hologram on whatever it
+        /// touches), pin on action, flash the result on the LCD for 3 s.</summary>
         private sealed class Home : AStateBehaviour
         {
             private readonly TrainCar? aimed;
+            private readonly string flash;
+            private readonly float flashUntil;
 
-            public Home(TrainCar? aimed)
+            public Home(TrainCar? aimed, string flash, float flashUntil)
                 : base(new CommsRadioState(
                     titleText: "AUTOPILOT",
-                    contentText: aimed == null ? "Aim at rolling stock." : aimed.ID,
-                    actionText: aimed == null ? "" : "identify",
+                    contentText: flashUntil > Time.time && flash.Length > 0
+                        ? flash
+                        : aimed == null ? "Aim at a locomotive." : aimed.ID,
+                    actionText: aimed == null ? "" : "pin",
                     ledState: aimed == null ? LEDState.Off : LEDState.On,
                     buttonBehaviour: DV.ButtonBehaviourType.Regular))
             {
                 this.aimed = aimed;
+                this.flash = flash;
+                this.flashUntil = flashUntil;
+            }
+
+            public override void OnLeave(CommsRadioUtility utility, AStateBehaviour? next)
+            {
+                if (next == null)
+                    Highlight(null); // mode switched away — drop the hologram
             }
 
             public override AStateBehaviour OnUpdate(CommsRadioUtility utility)
             {
                 var car = CarUnderLaser(utility);
-                return car == aimed ? (AStateBehaviour)this : new Home(car);
+                if (car != aimed)
+                {
+                    Highlight(car);
+                    return new Home(car, flash, flashUntil);
+                }
+                // Flash expired: rebuild so the LCD returns to the aim readout.
+                if (flash.Length > 0 && Time.time > flashUntil)
+                    return new Home(aimed, "", 0f);
+                return this;
             }
 
             public override AStateBehaviour OnAction(CommsRadioUtility utility, InputAction action)
@@ -124,15 +170,11 @@ namespace DvMod.Autopilot
                 }
                 else
                 {
-                    // The action IS the dispatcher's picker: pin the loco to the
-                    // tablet (or take it back off).
                     message = TabletPins.Toggle(car);
                     utility.PlaySound(VanillaSoundCommsRadio.Confirm);
                 }
-                // pauseGame: false — a radio readout must not stop the world.
-                MessageBox.PopupAPI.ShowOk(message, _ => { }, "Autopilot", "Ok", pauseGame: false);
-                // Activate must transition; a fresh instance re-arms the laser.
-                return new Home(null);
+                // The result lives on the LCD for three seconds — no popup.
+                return new Home(aimed, message, Time.time + 3f);
             }
         }
     }

@@ -1,4 +1,5 @@
 using CommsRadioAPI;
+using System.Linq;
 using UnityEngine;
 
 namespace DvMod.Autopilot
@@ -43,7 +44,10 @@ namespace DvMod.Autopilot
             // this one becomes a duplicate — the player then pins locos into a
             // dead assembly's list and the tablet shows nothing. Strip stale API
             // modes before adding ours (we are the only API-based mode here).
-            var controller = UnityEngine.Object.FindObjectOfType<DV.CommsRadioController>();
+            // Not FindObjectOfType: a stowed radio is an INACTIVE object and gets
+            // skipped, which is how seven AUTOPILOT entries piled up.
+            var controller = Resources.FindObjectsOfTypeAll<DV.CommsRadioController>()
+                .FirstOrDefault(c => c != null && c.gameObject.scene.IsValid());
             if (controller != null)
             {
                 var stale = controller.GetComponents<CommsRadioMode>();

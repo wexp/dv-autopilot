@@ -206,8 +206,10 @@ namespace DvMod.Autopilot
             if (t == null || t.screenPiece == null)
                 return;
             var local = t.screenPiece.InverseTransformPoint(hit.point);
-            int col = Mathf.Clamp((int)((local.x + 0.5f) * TabletPins.Max), 0, TabletPins.Max - 1);
-            int row = Mathf.Clamp((int)((0.5f - local.z) * Rows), 0, Rows - 1);
+            // 2 x 2 windows: quadrant first, then the row inside the quadrant.
+            int col = (local.x > 0f ? 1 : 0) + (local.z > 0f ? 0 : 2);
+            float zq = local.z > 0f ? local.z : local.z + 0.5f; // within-quadrant, 0..0.5
+            int row = Mathf.Clamp((int)((0.5f - zq) / 0.5f * Rows), 0, Rows - 1);
             if (t.hoverCol != col || t.hoverRow != row)
             {
                 t.hoverCol = col;
@@ -528,7 +530,7 @@ namespace DvMod.Autopilot
             // Trigger, not solid — a solid collider 26 cm from the camera shoves
             // the player backwards whenever they glance at the screen.
             screenPiece.GetComponent<Collider>().isTrigger = true;
-            Piece("TabletHome", World(0.005f, 0.0015f, 0.005f), new Vector3(0, 0.0022f, -0.0497f),
+            Piece("TabletHome", World(0.005f, 0.0004f, 0.005f), new Vector3(0, 0.0021f, -0.0497f),
                 new Color(0.32f, 0.33f, 0.35f), shape: PrimitiveType.Cylinder);
 
             var marker = go.AddComponent<TabletMarker>();
@@ -540,8 +542,8 @@ namespace DvMod.Autopilot
             // Four window texts across the glass plus the empty-board message.
             // TMP, not TextMesh: TMP's shader tests depth, so the text no longer
             // shines through walls.
-            TextMeshPro MakeText(string name, float worldX, float worldWidth,
-                float fontSize, TextAlignmentOptions align)
+            TextMeshPro MakeText(string name, float worldX, float worldZ,
+                float worldWidth, float worldHeight, TextAlignmentOptions align)
             {
                 var textGo = new GameObject(name);
                 textGo.transform.SetParent(model, true);
@@ -549,19 +551,22 @@ namespace DvMod.Autopilot
                 // Clear of the glass: the screen slab's top face sits ~3.7 mm up
                 // and TMP tests depth — text below that line is inside the slab.
                 textGo.transform.position = dial.position
-                    + dial.up * 0.007f + dial.right * (worldX * S);
+                    + dial.up * 0.007f + dial.right * (worldX * S)
+                    + dial.forward * (worldZ * S);
                 textGo.transform.rotation = dial.rotation * Quaternion.Euler(90f, 0f, 0f);
                 var text = textGo.AddComponent<TextMeshPro>();
                 text.font = Font();
-                text.fontSize = fontSize;
+                // Auto-size to the rect — every hand-picked size was wrong on
+                // some screen; let TMP fit the text to the window.
+                text.enableAutoSizing = true;
+                text.fontSizeMin = 0.004f;
+                text.fontSizeMax = 0.06f;
                 text.alignment = align;
                 text.richText = true;
                 text.color = Color.white;
                 text.enableWordWrapping = true;
-                // Hard clip at the rect: overflow was billboarding half a
-                // sentence across the night sky.
                 text.overflowMode = TextOverflowModes.Truncate;
-                text.rectTransform.sizeDelta = new Vector2(worldWidth * S, 0.0935f * S);
+                text.rectTransform.sizeDelta = new Vector2(worldWidth * S, worldHeight * S);
                 // World-unit scale regardless of the item's own scaling.
                 textGo.transform.localScale = new Vector3(
                     1f / Mathf.Max(0.0001f, pl.x),
@@ -570,14 +575,17 @@ namespace DvMod.Autopilot
                 return text;
             }
 
-            const float colWidth = 0.1315f / TabletPins.Max;
+            // 2 x 2 grid: each window takes a quarter of the glass.
+            const float halfW = 0.1315f / 2f;
+            const float halfH = 0.0935f / 2f;
             for (int i = 0; i < TabletPins.Max; i++)
             {
-                float x = (i - (TabletPins.Max - 1) / 2f) * colWidth;
-                marker.windows[i] = MakeText($"TabletWindow{i}", x, colWidth - 0.004f,
-                    0.012f, TextAlignmentOptions.Top);
+                float x = (i % 2 == 0 ? -1 : 1) * halfW / 2f;
+                float z = (i < 2 ? 1 : -1) * halfH / 2f;
+                marker.windows[i] = MakeText($"TabletWindow{i}", x, z,
+                    halfW - 0.006f, halfH - 0.004f, TextAlignmentOptions.Top);
             }
-            marker.emptyMsg = MakeText("TabletEmpty", 0f, 0.128f, 0.04f,
+            marker.emptyMsg = MakeText("TabletEmpty", 0f, 0f, 0.128f, 0.05f,
                 TextAlignmentOptions.Center);
 
             tablets.Add(marker);

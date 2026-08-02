@@ -127,10 +127,13 @@ namespace DvMod.Autopilot
             bool held = HeldTablet() == t;
             if (held && cam != null)
             {
+                // Low and reclined, like a clipboard in hand — reading stays easy
+                // and the world above it stays visible for walking.
                 var pos = cam.transform.position
-                    + cam.transform.forward * 0.26f
-                    - cam.transform.up * 0.06f;
-                var rot = Quaternion.LookRotation(cam.transform.up, -cam.transform.forward);
+                    + cam.transform.forward * 0.36f
+                    - cam.transform.up * 0.14f;
+                var rot = Quaternion.AngleAxis(-22f, cam.transform.right)
+                    * Quaternion.LookRotation(cam.transform.up, -cam.transform.forward);
                 t.model.SetPositionAndRotation(pos, rot);
             }
             else if (t.model.localPosition != t.homeLocalPos)
@@ -492,7 +495,7 @@ namespace DvMod.Autopilot
                         new Vector3(sx * (0.145f / 2 - cr), 0f, sz * (0.105f / 2 - cr)),
                         bodyColor, shape: PrimitiveType.Cylinder);
             var screenPiece = Piece("TabletScreen",
-                World(0.118f, 0.002f, 0.088f), new Vector3(0, 0.0022f, -0.003f),
+                World(0.118f, 0.002f, 0.082f), new Vector3(0, 0.0022f, 0f),
                 new Color(0.02f, 0.03f, 0.05f), new Color(0.02f, 0.05f, 0.09f),
                 keepCollider: true); // the glass takes the cursor-mode mouse ray
             // Speaker slit above the screen, home button below it.

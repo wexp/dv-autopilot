@@ -6,5 +6,7 @@
   "AssemblyName": "Autopilot.dll",
   "EntryMethod": "DvMod.Autopilot.Main.Load",
   "LoadAfter": [ "PersistentJobsMod" ],
-  "ManagerVersion": "0.27.3"
+  "ManagerVersion": "0.27.3",
+  "Repository": "https://raw.githubusercontent.com/Alexand3r/dv-autopilot/master/repository.json",
+  "HomePage": "https://github.com/Alexand3r/dv-autopilot"
 }

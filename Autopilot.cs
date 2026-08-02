@@ -258,7 +258,7 @@ namespace DvMod.Autopilot
         // The longest road a SHUNT may accept, m. Generous — a runaround over a big
         // yard's own 3 km line is real yard work — but it shuts the door on the
         // "re-route the long way round the valley" plans a fouled junction invites.
-        private const double ShuntMaxRouteMeters = 8000;
+        private const double ShuntMaxRouteMeters = 3000;
 
         // Conservative service deceleration used to plan the stop, m/s^2.
         private const float StopDecel = 0.35f;

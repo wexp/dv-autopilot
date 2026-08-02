@@ -39,6 +39,22 @@ namespace DvMod.Autopilot
         {
             if (created)
                 return;
+            // A hot reload leaves the PREVIOUS assembly's mode on the radio and
+            // this one becomes a duplicate — the player then pins locos into a
+            // dead assembly's list and the tablet shows nothing. Strip stale API
+            // modes before adding ours (we are the only API-based mode here).
+            var controller = UnityEngine.Object.FindObjectOfType<DV.CommsRadioController>();
+            if (controller != null)
+            {
+                var stale = controller.GetComponents<CommsRadioMode>();
+                if (stale.Length > 0)
+                {
+                    controller.allModes.RemoveAll(m => m is CommsRadioMode);
+                    foreach (var s in stale)
+                        UnityEngine.Object.Destroy(s);
+                    controller.ReactivateModes();
+                }
+            }
             var mode = CommsRadioMode.Create(new Home(null), LaserColor);
             // The API's default signal origin is the controller object on the
             // player, whose forward is wherever the BODY faces — not the laser.

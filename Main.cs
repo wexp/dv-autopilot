@@ -115,6 +115,29 @@ namespace DvMod.Autopilot
         private static void Start()
         {
             Updater.Create();
+            TryAttachCommsRadio();
+        }
+
+        /// <summary>The comms radio mode needs two other mods (CommsRadioAPI for
+        /// the mode itself, MessageBox for its popups). Without them nothing here
+        /// may even TOUCH the CommsRadio class — resolving its method bodies would
+        /// throw for the missing assemblies — so the gate lives out here.</summary>
+        private static void TryAttachCommsRadio()
+        {
+            if (UnityModManager.FindMod("CommsRadioAPI")?.Active != true
+                || UnityModManager.FindMod("MessageBox")?.Active != true)
+            {
+                DebugLog(() => "CommsRadioAPI/MessageBox not installed — no radio mode");
+                return;
+            }
+            try
+            {
+                CommsRadio.Attach();
+            }
+            catch (System.Exception e)
+            {
+                mod?.Logger.Log($"Comms radio mode not attached: {e.Message}");
+            }
         }
 
         private static void Stop()

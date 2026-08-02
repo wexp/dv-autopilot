@@ -17,6 +17,8 @@ This mod is an engine only — it has no UI of its own. It is designed as an add
 
 - Derail Valley (build 99.x)
 - [Unity Mod Manager](https://www.nexusmods.com/site/mods/21)
+- [CommsRadioAPI](https://github.com/fauxnik/dv-comms-radio-api) — for the AUTOPILOT comms radio mode
+- [MessageBox](https://github.com/fauxnik/dv-message-box) — for the radio mode's popups
 - [dv-remote-dispatch](https://github.com/Alexand3r/dv-remote-dispatch) for the user interface
 
 ## Installation

@@ -40,6 +40,18 @@
     <Reference Include="Newtonsoft.Json"/>
     <Reference Include="net.smkd.vector3d"/>
     <Reference Include="WorldStreamer" />
+    <Reference Include="DV.UIFramework"/>
+    <!-- Optional integrations: the radio mode and its popup. Both mods must be
+         installed for the references to resolve at build time; at runtime Main
+         checks for them before any type touching them is loaded. -->
+    <Reference Include="CommsRadioAPI">
+      <HintPath>$(DvInstallDir)\Mods\CommsRadioAPI\CommsRadioAPI.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="MessageBox">
+      <HintPath>$(DvInstallDir)\Mods\MessageBox\MessageBox.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
   </ItemGroup>
 
   <ItemGroup>

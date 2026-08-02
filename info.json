@@ -5,7 +5,8 @@
   "Version": "0.1.0",
   "AssemblyName": "Autopilot.dll",
   "EntryMethod": "DvMod.Autopilot.Main.Load",
-  "LoadAfter": [ "PersistentJobsMod" ],
+  "Requirements": [ "CommsRadioAPI", "MessageBox" ],
+  "LoadAfter": [ "PersistentJobsMod", "CommsRadioAPI", "MessageBox" ],
   "ManagerVersion": "0.27.3",
   "Repository": "https://raw.githubusercontent.com/Alexand3r/dv-autopilot/master/repository.json",
   "HomePage": "https://github.com/Alexand3r/dv-autopilot"

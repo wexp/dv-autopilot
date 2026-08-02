@@ -548,8 +548,10 @@ namespace DvMod.Autopilot
                 var textGo = new GameObject(name);
                 textGo.transform.SetParent(model, true);
                 textGo.layer = layer;
+                // Clear of the glass: the screen slab's top face sits ~3.7 mm up
+                // and TMP tests depth — text below that line is inside the slab.
                 textGo.transform.position = dial.position
-                    + dial.up * 0.0035f + dial.right * (worldX * S);
+                    + dial.up * 0.007f + dial.right * (worldX * S);
                 textGo.transform.rotation = dial.rotation * Quaternion.Euler(90f, 0f, 0f);
                 var text = textGo.AddComponent<TextMeshPro>();
                 text.font = Font();

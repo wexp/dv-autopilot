@@ -452,9 +452,9 @@ namespace DvMod.Autopilot
                 x * S / Mathf.Max(0.0001f, pl.x),
                 y * S / Mathf.Max(0.0001f, pl.y),
                 z * S / Mathf.Max(0.0001f, pl.z));
-            GameObject Piece(string name, Vector3 size, Vector3 worldOffset, Color color, Color? glow = null, bool keepCollider = false)
+            GameObject Piece(string name, Vector3 size, Vector3 worldOffset, Color color, Color? glow = null, bool keepCollider = false, PrimitiveType shape = PrimitiveType.Cube)
             {
-                var piece = GameObject.CreatePrimitive(PrimitiveType.Cube);
+                var piece = GameObject.CreatePrimitive(shape);
                 piece.name = name;
                 if (!keepCollider)
                     UnityEngine.Object.Destroy(piece.GetComponent<Collider>());
@@ -478,8 +478,19 @@ namespace DvMod.Autopilot
             // Body: dark grey slab, the bezel is simply its margin around the
             // screen. Screen: near-black with a faint glow so it reads at night.
             // Landscape: wide side across the hands, like the booklet held open.
-            Piece("TabletBody", World(0.145f, 0.004f, 0.105f), new Vector3(0, 0.000f, 0),
-                new Color(0.13f, 0.13f, 0.14f));
+            // Rounded corners: the body is a cross of two slabs with a quarter of
+            // a cylinder showing at each corner.
+            var bodyColor = new Color(0.13f, 0.13f, 0.14f);
+            const float r = 0.009f;
+            Piece("TabletBodyA", World(0.145f, 0.004f, 0.105f - 2 * r), Vector3.zero, bodyColor);
+            Piece("TabletBodyB", World(0.145f - 2 * r, 0.004f, 0.105f), Vector3.zero, bodyColor);
+            foreach (var sx in new[] { -1f, 1f })
+                foreach (var sz in new[] { -1f, 1f })
+                    Piece("TabletCorner",
+                        // A cylinder's height is TWICE its Y scale.
+                        World(2 * r, 0.002f, 2 * r),
+                        new Vector3(sx * (0.145f / 2 - r), 0f, sz * (0.105f / 2 - r)),
+                        bodyColor, shape: PrimitiveType.Cylinder);
             var screenPiece = Piece("TabletScreen",
                 World(0.118f, 0.002f, 0.088f), new Vector3(0, 0.0022f, -0.003f),
                 new Color(0.02f, 0.03f, 0.05f), new Color(0.02f, 0.05f, 0.09f),

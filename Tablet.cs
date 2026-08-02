@@ -154,7 +154,7 @@ namespace DvMod.Autopilot
             {
                 // Looking ahead: tucked low. Looking down at it: close reading
                 // pose covering about half the view. Continuous blend.
-                float down = Mathf.Clamp01((-cam.transform.forward.y - 0.05f) / 0.30f);
+                float down = Mathf.Clamp01((-cam.transform.forward.y - 0.22f) / 0.30f);
                 float dist = Mathf.Lerp(0.26f, 0.11f, down);
                 float drop = Mathf.Lerp(0.16f, 0.01f, down);
                 // Tucked: sits low and leans away, like a device resting in the

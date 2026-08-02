@@ -53,7 +53,9 @@ namespace DvMod.Autopilot
             if (!Physics.Raycast(origin.position, origin.forward, out var hit, 100f,
                     LayerMask.GetMask("Train_Big_Collider")))
                 return null;
-            return TrainCar.Resolve(hit.transform.root);
+            // Not transform.root: cars hang under the world mover, so "root" is
+            // the world container and never the car. Walk up to the car itself.
+            return hit.collider.GetComponentInParent<TrainCar>();
         }
 
         /// <summary>The one state: follow the laser, and identify on action.</summary>

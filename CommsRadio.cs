@@ -108,7 +108,8 @@ namespace DvMod.Autopilot
                         + (Autopilot.IsUnderAutopilot(car.trainset) ? "\nUnder autopilot." : "\nIdle.");
                     utility.PlaySound(VanillaSoundCommsRadio.Confirm);
                 }
-                MessageBox.PopupAPI.ShowOk(message, _ => { }, "Autopilot", "Ok");
+                // pauseGame: false — a radio readout must not stop the world.
+                MessageBox.PopupAPI.ShowOk(message, _ => { }, "Autopilot", "Ok", pauseGame: false);
                 // Activate must transition; a fresh instance re-arms the laser.
                 return new Home(null);
             }

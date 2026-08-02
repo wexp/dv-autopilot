@@ -127,13 +127,18 @@ namespace DvMod.Autopilot
             bool held = HeldTablet() == t;
             if (held && cam != null)
             {
-                // Low and reclined, like a clipboard in hand — reading stays easy
-                // and the world above it stays visible for walking.
+                // Two poses blended on camera pitch: looking AHEAD the tablet
+                // tucks low and far so the world stays walkable; looking DOWN at
+                // it, it rises to a close reading pose covering about half the
+                // view. The blend is continuous, so it follows the glance.
+                float down = Mathf.Clamp01((-cam.transform.forward.y - 0.15f) / 0.45f);
+                float dist = Mathf.Lerp(0.46f, 0.26f, down);
+                float drop = Mathf.Lerp(0.18f, 0.02f, down);
                 var pos = cam.transform.position
-                    + cam.transform.forward * 0.36f
-                    - cam.transform.up * 0.14f;
-                var rot = Quaternion.AngleAxis(-22f, cam.transform.right)
-                    * Quaternion.LookRotation(cam.transform.up, -cam.transform.forward);
+                    + cam.transform.forward * dist
+                    - cam.transform.up * drop;
+                // Flat to the view — no recline.
+                var rot = Quaternion.LookRotation(cam.transform.up, -cam.transform.forward);
                 t.model.SetPositionAndRotation(pos, rot);
             }
             else if (t.model.localPosition != t.homeLocalPos)

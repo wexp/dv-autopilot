@@ -388,7 +388,11 @@ namespace DvMod.Autopilot
                     continue;
                 foreach (var r in text.GetComponentsInChildren<Renderer>(true))
                 {
-                    r.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
+                    if (r.shadowCastingMode != UnityEngine.Rendering.ShadowCastingMode.Off)
+                    {
+                        Main.mod?.Logger.Log($"[TABLET] {r.gameObject.name} was casting shadows — disabled");
+                        r.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
+                    }
                     r.receiveShadows = false;
                 }
             }
@@ -469,7 +473,14 @@ namespace DvMod.Autopilot
             {
                 if (spec == null || !spec.gameObject.scene.IsValid())
                     continue;
-                if (!spec.gameObject.name.StartsWith("AutopilotDispatcherTablet"))
+                // The game renames item objects on pickup, so the name test alone
+                // let dead tablets from earlier assemblies survive reloads — the
+                // frozen boards whose shadows nothing could fix. Match by marker
+                // component NAME across assemblies instead.
+                bool isTablet = spec.gameObject.name.StartsWith("AutopilotDispatcherTablet")
+                    || spec.GetComponents<Component>().Any(
+                        c => c != null && c.GetType().Name == nameof(TabletMarker));
+                if (!isTablet)
                     continue;
                 if (spec.GetComponent<TabletMarker>() != null)
                     continue; // this assembly's live tablet
@@ -479,7 +490,7 @@ namespace DvMod.Autopilot
                     inv.DestroyItem(spec.gameObject);
                 else
                     UnityEngine.Object.Destroy(spec.gameObject);
-                Main.mod?.Logger.Log("Removed a stale dispatcher tablet");
+                Main.mod?.Logger.Log("[TABLET] removed a stale dispatcher tablet");
             }
         }
 
@@ -488,6 +499,28 @@ namespace DvMod.Autopilot
             if (font == null)
                 font = Resources.FindObjectsOfTypeAll<TMP_FontAsset>().FirstOrDefault();
             return font;
+        }
+
+        private static Material? cleanFontMat;
+
+        /// <summary>The font's material minus its preset effects — the underlay
+        /// (the "shadow" under every glyph) and the glow halo. Assigned as the
+        /// SHARED material: TMP rebinds the shared material on every text change,
+        /// so per-instance stripping silently reverted each repaint.</summary>
+        private static Material? CleanFontMaterial()
+        {
+            var f = Font();
+            if (f == null)
+                return null;
+            if (cleanFontMat == null)
+            {
+                cleanFontMat = new Material(f.material);
+                cleanFontMat.DisableKeyword("UNDERLAY_ON");
+                cleanFontMat.DisableKeyword("UNDERLAY_INNER");
+                cleanFontMat.DisableKeyword("GLOW_ON");
+                cleanFontMat.DisableKeyword("OUTLINE_ON");
+            }
+            return cleanFontMat;
         }
 
         private void GiveTablet()
@@ -573,6 +606,10 @@ namespace DvMod.Autopilot
                     + dial.forward * (worldOffset.z * S);
                 piece.transform.localScale = size;
                 var m = new Material(Shader.Find("Standard")) { color = color };
+                // Fully matte. The glossy default reflected the bright glyphs in
+                // the glass as a dark offset copy — the "shadow" that survived
+                // every shadow fix, because it never was one.
+                m.SetFloat("_Glossiness", 0f);
                 if (glow != null)
                 {
                     m.EnableKeyword("_EMISSION");
@@ -611,11 +648,28 @@ namespace DvMod.Autopilot
             // Four window texts across the glass plus the empty-board message.
             // TMP, not TextMesh: TMP's shader tests depth, so the text no longer
             // shines through walls.
+            // The game's own plate text (the wagon number boards) is the known-good
+            // TMP setup: right font, clean material, no underlay ghost, no glow —
+            // clone it instead of assembling text from found parts (the
+            // dv-wagon-destination recipe).
+            var plateText = Resources.FindObjectsOfTypeAll<TrainCarPlate>()
+                .Select(pl => pl != null ? pl.cargoMassJobId : null)
+                .FirstOrDefault(src => src != null);
+
             TextMeshPro MakeText(string name, float worldX, float worldZ,
                 float worldWidth, float worldHeight, TextAlignmentOptions align,
                 bool wrap = false)
             {
-                var textGo = new GameObject(name);
+                GameObject textGo;
+                if (plateText != null)
+                {
+                    textGo = UnityEngine.Object.Instantiate(plateText.gameObject);
+                    textGo.name = name;
+                }
+                else
+                {
+                    textGo = new GameObject(name);
+                }
                 textGo.transform.SetParent(model, true);
                 textGo.layer = layer;
                 // Clear of the glass: the screen slab's top face sits ~3.7 mm up
@@ -624,8 +678,20 @@ namespace DvMod.Autopilot
                     + dial.up * 0.007f + dial.right * (worldX * S)
                     + dial.forward * (worldZ * S);
                 textGo.transform.rotation = dial.rotation * Quaternion.Euler(90f, 0f, 0f);
-                var text = textGo.AddComponent<TextMeshPro>();
-                text.font = Font();
+                var text = textGo.GetComponent<TextMeshPro>();
+                bool cloned = text != null;
+                if (text == null)
+                    text = textGo.AddComponent<TextMeshPro>();
+                if (!cloned)
+                {
+                    // Built from scratch: fall back to a found font, effects
+                    // stripped. The clone keeps its own — that's its value.
+                    text.font = Font();
+                    var clean = CleanFontMaterial();
+                    if (clean != null)
+                        text.fontSharedMaterial = clean;
+                }
+                text.text = "";
                 // Auto-size to the rect — every hand-picked size was wrong on
                 // some screen; let TMP fit the text to the window.
                 text.enableAutoSizing = true;
@@ -638,6 +704,11 @@ namespace DvMod.Autopilot
                 // only the empty-board message wraps.
                 text.enableWordWrapping = wrap;
                 text.overflowMode = TextOverflowModes.Truncate;
+                // The plate clone brings the plate's off-centre pivot along —
+                // centre it or the text hangs off the right edge of the glass.
+                text.rectTransform.pivot = new Vector2(0.5f, 0.5f);
+                text.rectTransform.anchorMin = new Vector2(0.5f, 0.5f);
+                text.rectTransform.anchorMax = new Vector2(0.5f, 0.5f);
                 text.rectTransform.sizeDelta = new Vector2(worldWidth * S, worldHeight * S);
                 // Glyphs are meshes and were casting sundial shadows on the glass.
                 var mr = textGo.GetComponent<MeshRenderer>();

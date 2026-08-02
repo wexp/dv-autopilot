@@ -68,10 +68,10 @@ namespace DvMod.Autopilot
     public class TabletManager : MonoBehaviour
     {
         private const float RepaintSeconds = 0.25f;
-        /// <summary>Rows in a window, top to bottom. 0 header, 1..7 selectable,
-        /// 8 status. Mouse maps the glass to this grid.</summary>
-        private const int Rows = 9;
-        private static readonly string[] ArriveNames = { "auto", "shove", "pull" };
+        /// <summary>Rows in a window, top to bottom. 0 header, 1..8 selectable,
+        /// 9 status. Mouse maps the glass to this grid.</summary>
+        private const int Rows = 10;
+        private static readonly string[] LeadNames = { "Auto", "Wagons first", "Loco first" };
 
         /// <summary>Per-loco command drafts, keyed by car guid — they survive
         /// unpinning and tablet respawns within a session.</summary>
@@ -83,6 +83,8 @@ namespace DvMod.Autopilot
             public bool couple;
             public bool uncouple;
             public int arrive;
+            /// <summary>0 = auto, then the entry junctions of the destination.</summary>
+            public int via;
             public string lastResult = "";
             public float lastResultUntil;
         }
@@ -199,6 +201,34 @@ namespace DvMod.Autopilot
             return info.tracks.ToList();
         }
 
+        /// <summary>Via choices for a shunt destination: "auto" plus the
+        /// junction at each end of the track, as the web console offers.</summary>
+        private List<(string label, int? junction)> ViaOptions(Draft d, string guid)
+        {
+            var options = new List<(string, int?)> { ("auto", (int?)null) };
+            if (!d.shunt)
+                return options;
+            var tracks = ShuntTracks(guid);
+            if (tracks.Count == 0)
+                return options;
+            string dest = tracks[Mathf.Clamp(d.destShunt, 0, tracks.Count - 1)];
+            try
+            {
+                var json = Newtonsoft.Json.Linq.JObject.Parse(
+                    Autopilot.GetTrackJunctionsJson(dest));
+                foreach (var key in new[] { "in", "out" })
+                {
+                    var v = json[key];
+                    if (v != null && v.Type == Newtonsoft.Json.Linq.JTokenType.Integer)
+                        options.Add(($"J-{(int)v}", (int?)(int)v));
+                }
+            }
+            catch
+            {
+            }
+            return options;
+        }
+
         /* ----------------------------------------------------------- mouse -- */
 
         private void HandleMouse()
@@ -248,7 +278,10 @@ namespace DvMod.Autopilot
             {
                 case 1:
                     if (click)
+                    {
                         d.shunt = !d.shunt;
+                        d.via = 0; // the junction list belongs to the mode's dest
+                    }
                     break;
                 case 2:
                     if (d.shunt)
@@ -256,6 +289,7 @@ namespace DvMod.Autopilot
                         var tracks = ShuntTracks(guid);
                         if (tracks.Count > 0)
                             d.destShunt = Wrap(d.destShunt + step, tracks.Count);
+                        d.via = 0;
                     }
                     else if (yards.Count > 0)
                     {
@@ -271,13 +305,21 @@ namespace DvMod.Autopilot
                         d.uncouple = !d.uncouple;
                     break;
                 case 5:
-                    d.arrive = Wrap(d.arrive + step, ArriveNames.Length);
+                    d.arrive = Wrap(d.arrive + step, LeadNames.Length);
                     break;
                 case 6:
+                    if (d.shunt)
+                    {
+                        var options = ViaOptions(d, guid);
+                        if (options.Count > 1)
+                            d.via = Wrap(d.via + step, options.Count);
+                    }
+                    break;
+                case 7:
                     if (click)
                         Dispatch(guid, d);
                     break;
-                case 7:
+                case 8:
                     if (click)
                     {
                         Autopilot.Stop(guid);
@@ -301,7 +343,9 @@ namespace DvMod.Autopilot
                     return;
                 }
                 string dest = tracks[Mathf.Clamp(d.destShunt, 0, tracks.Count - 1)];
-                result = Autopilot.Start(guid, dest, 0f, d.couple, arrive, null,
+                var options = ViaOptions(d, guid);
+                int? via = options[Mathf.Clamp(d.via, 0, options.Count - 1)].junction;
+                result = Autopilot.Start(guid, dest, 0f, d.couple, arrive, via,
                     AutopilotMode.Shunt, Yards.YardOf(guid), d.uncouple);
             }
             else
@@ -370,21 +414,26 @@ namespace DvMod.Autopilot
                     ? yards[Mathf.Clamp(d.destDrive, 0, yards.Count - 1)] : "-";
             }
 
+            var viaOptions = ViaOptions(d, guid);
+            string via = d.shunt
+                ? viaOptions[Mathf.Clamp(d.via, 0, viaOptions.Count - 1)].label
+                : "-";
             var rows = new string[Rows];
             rows[0] = $"<b>{loco.ID}</b>";
-            rows[1] = $"Mode: {(d.shunt ? "Shunt" : "Drive")}";
-            rows[2] = $"Dest: {dest}";
-            rows[3] = $"Couple: {(d.couple ? "yes" : "no")}";
-            rows[4] = $"Uncpl: {(d.uncouple ? "yes" : "no")}";
-            rows[5] = $"Arrive: {ArriveNames[d.arrive]}";
-            rows[6] = "GO";
-            rows[7] = "STOP";
-            rows[8] = Time.unscaledTime < d.lastResultUntil
+            rows[1] = $"Mode: {(d.shunt ? "Shunting" : "Driving")}";
+            rows[2] = $"Destination: {dest}";
+            rows[3] = $"Couple Train on Destination: {(d.couple ? "yes" : "no")}";
+            rows[4] = $"Uncouple Locomotives: {(d.uncouple ? "yes" : "no")}";
+            rows[5] = $"Lead: {LeadNames[d.arrive]}";
+            rows[6] = $"Via Junction: {via}";
+            rows[7] = "GO";
+            rows[8] = "STOP";
+            rows[9] = Time.unscaledTime < d.lastResultUntil
                 ? $"<color=#7fff7f>{d.lastResult}</color>"
                 : $"<color=#9fb7c7>{state}</color>";
 
             for (int i = 0; i < Rows; i++)
-                if (i == hoverRow && i >= 1 && i <= 7)
+                if (i == hoverRow && i >= 1 && i <= 8)
                     rows[i] = $"<color=#ffa500>{rows[i]}</color>";
             return string.Join("\n", rows);
         }
@@ -550,7 +599,8 @@ namespace DvMod.Autopilot
             // TMP, not TextMesh: TMP's shader tests depth, so the text no longer
             // shines through walls.
             TextMeshPro MakeText(string name, float worldX, float worldZ,
-                float worldWidth, float worldHeight, TextAlignmentOptions align)
+                float worldWidth, float worldHeight, TextAlignmentOptions align,
+                bool wrap = false)
             {
                 var textGo = new GameObject(name);
                 textGo.transform.SetParent(model, true);
@@ -571,7 +621,9 @@ namespace DvMod.Autopilot
                 text.alignment = align;
                 text.richText = true;
                 text.color = Color.white;
-                text.enableWordWrapping = true;
+                // Window rows must stay ONE line each or the click grid lies;
+                // only the empty-board message wraps.
+                text.enableWordWrapping = wrap;
                 text.overflowMode = TextOverflowModes.Truncate;
                 text.rectTransform.sizeDelta = new Vector2(worldWidth * S, worldHeight * S);
                 // Glyphs are meshes and were casting sundial shadows on the glass.
@@ -600,7 +652,7 @@ namespace DvMod.Autopilot
                     halfW - 0.006f, halfH - 0.004f, TextAlignmentOptions.Top);
             }
             marker.emptyMsg = MakeText("TabletEmpty", 0f, 0f, 0.128f, 0.05f,
-                TextAlignmentOptions.Center);
+                TextAlignmentOptions.Center, wrap: true);
 
             tablets.Add(marker);
             int result = inv.AddItemToInventory(go, slot, false);

@@ -481,15 +481,15 @@ namespace DvMod.Autopilot
             // Rounded corners: the body is a cross of two slabs with a quarter of
             // a cylinder showing at each corner.
             var bodyColor = new Color(0.13f, 0.13f, 0.14f);
-            const float r = 0.009f;
-            Piece("TabletBodyA", World(0.145f, 0.004f, 0.105f - 2 * r), Vector3.zero, bodyColor);
-            Piece("TabletBodyB", World(0.145f - 2 * r, 0.004f, 0.105f), Vector3.zero, bodyColor);
+            const float cr = 0.009f;
+            Piece("TabletBodyA", World(0.145f, 0.004f, 0.105f - 2 * cr), Vector3.zero, bodyColor);
+            Piece("TabletBodyB", World(0.145f - 2 * cr, 0.004f, 0.105f), Vector3.zero, bodyColor);
             foreach (var sx in new[] { -1f, 1f })
                 foreach (var sz in new[] { -1f, 1f })
                     Piece("TabletCorner",
                         // A cylinder's height is TWICE its Y scale.
-                        World(2 * r, 0.002f, 2 * r),
-                        new Vector3(sx * (0.145f / 2 - r), 0f, sz * (0.105f / 2 - r)),
+                        World(2 * cr, 0.002f, 2 * cr),
+                        new Vector3(sx * (0.145f / 2 - cr), 0f, sz * (0.105f / 2 - cr)),
                         bodyColor, shape: PrimitiveType.Cylinder);
             var screenPiece = Piece("TabletScreen",
                 World(0.118f, 0.002f, 0.088f), new Vector3(0, 0.0022f, -0.003f),

@@ -428,7 +428,8 @@ namespace DvMod.Autopilot
             {
                 itemSpec.BelongsToPlayer = true;
                 itemSpec.NameOverride = "Dispatcher Tablet";
-                itemSpec.ImmuneToDumpster = true;
+                // Deliberately NOT dumpster-immune: the dumpster is how a spare
+                // tablet is disposed of, F9 always makes another.
             }
 
             var model = go.transform.Find("model");

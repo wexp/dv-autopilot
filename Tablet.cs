@@ -543,7 +543,7 @@ namespace DvMod.Autopilot
             // TMP, not TextMesh: TMP's shader tests depth, so the text no longer
             // shines through walls.
             TextMeshPro MakeText(string name, float worldX, float worldWidth,
-                TextAlignmentOptions align)
+                float fontSize, TextAlignmentOptions align)
             {
                 var textGo = new GameObject(name);
                 textGo.transform.SetParent(model, true);
@@ -553,10 +553,14 @@ namespace DvMod.Autopilot
                 textGo.transform.rotation = dial.rotation * Quaternion.Euler(90f, 0f, 0f);
                 var text = textGo.AddComponent<TextMeshPro>();
                 text.font = Font();
-                text.fontSize = 0.55f;
+                text.fontSize = fontSize;
                 text.alignment = align;
                 text.richText = true;
                 text.color = Color.white;
+                text.enableWordWrapping = true;
+                // Hard clip at the rect: overflow was billboarding half a
+                // sentence across the night sky.
+                text.overflowMode = TextOverflowModes.Truncate;
                 text.rectTransform.sizeDelta = new Vector2(worldWidth * S, 0.082f * S);
                 // World-unit scale regardless of the item's own scaling.
                 textGo.transform.localScale = new Vector3(
@@ -571,9 +575,10 @@ namespace DvMod.Autopilot
             {
                 float x = (i - (TabletPins.Max - 1) / 2f) * colWidth;
                 marker.windows[i] = MakeText($"TabletWindow{i}", x, colWidth - 0.004f,
-                    TextAlignmentOptions.Top);
+                    0.1f, TextAlignmentOptions.Top);
             }
-            marker.emptyMsg = MakeText("TabletEmpty", 0f, 0.115f, TextAlignmentOptions.Center);
+            marker.emptyMsg = MakeText("TabletEmpty", 0f, 0.112f, 0.22f,
+                TextAlignmentOptions.Center);
 
             tablets.Add(marker);
             int result = inv.AddItemToInventory(go, slot, false);

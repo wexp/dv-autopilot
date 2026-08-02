@@ -204,30 +204,35 @@ namespace DvMod.Autopilot
         /// TM (steam, hydraulic) simply lack these ports and read as never overheating.
         /// Checked on every loco of the consist, like the engine temperature.
         /// </summary>
-        /// <summary>Locos known to have no TM ports at all (hydraulics like the
-        /// DH4). Asking their sim for the ports every drive tick wrote a "Port not
-        /// defined" line into Player.log ten times a second — ask once, remember.</summary>
-        private static readonly HashSet<string> noTmPorts = new HashSet<string>();
+        /// <summary>Locos known to lack a given TM port — cached PER PORT, because
+        /// e.g. the DE2 carries one of the pair and not the other, and every probe
+        /// of a missing port writes a "Port not defined" line into Player.log.
+        /// Ask once per loco per port, remember the misses.</summary>
+        private static readonly HashSet<string> noTmLamp = new HashSet<string>();
+        private static readonly HashSet<string> noTmFuse = new HashSet<string>();
 
         private static (bool warning, bool critical) TmOverheatState(TrainCar loco)
         {
             bool warning = false, critical = false;
             foreach (var c in MuGroup(loco))
             {
-                if (c == null || noTmPorts.Contains(c.CarGUID))
+                var simFlow = c?.SimController?.simFlow;
+                if (c == null || simFlow == null)
                     continue;
-                var simFlow = c.SimController?.simFlow;
-                if (simFlow == null)
-                    continue;
-                bool hasLamp = simFlow.TryGetPort("tmOverheatLamp.LAMP_STATE", out var lamp, true);
-                bool hasFuse = simFlow.TryGetPort("tm.OVERHEAT_POWER_FUSE_OFF", out var fuse, true);
-                if (!hasLamp && !hasFuse)
+                if (!noTmLamp.Contains(c.CarGUID))
                 {
-                    noTmPorts.Add(c.CarGUID);
-                    continue;
+                    if (simFlow.TryGetPort("tmOverheatLamp.LAMP_STATE", out var lamp, true))
+                        warning |= lamp.Value > 0.5f;
+                    else
+                        noTmLamp.Add(c.CarGUID);
                 }
-                warning |= hasLamp && lamp.Value > 0.5f;
-                critical |= hasFuse && fuse.Value > 0.5f;
+                if (!noTmFuse.Contains(c.CarGUID))
+                {
+                    if (simFlow.TryGetPort("tm.OVERHEAT_POWER_FUSE_OFF", out var fuse, true))
+                        critical |= fuse.Value > 0.5f;
+                    else
+                        noTmFuse.Add(c.CarGUID);
+                }
             }
             return (warning, critical);
         }

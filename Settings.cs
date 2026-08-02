@@ -15,7 +15,9 @@ namespace DvMod.Autopilot
         {
             GUILayout.BeginVertical(GUILayout.ExpandWidth(false));
             autopilot.Draw();
-            enableLogging = GUILayout.Toggle(enableLogging, "Enable logging");
+            GUILayout.Space(8);
+            enableLogging = GUILayout.Toggle(enableLogging,
+                " Write debug detail to the mod log (Player.log)");
             GUILayout.EndVertical();
         }
 
@@ -116,28 +118,55 @@ namespace DvMod.Autopilot
                     d.minMoveThrottle, d.maneuverKmh));
         }
 
-        private static float Field(string label, float value)
+        /// <summary>A labelled slider with its current value shown in real units.</summary>
+        private static float Slider(
+            string label, float value, float min, float max, string unit, string format)
         {
-            GUILayout.Label(label, GUILayout.Width(90));
-            var text = GUILayout.TextField(value.ToString("0.###"), GUILayout.Width(50));
-            return float.TryParse(text, out var parsed) ? parsed : value;
+            GUILayout.Label(label, GUILayout.Width(120));
+            float v = GUILayout.HorizontalSlider(value, min, max, GUILayout.Width(120));
+            GUILayout.Label(v.ToString(format) + " " + unit, GUILayout.Width(70));
+            return v;
         }
+
+        /// <summary>"LocoDE6" → "DE6"; the empty livery is the catch-all.</summary>
+        private static string FriendlyName(string livery) =>
+            livery.Length == 0 ? "All other locos"
+            : livery.StartsWith("Loco") ? livery.Substring(4) : livery;
 
         public void Draw()
         {
             EnsureDefaults();
-            GUILayout.Label("Autopilot, per locomotive type:");
-            GUILayout.BeginVertical("box", GUILayout.ExpandWidth(false));
+            GUILayout.Label("<b>Driving profiles</b> — how the autopilot handles each locomotive type.");
+            GUILayout.Label(
+                "Throttle response: how quickly the handle opens (higher = livelier, "
+                + "more wheelslip risk).\nThrottle to start: the least that gets that "
+                + "machine rolling.\nYard speed: top speed for shunting moves.");
+            GUILayout.Space(4);
             foreach (var p in profiles)
             {
+                GUILayout.BeginVertical("box", GUILayout.ExpandWidth(false));
+                GUILayout.Label("<b>" + FriendlyName(p.livery) + "</b>");
                 GUILayout.BeginHorizontal();
-                GUILayout.Label(p.livery.Length == 0 ? "(default)" : p.livery, GUILayout.Width(90));
-                p.throttleUp = Field("open rate", p.throttleUp);
-                p.minMoveThrottle = Field("min to move", p.minMoveThrottle);
-                p.maneuverKmh = Field("yard km/h", p.maneuverKmh);
+                // Stored per 0.1 s tick; shown as % of the handle per second.
+                p.throttleUp = Slider("Throttle response",
+                    p.throttleUp * 1000f, 2f, 40f, "%/s", "0") / 1000f;
                 GUILayout.EndHorizontal();
+                GUILayout.BeginHorizontal();
+                p.minMoveThrottle = Slider("Throttle to start",
+                    p.minMoveThrottle * 100f, 5f, 60f, "%", "0") / 100f;
+                GUILayout.EndHorizontal();
+                GUILayout.BeginHorizontal();
+                p.maneuverKmh = Mathf.Round(Slider("Yard speed",
+                    p.maneuverKmh, 10f, 40f, "km/h", "0"));
+                GUILayout.EndHorizontal();
+                GUILayout.EndVertical();
             }
-            GUILayout.EndVertical();
+            GUILayout.Space(4);
+            if (GUILayout.Button("Reset all profiles to defaults", GUILayout.Width(200)))
+            {
+                profiles.Clear();
+                EnsureDefaults();
+            }
         }
     }
 }

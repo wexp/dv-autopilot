@@ -23,6 +23,16 @@ This mod is an engine only — it has no UI of its own. It is designed as an add
 
 Install through Unity Mod Manager like any other DV mod: point UMM at the game, then drop the release zip onto its Mods tab (or unpack into `Derail Valley/Mods/Autopilot`).
 
+## Settings
+
+The Unity Mod Manager settings panel holds one driving profile per locomotive type (unlisted and custom locos use the *All other locos* profile):
+
+- **Throttle response (%/s)** — how quickly the autopilot winds the throttle handle open. Higher means livelier acceleration but more wheelslip risk on wet rail; wheelslip protection and the adhesion budget still have the last word.
+- **Throttle to start (%)** — the smallest handle setting that actually gets that machine rolling from a stand; below its coarsest notch a loco does nothing at all.
+- **Yard speed (km/h)** — top speed for shunting moves with that loco. Road runs use the cruise speed you dispatch with instead.
+
+*Reset all profiles to defaults* restores the shipped values. *Write debug detail to the mod log* adds per-tick driving detail to `Player.log` for bug hunts.
+
 ## Credits
 
 This project reuses and adapts code from two excellent Derail Valley mods:

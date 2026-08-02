@@ -2,11 +2,11 @@
 
 An autopilot engine for [Derail Valley](https://store.steampowered.com/app/588030/Derail_Valley/). It drives locomotives for you: road runs between yards, shunting moves inside a yard, coupling onto standing trains, spotting cuts inside track markers, and turntable rides — with block signalling between multiple autopilot trains so they queue instead of colliding.
 
-This mod is an engine only — it has no UI of its own. It is designed as an addon for [dv-remote-dispatch](https://github.com/mspielberg/dv-remote-dispatch), whose web console detects the mod and exposes the autopilot controls (destination, cruise speed, couple/uncouple, shove/pull arrival, via junction). Without the mod installed the console simply hides the autopilot panel.
+This mod is an engine only — it has no UI of its own. It is designed as an addon for [dv-remote-dispatch](https://github.com/Alexand3r/dv-remote-dispatch), whose web console detects the mod and exposes the autopilot controls (destination, cruise speed, couple/uncouple, shove/pull arrival, via junction). Without the mod installed the console simply hides the autopilot panel.
 
 ## Features
 
-- **Road and shunt modes** — line speed with planned braking curves on the road; yard pace, marker spotting and tie-down for shunts.
+- **Drive and Shunt modes** — Drive runs yard to yard at line speed with planned braking curves; Shunt works at yard pace with marker spotting and tie-down.
 - **Routing** — Dijkstra over directed track states with reversal costs, occupancy awareness, traffic-priced detours and run-round planning.
 - **Facing orders** — *shove* (wagons first) and *pull* (loco first) are hard orders derived from the physical consist orientation; a route that cannot honour them is refused out loud rather than arriving the wrong way round.
 - **Block signalling** — exclusive track and junction claims, distance-based movement authority, dispatch-order queueing, buffer-block release. Multiple autopilot trains wait for each other like trains, not like ghosts.
@@ -17,7 +17,7 @@ This mod is an engine only — it has no UI of its own. It is designed as an add
 
 - Derail Valley (build 99.x)
 - [Unity Mod Manager](https://www.nexusmods.com/site/mods/21)
-- [dv-remote-dispatch](https://github.com/mspielberg/dv-remote-dispatch) for the user interface
+- [dv-remote-dispatch](https://github.com/Alexand3r/dv-remote-dispatch) for the user interface
 
 ## Installation
 
@@ -37,7 +37,7 @@ The Unity Mod Manager settings panel holds one driving profile per locomotive ty
 
 This project reuses and adapts code from two excellent Derail Valley mods:
 
-- [dv-remote-dispatch](https://github.com/mspielberg/dv-remote-dispatch) by mspielberg — the mod this engine grew out of: world/track plumbing, job data handling and the updater scaffolding started there, and its web console is the intended front end for this engine.
+- [dv-remote-dispatch](https://github.com/mspielberg/dv-remote-dispatch) by mspielberg — the mod this engine grew out of: world/track plumbing, job data handling and the updater scaffolding started there. The maintained fork with the autopilot console is [Alexand3r/dv-remote-dispatch](https://github.com/Alexand3r/dv-remote-dispatch).
 - [dv-hud](https://github.com/koteq/dv-hud) by koteq — track following and speed/grade indexing ideas.
 
 Thanks to both authors for publishing their work under permissive licences.

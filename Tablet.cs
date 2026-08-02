@@ -506,6 +506,9 @@ namespace DvMod.Autopilot
                 World(0.118f, 0.002f, 0.082f), new Vector3(0, 0.0022f, 0f),
                 new Color(0.02f, 0.03f, 0.05f), new Color(0.02f, 0.05f, 0.09f),
                 keepCollider: true); // the glass takes the cursor-mode mouse ray
+            // Trigger, not solid: a solid collider 26 cm from the camera shoves
+            // the player backwards whenever they glance at the screen.
+            screenPiece.GetComponent<Collider>().isTrigger = true;
             // Speaker slit above the screen, home button below it.
             Piece("TabletSpeaker", World(0.03f, 0.0015f, 0.003f), new Vector3(0, 0.0022f, 0.0465f),
                 new Color(0.05f, 0.05f, 0.05f));

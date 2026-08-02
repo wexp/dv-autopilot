@@ -14,12 +14,21 @@ namespace DvMod.Autopilot
     public class Updater : MonoBehaviour
     {
         private static Updater? instance;
+        private static int mainThreadId = -1;
 
         public void Start()
         {
             instance = this;
+            mainThreadId = System.Threading.Thread.CurrentThread.ManagedThreadId;
             StartCoroutine(DeferredEventsCoro());
         }
+
+        /// <summary>Already on the game's main thread? Then a queued task would
+        /// DEADLOCK any caller that blocks on its Result — the queue only drains
+        /// on this very thread. In-game UIs call the same entry points the HTTP
+        /// server does; for them the work just runs inline.</summary>
+        private static bool OnMainThread =>
+            System.Threading.Thread.CurrentThread.ManagedThreadId == mainThreadId;
 
         /// <summary>Start a coroutine on the mod's persistent object. Returns null
         /// if the Updater hasn't spun up yet.</summary>
@@ -71,6 +80,19 @@ namespace DvMod.Autopilot
         public static Task RunOnMainThread(Action action)
         {
             var tcs = new TaskCompletionSource<bool>();
+            if (OnMainThread)
+            {
+                try
+                {
+                    action();
+                    tcs.SetResult(true);
+                }
+                catch (Exception e)
+                {
+                    tcs.SetException(e);
+                }
+                return tcs.Task;
+            }
             taskQueue.Enqueue(() =>
             {
                 try
@@ -89,6 +111,18 @@ namespace DvMod.Autopilot
         public static Task<T> RunOnMainThread<T>(Func<T> func)
         {
             var tcs = new TaskCompletionSource<T>();
+            if (OnMainThread)
+            {
+                try
+                {
+                    tcs.SetResult(func());
+                }
+                catch (Exception e)
+                {
+                    tcs.SetException(e);
+                }
+                return tcs.Task;
+            }
             taskQueue.Enqueue(() =>
             {
                 try

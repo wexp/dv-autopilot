@@ -352,7 +352,13 @@ namespace DvMod.Autopilot
             slab.layer = layer;
             slab.transform.position = dial.position;
             slab.transform.rotation = dial.rotation;
-            slab.transform.localScale = new Vector3(0.085f, 0.002f, 0.11f);
+            // localScale multiplies by the parent's — divide it out, or the
+            // "tablet" turns into a billboard lying across the yard.
+            var pl = model.lossyScale;
+            slab.transform.localScale = new Vector3(
+                0.085f / Mathf.Max(0.0001f, pl.x),
+                0.002f / Mathf.Max(0.0001f, pl.y),
+                0.11f / Mathf.Max(0.0001f, pl.z));
             var mat = new Material(Shader.Find("Standard"))
             {
                 color = new Color(0.05f, 0.06f, 0.07f, 1f),
@@ -369,6 +375,13 @@ namespace DvMod.Autopilot
             tm.alignment = TextAlignment.Center;
             tm.fontSize = 64;
             tm.characterSize = 0.00075f;
+            // SetParent(worldPositionStays) already compensated this transform's
+            // localScale for the parent — forcing it back to world unit keeps the
+            // glyph size authored above true regardless of the item's scale.
+            textGo.transform.localScale = new Vector3(
+                1f / Mathf.Max(0.0001f, model.lossyScale.x),
+                1f / Mathf.Max(0.0001f, model.lossyScale.y),
+                1f / Mathf.Max(0.0001f, model.lossyScale.z));
             tm.richText = true;
             tm.color = Color.white;
             tm.text = "<b>DISPATCH</b>\nloading...";

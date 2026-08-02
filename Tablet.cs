@@ -477,16 +477,17 @@ namespace DvMod.Autopilot
 
             // Body: dark grey slab, the bezel is simply its margin around the
             // screen. Screen: near-black with a faint glow so it reads at night.
-            Piece("TabletBody", World(0.105f, 0.004f, 0.145f), new Vector3(0, 0.000f, 0),
+            // Landscape: wide side across the hands, like the booklet held open.
+            Piece("TabletBody", World(0.145f, 0.004f, 0.105f), new Vector3(0, 0.000f, 0),
                 new Color(0.13f, 0.13f, 0.14f));
             var screenPiece = Piece("TabletScreen",
-                World(0.088f, 0.002f, 0.118f), new Vector3(0, 0.0022f, 0.004f),
+                World(0.118f, 0.002f, 0.088f), new Vector3(0, 0.0022f, -0.003f),
                 new Color(0.02f, 0.03f, 0.05f), new Color(0.02f, 0.05f, 0.09f),
                 keepCollider: true); // the glass takes the cursor-mode mouse ray
             // Speaker slit above the screen, home button below it.
-            Piece("TabletSpeaker", World(0.03f, 0.0015f, 0.003f), new Vector3(0, 0.0022f, 0.069f),
+            Piece("TabletSpeaker", World(0.03f, 0.0015f, 0.003f), new Vector3(0, 0.0022f, 0.0465f),
                 new Color(0.05f, 0.05f, 0.05f));
-            Piece("TabletHome", World(0.008f, 0.0015f, 0.008f), new Vector3(0, 0.0022f, -0.066f),
+            Piece("TabletHome", World(0.008f, 0.0015f, 0.008f), new Vector3(0, 0.0022f, -0.0465f),
                 new Color(0.32f, 0.33f, 0.35f));
 
             var textGo = new GameObject("TabletText");

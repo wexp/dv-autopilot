@@ -157,7 +157,7 @@ namespace DvMod.Autopilot
                 float drop = Mathf.Lerp(0.16f, 0.01f, down);
                 // Tucked: sits low and leans away, like a device resting in the
                 // hand. Glanced at: rises flat to the view.
-                float lean = Mathf.Lerp(-35f, 0f, down);
+                float lean = Mathf.Lerp(35f, 0f, down);
                 var pos = cam.transform.position
                     + cam.transform.forward * dist
                     - cam.transform.up * drop;

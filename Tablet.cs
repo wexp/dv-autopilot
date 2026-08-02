@@ -426,7 +426,6 @@ namespace DvMod.Autopilot
             var itemSpec = go.GetComponent<InventoryItemSpec>();
             if (itemSpec != null)
             {
-                itemSpec.BelongsToPlayer = true;
                 itemSpec.NameOverride = "Dispatcher Tablet";
                 // Deliberately NOT dumpster-immune: the dumpster is how a spare
                 // tablet is disposed of, F9 always makes another.

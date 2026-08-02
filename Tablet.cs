@@ -90,6 +90,11 @@ namespace DvMod.Autopilot
             // at the wrong moment.
             if (!WorldStreamingInit.IsLoaded)
                 return;
+            if (!sweptStale)
+            {
+                sweptStale = true;
+                SweepStaleTablets();
+            }
             var settings = Main.settings;
             if (Input.GetKeyDown(settings.tabletKey))
                 GiveTablet();
@@ -145,6 +150,32 @@ namespace DvMod.Autopilot
             {
                 t.model.localPosition = t.homeLocalPos;
                 t.model.localRotation = t.homeLocalRot;
+            }
+        }
+
+        private bool sweptStale;
+
+        /// <summary>Destroy tablet clones left over from earlier assemblies (mod
+        /// reloads orphan them: their marker type is the OLD assembly's, so they
+        /// are dead weight squatting in locked inventory slots for ever).</summary>
+        private void SweepStaleTablets()
+        {
+            var inv = Inventory.Instance;
+            foreach (var spec in Resources.FindObjectsOfTypeAll<InventoryItemSpec>())
+            {
+                if (spec == null || !spec.gameObject.scene.IsValid())
+                    continue;
+                if (!spec.gameObject.name.StartsWith("AutopilotDispatcherTablet"))
+                    continue;
+                if (spec.GetComponent<TabletMarker>() != null)
+                    continue; // this assembly's live tablet
+                spec.isEssential = false;
+                spec.ImmuneToDumpster = false;
+                if (inv != null)
+                    inv.DestroyItem(spec.gameObject);
+                else
+                    UnityEngine.Object.Destroy(spec.gameObject);
+                Main.mod?.Logger.Log("Removed a stale dispatcher tablet");
             }
         }
 
@@ -435,6 +466,10 @@ namespace DvMod.Autopilot
                 // a tablet that is put down for a moment.
                 itemSpec.BelongsToPlayer = true;
                 itemSpec.NameOverride = "Dispatcher Tablet";
+                // The compass is an ESSENTIAL item and the clone inherits it —
+                // that is the lock icon, the un-trashable dumpster behaviour and
+                // the slots nothing could free. A tablet is expendable.
+                itemSpec.isEssential = false;
                 // Deliberately NOT dumpster-immune: the dumpster is how a spare
                 // tablet is disposed of, F9 always makes another.
             }

@@ -41,6 +41,7 @@
     <Reference Include="net.smkd.vector3d"/>
     <Reference Include="WorldStreamer" />
     <Reference Include="DV.UIFramework"/>
+    <Reference Include="DV.Inventory"/>
     <!-- Optional integrations: the radio mode and its popup. Both mods must be
          installed for the references to resolve at build time; at runtime Main
          checks for them before any type touching them is loaded. -->
@@ -58,6 +59,8 @@
     <Reference Include="UnityEngine.CoreModule"/>
     <Reference Include="UnityEngine.IMGUIModule"/>
     <Reference Include="UnityEngine.PhysicsModule"/>
+    <Reference Include="UnityEngine.TextRenderingModule"/>
+    <Reference Include="UnityEngine.InputLegacyModule"/>
     <PackageReference Include="UnityModManager" Version="0.27.2"/>
   </ItemGroup>
 </Project>

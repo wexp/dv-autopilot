@@ -115,6 +115,7 @@ namespace DvMod.Autopilot
         private static void Start()
         {
             Updater.Create();
+            Tablet.Attach();
             TryAttachCommsRadio();
         }
 
@@ -146,6 +147,7 @@ namespace DvMod.Autopilot
             // it kills the drive coroutines where they stand, which would leave a loco
             // rolling with its throttle open.
             Autopilot.StopAllHere();
+            Tablet.Detach();
             Updater.Destroy();
         }
 

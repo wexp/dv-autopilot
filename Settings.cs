@@ -8,6 +8,12 @@ namespace DvMod.Autopilot
     {
         public bool enableLogging = false;
         public LocoProfiles autopilot = new LocoProfiles();
+        // The dispatcher tablet's keys. Editable in Settings.xml; shown in the
+        // panel as text so nobody has to guess.
+        public KeyCode tabletKey = KeyCode.F9;
+        public KeyCode tabletConfirmKey = KeyCode.Return;
+        public KeyCode tabletBackKey = KeyCode.Backspace;
+        public float tabletCruiseKmh = 80f;
 
         public readonly string? version = Main.mod?.Info.Version;
 
@@ -15,6 +21,12 @@ namespace DvMod.Autopilot
         {
             GUILayout.BeginVertical(GUILayout.ExpandWidth(false));
             autopilot.Draw();
+            GUILayout.Space(8);
+            GUILayout.Label("<b>Dispatcher tablet</b> — press " + tabletKey
+                + " to receive one; hold or look at it, Shift+wheel moves, "
+                + tabletConfirmKey + " confirms, " + tabletBackKey + " goes back. "
+                + $"Road runs dispatch at {tabletCruiseKmh:0} km/h. "
+                + "Keys editable in Settings.xml.");
             GUILayout.Space(8);
             enableLogging = GUILayout.Toggle(enableLogging,
                 " Write debug detail to the mod log (Player.log)");

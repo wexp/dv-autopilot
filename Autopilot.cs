@@ -504,6 +504,11 @@ namespace DvMod.Autopilot
         /// <summary>Every run, keyed by car guid, so one poll covers however many
         /// locos are out there. A guid absent from the object is simply not under
         /// autopilot.</summary>
+        /// <summary>The state of this loco's run ("driving", "arrived", ...) or
+        /// null when it has none — for in-game UIs that don't want JSON.</summary>
+        internal static string? RunStateOf(string carGuid) =>
+            runs.TryGetValue(carGuid, out var run) ? run.state : null;
+
         public static string GetStatusJson()
         {
             return Updater.RunOnMainThread(() =>

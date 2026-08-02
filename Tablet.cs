@@ -151,11 +151,15 @@ namespace DvMod.Autopilot
                 // pose covering about half the view. Continuous blend.
                 float down = Mathf.Clamp01((-cam.transform.forward.y - 0.05f) / 0.30f);
                 float dist = Mathf.Lerp(0.26f, 0.11f, down);
-                float drop = Mathf.Lerp(0.09f, 0.01f, down);
+                float drop = Mathf.Lerp(0.16f, 0.01f, down);
+                // Tucked: sits low and leans away, like a device resting in the
+                // hand. Glanced at: rises flat to the view.
+                float lean = Mathf.Lerp(-35f, 0f, down);
                 var pos = cam.transform.position
                     + cam.transform.forward * dist
                     - cam.transform.up * drop;
-                var rot = Quaternion.LookRotation(cam.transform.up, -cam.transform.forward);
+                var rot = Quaternion.AngleAxis(lean, cam.transform.right)
+                    * Quaternion.LookRotation(cam.transform.up, -cam.transform.forward);
                 t.model.SetPositionAndRotation(pos, rot);
             }
             else if (t.model.localPosition != t.homeLocalPos)
@@ -559,8 +563,8 @@ namespace DvMod.Autopilot
                 // Auto-size to the rect — every hand-picked size was wrong on
                 // some screen; let TMP fit the text to the window.
                 text.enableAutoSizing = true;
-                text.fontSizeMin = 0.004f;
-                text.fontSizeMax = 0.06f;
+                text.fontSizeMin = 0.05f;
+                text.fontSizeMax = 8f;
                 text.alignment = align;
                 text.richText = true;
                 text.color = Color.white;

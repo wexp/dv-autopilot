@@ -16,6 +16,15 @@ namespace DvMod.Autopilot
     public class TabletMarker : MonoBehaviour
     {
         public TextMesh? screen;
+        /// <summary>The visual model child, moved into a reading pose while held.</summary>
+        public Transform? model;
+        /// <summary>The glass — the piece the cursor-mode mouse ray hits.</summary>
+        public Transform? screenPiece;
+        /// <summary>Rendered line → selection index (-1 = not selectable), refreshed
+        /// on every repaint so mouse rows always match what is on screen.</summary>
+        public int[] lineMap = System.Array.Empty<int>();
+        public Vector3 homeLocalPos;
+        public Quaternion homeLocalRot;
         /// <summary>Which page the tablet shows: 0 = loco list, 1 = one loco.</summary>
         public int page;
         public int locoIndex;
@@ -89,6 +98,10 @@ namespace DvMod.Autopilot
             if (target != null)
                 HandleInput(target);
 
+            // Alt (cursor) mode: point at rows, click to confirm, right-click back.
+            if (Cursor.visible)
+                HandleMouse();
+
             if (Time.unscaledTime >= nextRepaint)
             {
                 nextRepaint = Time.unscaledTime + RepaintSeconds;
@@ -96,6 +109,34 @@ namespace DvMod.Autopilot
                 foreach (var t in tablets)
                     if (t != null && t.screen != null)
                         Repaint(t);
+            }
+
+            foreach (var t in tablets)
+                if (t != null)
+                    ApplyPose(t);
+        }
+
+        /// <summary>Held tablet floats into a reading pose — centred in view, close
+        /// enough to read — instead of dangling at the hand anchor. Only the
+        /// visual model moves; the item itself stays in the hand.</summary>
+        private void ApplyPose(TabletMarker t)
+        {
+            if (t.model == null)
+                return;
+            var cam = Camera.main;
+            bool held = HeldTablet() == t;
+            if (held && cam != null)
+            {
+                var pos = cam.transform.position
+                    + cam.transform.forward * 0.42f
+                    - cam.transform.up * 0.10f;
+                var rot = Quaternion.LookRotation(cam.transform.up, -cam.transform.forward);
+                t.model.SetPositionAndRotation(pos, rot);
+            }
+            else if (t.model.localPosition != t.homeLocalPos)
+            {
+                t.model.localPosition = t.homeLocalPos;
+                t.model.localRotation = t.homeLocalRot;
             }
         }
 
@@ -146,6 +187,43 @@ namespace DvMod.Autopilot
                 Repaint(t);
             }
             if (Input.GetKeyDown(Main.settings.tabletBackKey) && t.page == 1)
+            {
+                t.page = 0;
+                t.lastResult = "";
+                Repaint(t);
+            }
+        }
+
+        private void HandleMouse()
+        {
+            var cam = Camera.main;
+            if (cam == null)
+                return;
+            var ray = cam.ScreenPointToRay(Input.mousePosition);
+            if (!Physics.Raycast(ray, out var hit, 3f, ~0, QueryTriggerInteraction.Collide))
+                return;
+            var t = hit.collider != null ? hit.collider.GetComponentInParent<TabletMarker>() : null;
+            if (t == null || t.screenPiece == null || t.lineMap.Length == 0)
+                return;
+            // Local Z runs along the screen's long axis; +0.5 is one end. Map the
+            // hit to a rendered line, then to the selection that line stands for.
+            var local = t.screenPiece.InverseTransformPoint(hit.point);
+            float f = Mathf.Clamp01(0.5f - local.z);
+            int line = Mathf.Clamp((int)(f * t.lineMap.Length), 0, t.lineMap.Length - 1);
+            int sel = t.lineMap[line];
+            if (sel >= 0)
+            {
+                bool changed = t.page == 0 ? t.locoIndex != sel : t.actionIndex != sel;
+                if (t.page == 0) t.locoIndex = sel; else t.actionIndex = sel;
+                if (changed)
+                    Repaint(t);
+                if (Input.GetMouseButtonDown(0))
+                {
+                    Confirm(t);
+                    Repaint(t);
+                }
+            }
+            if (Input.GetMouseButtonDown(1) && t.page == 1)
             {
                 t.page = 0;
                 t.lastResult = "";
@@ -220,9 +298,11 @@ namespace DvMod.Autopilot
         private string RenderList(TabletMarker t)
         {
             var lines = new List<string> { "<b>DISPATCH</b>" };
+            var map = new List<int> { -1 };
             if (locos.Count == 0)
             {
                 lines.Add("no locomotives");
+                map.Add(-1);
             }
             else
             {
@@ -235,9 +315,12 @@ namespace DvMod.Autopilot
                     string state = Autopilot.RunStateOf(c.CarGUID) ?? "idle";
                     string row = $"{c.ID}  {state}";
                     lines.Add(i == t.locoIndex ? $"<color=#ffa500>> {row}</color>" : $"  {row}");
+                    map.Add(i);
                 }
             }
             lines.Add("<size=44>shift+wheel / confirm</size>");
+            map.Add(-1);
+            t.lineMap = map.ToArray();
             return string.Join("\n", lines);
         }
 
@@ -260,11 +343,19 @@ namespace DvMod.Autopilot
                 "back",
             };
             var lines = new List<string> { $"<b>{loco.ID}</b>  {state}" };
+            var map = new List<int> { -1 };
             for (int i = 0; i < rows.Length; i++)
+            {
                 lines.Add(i == t.actionIndex
                     ? $"<color=#ffa500>> {rows[i]}</color>" : $"  {rows[i]}");
+                map.Add(i);
+            }
             if (t.lastResult.Length > 0)
+            {
                 lines.Add($"<color=#7fff7f>{t.lastResult}</color>");
+                map.Add(-1);
+            }
+            t.lineMap = map.ToArray();
             return string.Join("\n", lines);
         }
 
@@ -350,25 +441,50 @@ namespace DvMod.Autopilot
                 r.enabled = false;
 
             // Screen slab where the dial sat.
-            var slab = GameObject.CreatePrimitive(PrimitiveType.Cube);
-            slab.name = "TabletScreen";
-            UnityEngine.Object.Destroy(slab.GetComponent<Collider>());
-            slab.transform.SetParent(model, true);
-            slab.layer = layer;
-            slab.transform.position = dial.position;
-            slab.transform.rotation = dial.rotation;
-            // localScale multiplies by the parent's — divide it out, or the
-            // "tablet" turns into a billboard lying across the yard.
+            // ------------------------------------------------- tablet body --
+            // All primitives, all sized in WORLD units then divided by the
+            // parent's scale (localScale multiplies by it).
             var pl = model.lossyScale;
-            slab.transform.localScale = new Vector3(
-                0.085f / Mathf.Max(0.0001f, pl.x),
-                0.002f / Mathf.Max(0.0001f, pl.y),
-                0.11f / Mathf.Max(0.0001f, pl.z));
-            var mat = new Material(Shader.Find("Standard"))
+            Vector3 World(float x, float y, float z) => new Vector3(
+                x / Mathf.Max(0.0001f, pl.x),
+                y / Mathf.Max(0.0001f, pl.y),
+                z / Mathf.Max(0.0001f, pl.z));
+            GameObject Piece(string name, Vector3 size, Vector3 worldOffset, Color color, Color? glow = null, bool keepCollider = false)
             {
-                color = new Color(0.05f, 0.06f, 0.07f, 1f),
-            };
-            slab.GetComponent<Renderer>().material = mat;
+                var piece = GameObject.CreatePrimitive(PrimitiveType.Cube);
+                piece.name = name;
+                if (!keepCollider)
+                    UnityEngine.Object.Destroy(piece.GetComponent<Collider>());
+                piece.transform.SetParent(model, true);
+                piece.layer = layer;
+                piece.transform.rotation = dial.rotation;
+                piece.transform.position = dial.position
+                    + dial.right * worldOffset.x + dial.up * worldOffset.y
+                    + dial.forward * worldOffset.z;
+                piece.transform.localScale = size;
+                var m = new Material(Shader.Find("Standard")) { color = color };
+                if (glow != null)
+                {
+                    m.EnableKeyword("_EMISSION");
+                    m.SetColor("_EmissionColor", glow.Value);
+                }
+                piece.GetComponent<Renderer>().material = m;
+                return piece;
+            }
+
+            // Body: dark grey slab, the bezel is simply its margin around the
+            // screen. Screen: near-black with a faint glow so it reads at night.
+            Piece("TabletBody", World(0.105f, 0.004f, 0.145f), new Vector3(0, 0.000f, 0),
+                new Color(0.13f, 0.13f, 0.14f));
+            var screenPiece = Piece("TabletScreen",
+                World(0.088f, 0.002f, 0.118f), new Vector3(0, 0.0022f, 0.004f),
+                new Color(0.02f, 0.03f, 0.05f), new Color(0.02f, 0.05f, 0.09f),
+                keepCollider: true); // the glass takes the cursor-mode mouse ray
+            // Speaker slit above the screen, home button below it.
+            Piece("TabletSpeaker", World(0.03f, 0.0015f, 0.003f), new Vector3(0, 0.0022f, 0.069f),
+                new Color(0.05f, 0.05f, 0.05f));
+            Piece("TabletHome", World(0.008f, 0.0015f, 0.008f), new Vector3(0, 0.0022f, -0.066f),
+                new Color(0.32f, 0.33f, 0.35f));
 
             var textGo = new GameObject("TabletText");
             textGo.transform.SetParent(model, true);
@@ -393,6 +509,10 @@ namespace DvMod.Autopilot
 
             var marker = go.AddComponent<TabletMarker>();
             marker.screen = tm;
+            marker.model = model;
+            marker.screenPiece = screenPiece.transform;
+            marker.homeLocalPos = model.localPosition;
+            marker.homeLocalRot = model.localRotation;
             tablets.Add(marker);
 
             int result = inv.AddItemToInventory(go, slot, false);

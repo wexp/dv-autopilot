@@ -2,45 +2,46 @@ using DV.InventorySystem;
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using TMPro;
 using UnityEngine;
 
 namespace DvMod.Autopilot
 {
-    /// <summary>
-    /// Marker + per-device UI state on a spawned dispatcher tablet. The item is
-    /// a gutted compass (the DVBonusTimer recipe: clone a vanilla item, hide its
-    /// visuals, draw our own face) whose screen is a TextMesh the manager
-    /// repaints. All the interaction state lives here so two tablets don't
-    /// fight over one cursor.
-    /// </summary>
+    /// <summary>The locos pinned to the dispatcher tablet, in pin order. The
+    /// comms radio's AUTOPILOT mode adds and removes them; every tablet in the
+    /// world shows the same board.</summary>
+    public static class TabletPins
+    {
+        public const int Max = 4;
+        public static readonly List<string> Guids = new List<string>();
+
+        /// <summary>Pin (or unpin) a loco. Returns the popup message.</summary>
+        public static string Toggle(TrainCar car)
+        {
+            if (Guids.Remove(car.CarGUID))
+                return $"{car.ID} removed from the tablet.";
+            if (Guids.Count >= Max)
+                return $"The tablet is full ({Max} windows) — remove one first.";
+            Guids.Add(car.CarGUID);
+            return $"{car.ID} pinned to the tablet ({Guids.Count}/{Max}).";
+        }
+    }
+
+    /// <summary>Marker + screen references on a spawned dispatcher tablet.</summary>
     public class TabletMarker : MonoBehaviour
     {
-        public TextMesh? screen;
+        public TextMeshPro?[] windows = new TextMeshPro?[TabletPins.Max];
+        public TextMeshPro? emptyMsg;
         /// <summary>The visual model child, moved into a reading pose while held.</summary>
         public Transform? model;
         /// <summary>The glass — the piece the cursor-mode mouse ray hits.</summary>
         public Transform? screenPiece;
-        /// <summary>Rendered line → selection index (-1 = not selectable), refreshed
-        /// on every repaint so mouse rows always match what is on screen.</summary>
-        public int[] lineMap = System.Array.Empty<int>();
         public Vector3 homeLocalPos;
         public Quaternion homeLocalRot;
-        /// <summary>Which page the tablet shows: 0 = loco list, 1 = one loco.</summary>
-        public int page;
-        public int locoIndex;
-        public int actionIndex;
-        public int destIndex;
-        public string chosenLoco = "";
-        public string lastResult = "";
+        public int hoverCol = -1;
+        public int hoverRow = -1;
     }
 
-    /// <summary>
-    /// The dispatcher tablet: a carryable item that lists every controllable
-    /// locomotive with its autopilot state, and can send one on a road run to a
-    /// yard or stop it. Interaction while holding it (or looking at it):
-    /// Shift + mouse wheel moves the cursor, the confirm key activates, the
-    /// back key goes up a page.
-    /// </summary>
     public static class Tablet
     {
         private static GameObject? host;
@@ -67,27 +68,37 @@ namespace DvMod.Autopilot
     public class TabletManager : MonoBehaviour
     {
         private const float RepaintSeconds = 0.25f;
-        private const int RowsPerPage = 6;
+        /// <summary>Rows in a window, top to bottom. 0 header, 1..7 selectable,
+        /// 8 status. Mouse maps the glass to this grid.</summary>
+        private const int Rows = 9;
+        private static readonly string[] ArriveNames = { "auto", "shove", "pull" };
+
+        /// <summary>Per-loco command drafts, keyed by car guid — they survive
+        /// unpinning and tablet respawns within a session.</summary>
+        private sealed class Draft
+        {
+            public bool shunt;
+            public int destDrive;
+            public int destShunt;
+            public bool couple;
+            public bool uncouple;
+            public int arrive;
+            public string lastResult = "";
+            public float lastResultUntil;
+        }
+
+        private static readonly Dictionary<string, Draft> drafts =
+            new Dictionary<string, Draft>();
 
         private readonly List<TabletMarker> tablets = new List<TabletMarker>();
         private float nextRepaint;
         private float nextScan;
-        private List<TrainCar> locos = new List<TrainCar>();
         private List<string> yards = new List<string>();
-
-        public void Start()
-        {
-            // A reload may find tablets from the previous assembly's session.
-            foreach (var m in Resources.FindObjectsOfTypeAll<TabletMarker>())
-                if (m != null && m.gameObject.scene.IsValid())
-                    tablets.Add(m);
-        }
+        private bool sweptStale;
+        private static TMP_FontAsset? font;
 
         public void Update()
         {
-            // Nothing here may poke game singletons while the world is still
-            // loading — an innocent Inventory.Instance mid-load forces creation
-            // at the wrong moment.
             if (!WorldStreamingInit.IsLoaded)
                 return;
             if (!sweptStale)
@@ -95,24 +106,22 @@ namespace DvMod.Autopilot
                 sweptStale = true;
                 SweepStaleTablets();
             }
-            var settings = Main.settings;
-            if (Input.GetKeyDown(settings.tabletKey))
+            if (Input.GetKeyDown(Main.settings.tabletKey))
                 GiveTablet();
 
-            var target = HeldTablet() ?? LookedAtTablet();
-            if (target != null)
-                HandleInput(target);
-
-            // Alt (cursor) mode: point at rows, click to confirm, right-click back.
             if (Cursor.visible)
                 HandleMouse();
+            else
+                foreach (var t in tablets)
+                    if (t != null)
+                        t.hoverCol = t.hoverRow = -1;
 
             if (Time.unscaledTime >= nextRepaint)
             {
                 nextRepaint = Time.unscaledTime + RepaintSeconds;
                 RefreshData();
                 foreach (var t in tablets)
-                    if (t != null && t.screen != null)
+                    if (t != null)
                         Repaint(t);
             }
 
@@ -121,9 +130,15 @@ namespace DvMod.Autopilot
                     ApplyPose(t);
         }
 
-        /// <summary>Held tablet floats into a reading pose — centred in view, close
-        /// enough to read — instead of dangling at the hand anchor. Only the
-        /// visual model moves; the item itself stays in the hand.</summary>
+        private static Draft DraftOf(string guid)
+        {
+            if (!drafts.TryGetValue(guid, out var d))
+                drafts[guid] = d = new Draft();
+            return d;
+        }
+
+        /* ------------------------------------------------------------ pose -- */
+
         private void ApplyPose(TabletMarker t)
         {
             if (t.model == null)
@@ -132,17 +147,14 @@ namespace DvMod.Autopilot
             bool held = HeldTablet() == t;
             if (held && cam != null)
             {
-                // Two poses blended on camera pitch: looking AHEAD the tablet
-                // tucks low and far so the world stays walkable; looking DOWN at
-                // it, it rises to a close reading pose covering about half the
-                // view. The blend is continuous, so it follows the glance.
+                // Looking ahead: tucked low. Looking down at it: close reading
+                // pose covering about half the view. Continuous blend.
                 float down = Mathf.Clamp01((-cam.transform.forward.y - 0.15f) / 0.45f);
                 float dist = Mathf.Lerp(0.46f, 0.26f, down);
                 float drop = Mathf.Lerp(0.18f, 0.02f, down);
                 var pos = cam.transform.position
                     + cam.transform.forward * dist
                     - cam.transform.up * drop;
-                // Flat to the view — no recline.
                 var rot = Quaternion.LookRotation(cam.transform.up, -cam.transform.forward);
                 t.model.SetPositionAndRotation(pos, rot);
             }
@@ -153,11 +165,232 @@ namespace DvMod.Autopilot
             }
         }
 
-        private bool sweptStale;
+        /* ------------------------------------------------------------ data -- */
 
-        /// <summary>Destroy tablet clones left over from earlier assemblies (mod
-        /// reloads orphan them: their marker type is the OLD assembly's, so they
-        /// are dead weight squatting in locked inventory slots for ever).</summary>
+        private void RefreshData()
+        {
+            if (Time.unscaledTime < nextScan)
+                return;
+            nextScan = Time.unscaledTime + 2f;
+            if (yards.Count == 0)
+                yards = Yards.All().Keys.OrderBy(k => k).ToList();
+            // Locos that no longer exist fall off the board.
+            var registry = DV.Utils.SingletonBehaviour<TrainCarRegistry>.Instance;
+            if (registry != null)
+                TabletPins.Guids.RemoveAll(g => LocoOf(g) == null);
+        }
+
+        private static TrainCar? LocoOf(string guid) =>
+            DV.Utils.SingletonBehaviour<TrainCarRegistry>.Instance?
+                .GetTrainCarByCarGuid(guid);
+
+        private List<string> ShuntTracks(string guid)
+        {
+            var yard = Yards.YardOf(guid);
+            if (yard == null || !Yards.All().TryGetValue(yard, out var info))
+                return new List<string>();
+            return info.tracks.ToList();
+        }
+
+        /* ----------------------------------------------------------- mouse -- */
+
+        private void HandleMouse()
+        {
+            var cam = Camera.main;
+            if (cam == null)
+                return;
+            var ray = cam.ScreenPointToRay(Input.mousePosition);
+            if (!Physics.Raycast(ray, out var hit, 3f, ~0, QueryTriggerInteraction.Collide))
+                return;
+            var t = hit.collider != null ? hit.collider.GetComponentInParent<TabletMarker>() : null;
+            if (t == null || t.screenPiece == null)
+                return;
+            var local = t.screenPiece.InverseTransformPoint(hit.point);
+            int col = Mathf.Clamp((int)((local.x + 0.5f) * TabletPins.Max), 0, TabletPins.Max - 1);
+            int row = Mathf.Clamp((int)((0.5f - local.z) * Rows), 0, Rows - 1);
+            if (t.hoverCol != col || t.hoverRow != row)
+            {
+                t.hoverCol = col;
+                t.hoverRow = row;
+                Repaint(t);
+            }
+
+            if (col >= TabletPins.Guids.Count)
+                return;
+            string guid = TabletPins.Guids[col];
+            int wheel = 0;
+            if (Input.mouseScrollDelta.y > 0.01f) wheel = -1;
+            else if (Input.mouseScrollDelta.y < -0.01f) wheel = 1;
+            bool click = Input.GetMouseButtonDown(0);
+            if (click || wheel != 0)
+            {
+                Act(guid, row, click, wheel);
+                Repaint(t);
+            }
+        }
+
+        /// <summary>One interaction on a window row: click toggles/cycles/fires,
+        /// the wheel cycles values in either direction.</summary>
+        private void Act(string guid, int row, bool click, int wheel)
+        {
+            var d = DraftOf(guid);
+            int step = wheel != 0 ? wheel : click ? 1 : 0;
+            switch (row)
+            {
+                case 1:
+                    if (click)
+                        d.shunt = !d.shunt;
+                    break;
+                case 2:
+                    if (d.shunt)
+                    {
+                        var tracks = ShuntTracks(guid);
+                        if (tracks.Count > 0)
+                            d.destShunt = Wrap(d.destShunt + step, tracks.Count);
+                    }
+                    else if (yards.Count > 0)
+                    {
+                        d.destDrive = Wrap(d.destDrive + step, yards.Count);
+                    }
+                    break;
+                case 3:
+                    if (click)
+                        d.couple = !d.couple;
+                    break;
+                case 4:
+                    if (click)
+                        d.uncouple = !d.uncouple;
+                    break;
+                case 5:
+                    d.arrive = Wrap(d.arrive + step, ArriveNames.Length);
+                    break;
+                case 6:
+                    if (click)
+                        Dispatch(guid, d);
+                    break;
+                case 7:
+                    if (click)
+                    {
+                        Autopilot.Stop(guid);
+                        Flash(d, "STOPPED");
+                    }
+                    break;
+            }
+        }
+
+        private void Dispatch(string guid, Draft d)
+        {
+            var arrive = d.arrive == 1 ? ArriveMode.Shove
+                : d.arrive == 2 ? ArriveMode.Pull : ArriveMode.Auto;
+            string result;
+            if (d.shunt)
+            {
+                var tracks = ShuntTracks(guid);
+                if (tracks.Count == 0)
+                {
+                    Flash(d, "no yard here");
+                    return;
+                }
+                string dest = tracks[Mathf.Clamp(d.destShunt, 0, tracks.Count - 1)];
+                result = Autopilot.Start(guid, dest, 0f, d.couple, arrive, null,
+                    AutopilotMode.Shunt, Yards.YardOf(guid), d.uncouple);
+            }
+            else
+            {
+                if (yards.Count == 0)
+                {
+                    Flash(d, "no yards known");
+                    return;
+                }
+                string yard = yards[Mathf.Clamp(d.destDrive, 0, yards.Count - 1)];
+                result = Autopilot.Start(guid, "", Main.settings.tabletCruiseKmh,
+                    false, arrive, null, AutopilotMode.Drive, yard, false);
+            }
+            Flash(d, result.Contains("\"error\"") ? "REFUSED" : "DISPATCHED");
+        }
+
+        private static void Flash(Draft d, string message)
+        {
+            d.lastResult = message;
+            d.lastResultUntil = Time.unscaledTime + 4f;
+        }
+
+        private static int Wrap(int v, int count)
+        {
+            while (v < 0) v += count;
+            while (v >= count) v -= count;
+            return v;
+        }
+
+        /* ---------------------------------------------------------- render -- */
+
+        private void Repaint(TabletMarker t)
+        {
+            bool empty = TabletPins.Guids.Count == 0;
+            if (t.emptyMsg != null)
+                t.emptyMsg.text = empty
+                    ? "Select a locomotive using the\nComms Radio -> Autopilot" : "";
+            for (int i = 0; i < TabletPins.Max; i++)
+            {
+                var window = t.windows[i];
+                if (window == null)
+                    continue;
+                window.text = i < TabletPins.Guids.Count
+                    ? RenderWindow(TabletPins.Guids[i], t.hoverCol == i ? t.hoverRow : -1)
+                    : "";
+            }
+        }
+
+        private string RenderWindow(string guid, int hoverRow)
+        {
+            var loco = LocoOf(guid);
+            if (loco == null)
+                return "";
+            var d = DraftOf(guid);
+            string state = Autopilot.RunStateOf(guid) ?? "idle";
+            string dest;
+            if (d.shunt)
+            {
+                var tracks = ShuntTracks(guid);
+                dest = tracks.Count > 0
+                    ? tracks[Mathf.Clamp(d.destShunt, 0, tracks.Count - 1)] : "-";
+            }
+            else
+            {
+                dest = yards.Count > 0
+                    ? yards[Mathf.Clamp(d.destDrive, 0, yards.Count - 1)] : "-";
+            }
+
+            var rows = new string[Rows];
+            rows[0] = $"<b>{loco.ID}</b>";
+            rows[1] = $"Mode: {(d.shunt ? "Shunt" : "Drive")}";
+            rows[2] = $"Dest: {dest}";
+            rows[3] = $"Couple: {(d.couple ? "yes" : "no")}";
+            rows[4] = $"Uncpl: {(d.uncouple ? "yes" : "no")}";
+            rows[5] = $"Arrive: {ArriveNames[d.arrive]}";
+            rows[6] = "GO";
+            rows[7] = "STOP";
+            rows[8] = Time.unscaledTime < d.lastResultUntil
+                ? $"<color=#7fff7f>{d.lastResult}</color>"
+                : $"<color=#9fb7c7>{state}</color>";
+
+            for (int i = 0; i < Rows; i++)
+                if (i == hoverRow && i >= 1 && i <= 7)
+                    rows[i] = $"<color=#ffa500>{rows[i]}</color>";
+            return string.Join("\n", rows);
+        }
+
+        /* ------------------------------------------------------------ item -- */
+
+        private TabletMarker? HeldTablet()
+        {
+            var inv = Inventory.Instance;
+            if (inv == null)
+                return null;
+            var held = inv.GetEquippedItemAtSlot(0);
+            return held == null ? null : held.GetComponent<TabletMarker>();
+        }
+
         private void SweepStaleTablets()
         {
             var inv = Inventory.Instance;
@@ -179,250 +412,15 @@ namespace DvMod.Autopilot
             }
         }
 
-        /* ------------------------------------------------------------ data -- */
-
-        private void RefreshData()
+        private static TMP_FontAsset? Font()
         {
-            if (Time.unscaledTime < nextScan)
-                return;
-            nextScan = Time.unscaledTime + 1f;
-            var registry = DV.Utils.SingletonBehaviour<TrainCarRegistry>.Instance;
-            if (registry == null)
-                return;
-            locos = registry.logicCarToTrainCar.Values
-                .Where(c => c != null && c.IsLoco
-                    && c.GetComponent<DV.RemoteControls.RemoteControllerModule>() != null)
-                .OrderBy(c => c.ID)
-                .ToList();
-            if (yards.Count == 0)
-                yards = Yards.All().Keys.OrderBy(k => k).ToList();
-        }
-
-        /* ----------------------------------------------------------- input -- */
-
-        private void HandleInput(TabletMarker t)
-        {
-            bool shift = Input.GetKey(KeyCode.LeftShift) || Input.GetKey(KeyCode.RightShift);
-            int dir = 0;
-            if (shift)
-            {
-                float wheel = Input.mouseScrollDelta.y;
-                if (wheel > 0.01f) dir = -1;
-                else if (wheel < -0.01f) dir = 1;
-            }
-
-            if (dir != 0)
-            {
-                if (t.page == 0 && locos.Count > 0)
-                    t.locoIndex = Wrap(t.locoIndex + dir, locos.Count);
-                else if (t.page == 1)
-                    t.actionIndex = Wrap(t.actionIndex + dir, 4);
-                Repaint(t);
-            }
-
-            if (Input.GetKeyDown(Main.settings.tabletConfirmKey))
-            {
-                Confirm(t);
-                Repaint(t);
-            }
-            if (Input.GetKeyDown(Main.settings.tabletBackKey) && t.page == 1)
-            {
-                t.page = 0;
-                t.lastResult = "";
-                Repaint(t);
-            }
-        }
-
-        private void HandleMouse()
-        {
-            var cam = Camera.main;
-            if (cam == null)
-                return;
-            var ray = cam.ScreenPointToRay(Input.mousePosition);
-            if (!Physics.Raycast(ray, out var hit, 3f, ~0, QueryTriggerInteraction.Collide))
-                return;
-            var t = hit.collider != null ? hit.collider.GetComponentInParent<TabletMarker>() : null;
-            if (t == null || t.screenPiece == null || t.lineMap.Length == 0)
-                return;
-            // Local Z runs along the screen's long axis; +0.5 is one end. Map the
-            // hit to a rendered line, then to the selection that line stands for.
-            var local = t.screenPiece.InverseTransformPoint(hit.point);
-            float f = Mathf.Clamp01(0.5f - local.z);
-            int line = Mathf.Clamp((int)(f * t.lineMap.Length), 0, t.lineMap.Length - 1);
-            int sel = t.lineMap[line];
-            if (sel >= 0)
-            {
-                bool changed = t.page == 0 ? t.locoIndex != sel : t.actionIndex != sel;
-                if (t.page == 0) t.locoIndex = sel; else t.actionIndex = sel;
-                if (changed)
-                    Repaint(t);
-                if (Input.GetMouseButtonDown(0))
-                {
-                    Confirm(t);
-                    Repaint(t);
-                }
-            }
-            if (Input.GetMouseButtonDown(1) && t.page == 1)
-            {
-                t.page = 0;
-                t.lastResult = "";
-                Repaint(t);
-            }
-        }
-
-        private void Confirm(TabletMarker t)
-        {
-            if (t.page == 0)
-            {
-                if (locos.Count == 0)
-                    return;
-                t.locoIndex = Mathf.Clamp(t.locoIndex, 0, locos.Count - 1);
-                t.chosenLoco = locos[t.locoIndex].CarGUID;
-                t.page = 1;
-                t.actionIndex = 0;
-                t.lastResult = "";
-                return;
-            }
-
-            var loco = locos.FirstOrDefault(c => c.CarGUID == t.chosenLoco);
-            if (loco == null)
-            {
-                t.page = 0;
-                return;
-            }
-            switch (t.actionIndex)
-            {
-                case 0: // cycle destination yard
-                    if (yards.Count > 0)
-                        t.destIndex = Wrap(t.destIndex + 1, yards.Count);
-                    break;
-                case 1: // GO — road run to the chosen yard's line
-                    if (yards.Count > 0)
-                    {
-                        string yard = yards[Mathf.Clamp(t.destIndex, 0, yards.Count - 1)];
-                        string result = Autopilot.Start(
-                            loco.CarGUID, "", Main.settings.tabletCruiseKmh, false,
-                            ArriveMode.Auto, null, AutopilotMode.Drive, yard, false);
-                        t.lastResult = result.Contains("\"error\"")
-                            ? "REFUSED - see console" : "DISPATCHED";
-                    }
-                    break;
-                case 2: // STOP
-                    Autopilot.Stop(loco.CarGUID);
-                    t.lastResult = "STOPPED";
-                    break;
-                case 3: // back
-                    t.page = 0;
-                    t.lastResult = "";
-                    break;
-            }
-        }
-
-        private static int Wrap(int v, int count)
-        {
-            while (v < 0) v += count;
-            while (v >= count) v -= count;
-            return v;
-        }
-
-        /* ---------------------------------------------------------- render -- */
-
-        private void Repaint(TabletMarker t)
-        {
-            if (t.screen == null)
-                return;
-            t.screen.text = t.page == 0 ? RenderList(t) : RenderLoco(t);
-        }
-
-        private string RenderList(TabletMarker t)
-        {
-            var lines = new List<string> { "<b>DISPATCH</b>" };
-            var map = new List<int> { -1 };
-            if (locos.Count == 0)
-            {
-                lines.Add("no locomotives");
-                map.Add(-1);
-            }
-            else
-            {
-                t.locoIndex = Mathf.Clamp(t.locoIndex, 0, locos.Count - 1);
-                int first = Mathf.Max(0, Mathf.Min(t.locoIndex - RowsPerPage / 2,
-                    locos.Count - RowsPerPage));
-                for (int i = first; i < Mathf.Min(first + RowsPerPage, locos.Count); i++)
-                {
-                    var c = locos[i];
-                    string state = Autopilot.RunStateOf(c.CarGUID) ?? "idle";
-                    string row = $"{c.ID}  {state}";
-                    lines.Add(i == t.locoIndex ? $"<color=#ffa500>> {row}</color>" : $"  {row}");
-                    map.Add(i);
-                }
-            }
-            lines.Add("<size=44>shift+wheel / confirm</size>");
-            map.Add(-1);
-            t.lineMap = map.ToArray();
-            return string.Join("\n", lines);
-        }
-
-        private string RenderLoco(TabletMarker t)
-        {
-            var loco = locos.FirstOrDefault(c => c.CarGUID == t.chosenLoco);
-            if (loco == null)
-            {
-                t.page = 0;
-                return RenderList(t);
-            }
-            string state = Autopilot.RunStateOf(loco.CarGUID) ?? "idle";
-            string yard = yards.Count > 0
-                ? yards[Mathf.Clamp(t.destIndex, 0, yards.Count - 1)] : "-";
-            var rows = new[]
-            {
-                $"Dest: {yard}",
-                "GO  (drive there)",
-                "STOP",
-                "back",
-            };
-            var lines = new List<string> { $"<b>{loco.ID}</b>  {state}" };
-            var map = new List<int> { -1 };
-            for (int i = 0; i < rows.Length; i++)
-            {
-                lines.Add(i == t.actionIndex
-                    ? $"<color=#ffa500>> {rows[i]}</color>" : $"  {rows[i]}");
-                map.Add(i);
-            }
-            if (t.lastResult.Length > 0)
-            {
-                lines.Add($"<color=#7fff7f>{t.lastResult}</color>");
-                map.Add(-1);
-            }
-            t.lineMap = map.ToArray();
-            return string.Join("\n", lines);
-        }
-
-        /* ----------------------------------------------------------- item -- */
-
-        private TabletMarker? HeldTablet()
-        {
-            var inv = Inventory.Instance;
-            if (inv == null)
-                return null;
-            var held = inv.GetEquippedItemAtSlot(0);
-            return held == null ? null : held.GetComponent<TabletMarker>();
-        }
-
-        private TabletMarker? LookedAtTablet()
-        {
-            var cam = Camera.main;
-            if (cam == null)
-                return null;
-            var ray = cam.ViewportPointToRay(new Vector3(0.5f, 0.5f, 0f));
-            if (!Physics.Raycast(ray, out var hit, 4f, ~0, QueryTriggerInteraction.Ignore))
-                return null;
-            return hit.collider == null ? null : hit.collider.GetComponentInParent<TabletMarker>();
+            if (font == null)
+                font = Resources.FindObjectsOfTypeAll<TMP_FontAsset>().FirstOrDefault();
+            return font;
         }
 
         private void GiveTablet()
         {
-            // One is enough — bring an existing one to notice instead of stacking.
             if (tablets.Any(m => m != null))
             {
                 Main.mod?.Logger.Log("A dispatcher tablet already exists");
@@ -462,16 +460,11 @@ namespace DvMod.Autopilot
             var itemSpec = go.GetComponent<InventoryItemSpec>();
             if (itemSpec != null)
             {
-                // BelongsToPlayer keeps the world's junk cleanup from despawning
-                // a tablet that is put down for a moment.
+                // BelongsToPlayer keeps the world's junk cleanup off it; NOT
+                // essential (the compass is, and the flag padlocked the slot).
                 itemSpec.BelongsToPlayer = true;
                 itemSpec.NameOverride = "Dispatcher Tablet";
-                // The compass is an ESSENTIAL item and the clone inherits it —
-                // that is the lock icon, the un-trashable dumpster behaviour and
-                // the slots nothing could free. A tablet is expendable.
                 itemSpec.isEssential = false;
-                // Deliberately NOT dumpster-immune: the dumpster is how a spare
-                // tablet is disposed of, F9 always makes another.
             }
 
             var model = go.transform.Find("model");
@@ -483,22 +476,19 @@ namespace DvMod.Autopilot
                 return;
             }
             int layer = dial.gameObject.layer;
-            foreach (var r in model.GetComponentsInChildren<Renderer>(true))
-                r.enabled = false;
+            foreach (var rend in model.GetComponentsInChildren<Renderer>(true))
+                rend.enabled = false;
 
-            // Screen slab where the dial sat.
-            // ------------------------------------------------- tablet body --
-            // All primitives, all sized in WORLD units then divided by the
-            // parent's scale (localScale multiplies by it).
             var pl = model.lossyScale;
-            // Overall tablet size: 1 was a pocket phone; this matches the job
-            // booklet (~15 x 21 cm).
+            // Landscape, sized like the job booklet (~21 x 15 cm).
             const float S = 1.45f;
             Vector3 World(float x, float y, float z) => new Vector3(
                 x * S / Mathf.Max(0.0001f, pl.x),
                 y * S / Mathf.Max(0.0001f, pl.y),
                 z * S / Mathf.Max(0.0001f, pl.z));
-            GameObject Piece(string name, Vector3 size, Vector3 worldOffset, Color color, Color? glow = null, bool keepCollider = false, PrimitiveType shape = PrimitiveType.Cube)
+            GameObject Piece(string name, Vector3 size, Vector3 worldOffset, Color color,
+                Color? glow = null, bool keepCollider = false,
+                PrimitiveType shape = PrimitiveType.Cube)
             {
                 var piece = GameObject.CreatePrimitive(shape);
                 piece.name = name;
@@ -521,64 +511,71 @@ namespace DvMod.Autopilot
                 return piece;
             }
 
-            // Body: dark grey slab, the bezel is simply its margin around the
-            // screen. Screen: near-black with a faint glow so it reads at night.
-            // Landscape: wide side across the hands, like the booklet held open.
-            // Rounded corners: the body is a cross of two slabs with a quarter of
-            // a cylinder showing at each corner.
+            // Rounded body: a cross of two slabs plus quarter cylinders.
             var bodyColor = new Color(0.13f, 0.13f, 0.14f);
             const float cr = 0.009f;
             Piece("TabletBodyA", World(0.145f, 0.004f, 0.105f - 2 * cr), Vector3.zero, bodyColor);
             Piece("TabletBodyB", World(0.145f - 2 * cr, 0.004f, 0.105f), Vector3.zero, bodyColor);
             foreach (var sx in new[] { -1f, 1f })
                 foreach (var sz in new[] { -1f, 1f })
-                    Piece("TabletCorner",
-                        // A cylinder's height is TWICE its Y scale.
-                        World(2 * cr, 0.002f, 2 * cr),
+                    Piece("TabletCorner", World(2 * cr, 0.002f, 2 * cr),
                         new Vector3(sx * (0.145f / 2 - cr), 0f, sz * (0.105f / 2 - cr)),
                         bodyColor, shape: PrimitiveType.Cylinder);
             var screenPiece = Piece("TabletScreen",
                 World(0.118f, 0.002f, 0.082f), new Vector3(0, 0.0022f, 0f),
                 new Color(0.02f, 0.03f, 0.05f), new Color(0.02f, 0.05f, 0.09f),
-                keepCollider: true); // the glass takes the cursor-mode mouse ray
-            // Trigger, not solid: a solid collider 26 cm from the camera shoves
+                keepCollider: true);
+            // Trigger, not solid — a solid collider 26 cm from the camera shoves
             // the player backwards whenever they glance at the screen.
             screenPiece.GetComponent<Collider>().isTrigger = true;
-            // Speaker slit above the screen, home button below it.
             Piece("TabletSpeaker", World(0.03f, 0.0015f, 0.003f), new Vector3(0, 0.0022f, 0.0465f),
                 new Color(0.05f, 0.05f, 0.05f));
             Piece("TabletHome", World(0.008f, 0.0015f, 0.008f), new Vector3(0, 0.0022f, -0.0465f),
                 new Color(0.32f, 0.33f, 0.35f));
 
-            var textGo = new GameObject("TabletText");
-            textGo.transform.SetParent(model, true);
-            textGo.layer = layer;
-            textGo.transform.position = dial.position + dial.up * 0.0025f;
-            textGo.transform.rotation = dial.rotation * Quaternion.Euler(90f, 0f, 0f);
-            var tm = textGo.AddComponent<TextMesh>();
-            tm.anchor = TextAnchor.MiddleCenter;
-            tm.alignment = TextAlignment.Center;
-            tm.fontSize = 64;
-            tm.characterSize = 0.00075f * 1.45f;
-            // SetParent(worldPositionStays) already compensated this transform's
-            // localScale for the parent — forcing it back to world unit keeps the
-            // glyph size authored above true regardless of the item's scale.
-            textGo.transform.localScale = new Vector3(
-                1f / Mathf.Max(0.0001f, model.lossyScale.x),
-                1f / Mathf.Max(0.0001f, model.lossyScale.y),
-                1f / Mathf.Max(0.0001f, model.lossyScale.z));
-            tm.richText = true;
-            tm.color = Color.white;
-            tm.text = "<b>DISPATCH</b>\nloading...";
-
             var marker = go.AddComponent<TabletMarker>();
-            marker.screen = tm;
             marker.model = model;
             marker.screenPiece = screenPiece.transform;
             marker.homeLocalPos = model.localPosition;
             marker.homeLocalRot = model.localRotation;
-            tablets.Add(marker);
 
+            // Four window texts across the glass plus the empty-board message.
+            // TMP, not TextMesh: TMP's shader tests depth, so the text no longer
+            // shines through walls.
+            TextMeshPro MakeText(string name, float worldX, float worldWidth,
+                TextAlignmentOptions align)
+            {
+                var textGo = new GameObject(name);
+                textGo.transform.SetParent(model, true);
+                textGo.layer = layer;
+                textGo.transform.position = dial.position
+                    + dial.up * 0.0035f + dial.right * (worldX * S);
+                textGo.transform.rotation = dial.rotation * Quaternion.Euler(90f, 0f, 0f);
+                var text = textGo.AddComponent<TextMeshPro>();
+                text.font = Font();
+                text.fontSize = 0.55f;
+                text.alignment = align;
+                text.richText = true;
+                text.color = Color.white;
+                text.rectTransform.sizeDelta = new Vector2(worldWidth * S, 0.082f * S);
+                // World-unit scale regardless of the item's own scaling.
+                textGo.transform.localScale = new Vector3(
+                    1f / Mathf.Max(0.0001f, pl.x),
+                    1f / Mathf.Max(0.0001f, pl.y),
+                    1f / Mathf.Max(0.0001f, pl.z));
+                return text;
+            }
+
+            const float colWidth = 0.118f / TabletPins.Max;
+            for (int i = 0; i < TabletPins.Max; i++)
+            {
+                float x = (i - (TabletPins.Max - 1) / 2f) * colWidth;
+                marker.windows[i] = MakeText($"TabletWindow{i}", x, colWidth - 0.004f,
+                    TextAlignmentOptions.Top);
+            }
+            marker.emptyMsg = MakeText("TabletEmpty", 0f, 0.115f, TextAlignmentOptions.Center);
+
+            tablets.Add(marker);
             int result = inv.AddItemToInventory(go, slot, false);
             Main.mod?.Logger.Log($"Dispatcher tablet added to slot {result}");
         }

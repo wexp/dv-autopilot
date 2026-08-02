@@ -104,8 +104,9 @@ namespace DvMod.Autopilot
                 }
                 else
                 {
-                    message = $"Locomotive {car.ID} ({car.carLivery?.id ?? car.carType.ToString()})"
-                        + (Autopilot.IsUnderAutopilot(car.trainset) ? "\nUnder autopilot." : "\nIdle.");
+                    // The action IS the dispatcher's picker: pin the loco to the
+                    // tablet (or take it back off).
+                    message = TabletPins.Toggle(car);
                     utility.PlaySound(VanillaSoundCommsRadio.Confirm);
                 }
                 // pauseGame: false — a radio readout must not stop the world.

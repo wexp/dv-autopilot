@@ -63,7 +63,7 @@ namespace DvMod.Autopilot
 
             if (value)
             {
-                harmony.PatchAll();
+                PatchAllSurvivingFailures(harmony, modEntry);
                 WorldStreamingInit.LoadingFinished += Start;
                 UnloadWatcher.UnloadRequested += Stop;
                 ConnectToPersistentJobs();
@@ -108,6 +108,37 @@ namespace DvMod.Autopilot
                 }
             }
             return true;
+        }
+
+        /// <summary>
+        /// Apply our patches one class at a time, surviving the ones that blow up.
+        ///
+        /// NOT harmony.PatchAll: patching a method makes Harmony rebuild that
+        /// method's whole wrapper, re-emitting every OTHER mod's patches on it too.
+        /// One of those being unpatchable — built for a different game version,
+        /// naming an argument the method no longer has — threw out of PatchAll and
+        /// took the entire load with it, leaving the mod half-patched and Start()
+        /// never called. The failure has nothing to do with the patch we were
+        /// applying and everything to do with who else is on that method, so it
+        /// must not be fatal to us. Same reasoning as the unpatch loop below.
+        /// </summary>
+        private static void PatchAllSurvivingFailures(Harmony harmony, UnityModManager.ModEntry modEntry)
+        {
+            foreach (var type in Assembly.GetExecutingAssembly().GetTypes())
+            {
+                try
+                {
+                    new PatchClassProcessor(harmony, type).Patch();
+                }
+                catch (Exception e)
+                {
+                    // Name what was lost: a silently skipped patch is a feature
+                    // that quietly stops working.
+                    modEntry.Logger.Log(
+                        $"Could not patch {type.FullName}: {e.GetType().Name} — "
+                        + $"{e.InnerException?.Message ?? e.Message}; that feature is off this session");
+                }
+            }
         }
 
         private static void DisconnectFromPersistentJobs()

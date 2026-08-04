@@ -30,7 +30,29 @@ namespace DvMod.Autopilot
             GUILayout.Space(8);
             enableLogging = GUILayout.Toggle(enableLogging,
                 " Write debug detail to the mod log (Player.log)");
+            GUILayout.Space(8);
+            DrawMapDump();
             GUILayout.EndVertical();
+        }
+
+        /// <summary>Last dump's report, so the button says what it did instead of
+        /// leaving the only evidence in Player.log.</summary>
+        private string dumpReport = "";
+
+        /// <summary>
+        /// Writes the rail network out for the offline simulator. Only tracks the
+        /// game has STREAMED IN exist to be found, so the report leads with the
+        /// count: two dumps taken in different places that disagree mean the map is
+        /// partial, and there is no way to tell that from the file itself.
+        /// </summary>
+        private void DrawMapDump()
+        {
+            GUILayout.Label("<b>Simulator map</b> — dump the rail network to map.json / "
+                + "state.json in the mod folder, for running the autopilot outside the game.");
+            if (GUILayout.Button("Dump map + state", GUILayout.Width(200)))
+                dumpReport = MapDump.Write(null);
+            if (dumpReport.Length > 0)
+                GUILayout.Label(dumpReport);
         }
 
         public override void Save(UnityModManager.ModEntry entry)

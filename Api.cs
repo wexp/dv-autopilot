@@ -52,6 +52,11 @@ namespace DvMod.Autopilot
         /// do something that would freeze or kill the drive coroutines.</summary>
         public static void SecureAll() => Autopilot.SecureAllForReload();
 
+        /// <summary>Write the rail network and the current scenario to map.json /
+        /// state.json in the given folder (the mod's own when null), so the routing
+        /// and driving can be run outside the game. Returns a JSON report.</summary>
+        public static string DumpMap(string? dir) => MapDump.Write(dir);
+
         private static ArriveMode ParseArrive(string? value) => value switch
         {
             "shove" => ArriveMode.Shove,

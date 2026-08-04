@@ -63,31 +63,16 @@ namespace DvMod.Autopilot
 
                 // Done when the whole consist is fully within the destination — or,
                 // on a coupling run, as soon as our train has grown.
-                // A runaround only counts as arrived once the train has actually left
-                // the destination and come back in the other way.
-                if (!run.viaLocked && run.arriveEnteredIn != null && run.destTrack != null)
-                {
-                    if (!run.leftDest && AllOffTrack(car, run.destTrack))
-                        run.leftDest = true;
-                    // Back on it again: the constraint has done its job, and holding it
-                    // any longer would send the train out for another lap instead of
-                    // letting it pull up inside the markers.
-                    if (run.leftDest && !AllOffTrack(car, run.destTrack))
-                        run.reEntered = true;
-                }
-                bool mayArrive;
-                if (run.arriveEnteredIn == null)
-                    mayArrive = true;
-                else if (run.viaLocked)
-                    // A via move may legitimately CROSS its destination on the way
-                    // round; being fully inside it then is passing through, not
-                    // arriving. Arrived = the CURRENT plan ends on the destination
-                    // and comes in by the demanded end.
-                    mayArrive = run.path.Count > 0
+                //
+                // An arrive-end is only ever set by a declared via junction, and such
+                // a move may legitimately CROSS its destination on the way round;
+                // being fully inside it then is passing through, not arriving.
+                // Arrived = the CURRENT plan ends on the destination and comes in by
+                // the demanded end.
+                bool mayArrive = run.arriveEnteredIn == null
+                    || (run.path.Count > 0
                         && run.path[run.path.Count - 1] == run.destTrack
-                        && EntryEndIsIn(run.path, run.destTrack) == run.arriveEnteredIn;
-                else
-                    mayArrive = run.leftDest;
+                        && EntryEndIsIn(run.path, run.destTrack) == run.arriveEnteredIn);
                 if (run.couple && !run.coupledDone && Coupled(run))
                 {
                     // Hooked on. From here it is an ordinary spot, with the cars we
@@ -113,8 +98,7 @@ namespace DvMod.Autopilot
                 }
 
                 var path = Routing.FindPath(
-                    track, destId, car,
-                    run.reEntered && !run.viaLocked ? null : run.arriveEnteredIn,
+                    track, destId, car, run.arriveEnteredIn,
                     run.arrive, run.avoid, run.reversalPenalty);
                 if (path == null)
                 {
@@ -122,6 +106,14 @@ namespace DvMod.Autopilot
                     Finish(run, "error", "no route to " + destId);
                     yield break;
                 }
+                // Every leg re-plans, so this is where a run that keeps changing its
+                // mind shows it. The leg NUMBER is deliberately not in the text: it
+                // rises every pass, so including it made each re-plan a different
+                // line and two hundred identical decisions filled the buffer
+                // instead of collapsing to one entry with a count.
+                run.Note($"planned {path.Count} tracks to {destId}"
+                    + $" via {string.Join(" ", path.Skip(1).Take(4).Select(t => t.LogicTrack()?.ID?.ToString()))}"
+                    + (Routing.BlockedRoute ? " (through standing stock)" : ""));
 
                 // The router falls back to the blocked road when there is no other, so
                 // a plan that still runs through it means there IS no way round. Say so
@@ -251,9 +243,7 @@ namespace DvMod.Autopilot
 
                 ReleaseOffPlan(run, path);
                 var legs = ComputeLegs(path);
-                run.steps = CompileSteps(
-                    path, legs,
-                    run.reEntered && !run.viaLocked ? null : run.arriveEnteredIn, destId);
+                run.steps = CompileSteps(path, legs, run.arriveEnteredIn, destId);
                 var (s, e) = legs[0];
                 bool lastLeg = legs.Count == 1;
                 // Publish what we still have to cover, so the other runs can tell a
@@ -275,18 +265,20 @@ namespace DvMod.Autopilot
                     // shuffle toward the zone based on the WHOLE consist's extent (not
                     // just the reference bogie): if any bogie is below the low marker,
                     // pull to +span; if any is above the high marker, go -span.
-                    var (lo, hi) = MarkerZone(track);
-                    double mn = double.MaxValue, mx = double.MinValue;
-                    foreach (var c in car.trainset.cars)
-                        foreach (var bb in c.Bogies)
-                            if (bb?.track == track)
-                            {
-                                mn = Math.Min(mn, bb.traveller.Span);
-                                mx = Math.Max(mx, bb.traveller.Span);
-                            }
-                    bool wantPlusSpan = mn < lo || mx <= hi; // default deeper unless over
-                    if (mx > hi && mn >= lo)
-                        wantPlusSpan = false;
+                    // Which way to shuffle, and whether to shuffle at all — asked of
+                    // the same cars, and by the same arithmetic, as the test that
+                    // decides we have arrived. See SpotShuffleDirection.
+                    bool? want = SpotShuffleDirection(car, track);
+                    if (want == null)
+                    {
+                        // Already inside the marks (or as close as an oversize cut
+                        // will ever get). Stand, rather than shuffling on for ever.
+                        overrider.Throttle?.Set(0f);
+                        overrider.Brake?.Set(1f);
+                        Finish(run, "arrived", destId);
+                        yield break;
+                    }
+                    bool wantPlusSpan = want.Value;
                     // Coupling on our own track: head for the nearest cars that are
                     // not ours, wherever they stand — the markers say where to park,
                     // not where the train to pick up is.
@@ -307,12 +299,28 @@ namespace DvMod.Autopilot
                 // it, and go again. Detected by our own stock standing on a branch of
                 // a planned junction that the plan itself does not touch.
                 var wrongJ = WrongBranchJunction(car, path, reverser >= 0.5f);
+                string blockedWhy = "the front stands on the wrong road";
+                if (wrongJ == null)
+                {
+                    // The same move is needed BEFORE going wrong, not only after.
+                    // A leg whose next switch has to be thrown while our own train
+                    // is standing on it cannot be driven: the throw is refused, and
+                    // rolling on takes whichever leg the switch already lay on. The
+                    // train then finds itself off-plan and recovers the long way
+                    // round — which is the recovery working, not the move working.
+                    wrongJ = OwnConsistOnSwitchAhead(car, path, s, e);
+                    if (wrongJ != null)
+                        blockedWhy = "our own train is standing on it";
+                }
                 if (wrongJ != null)
                 {
                     float backRev = ExitIsOut(path[0], path.Count >= 2 ? path[1] : path[0])
                         == (bogie.TrackDirectionSign > 0) ? 0f : 1f;
-                    run.detail = $"backing clear of J-{JunctionIndex(wrongJ)} — "
-                        + "the front stands on the wrong road";
+                    run.detail = $"backing clear of J-{JunctionIndex(wrongJ)} — {blockedWhy}";
+                    // Repeats are collapsed with a count, so backing clear and then
+                    // immediately deciding to back clear AGAIN shows up as the
+                    // livelock it is instead of scrolling past.
+                    run.Note($"cannot use J-{JunctionIndex(wrongJ)} — {blockedWhy}; backing clear");
                     overrider.Throttle?.Set(0f);
                     overrider.DynamicBrake?.Set(0f);
                     overrider.Brake?.Set(1f);
@@ -435,7 +443,7 @@ namespace DvMod.Autopilot
                 ExtendAuthority(
                     run, path, s, track, bogie.traveller.Span,
                     (reverser >= 0.5f) == (bogie.TrackDirectionSign > 0),
-                    ConsistLengthAhead(car, bogie), AuthorityMinMeters,
+                    ConsistLengthAhead(car, reverser >= 0.5f), AuthorityMinMeters,
                     out _, out _, out _, lastLeg ? int.MaxValue : e);
                 run.state = "driving";
 
@@ -594,7 +602,7 @@ namespace DvMod.Autopilot
                 float speed = Mathf.Abs(car.GetForwardSpeed()) * 3.6f; // km/h
                 // How far our own cars reach beyond the reference bogie, so switch and
                 // limit distances are measured from the front of the train.
-                double ownLeadHint = ConsistLengthAhead(car, bogie);
+                double ownLeadHint = ConsistLengthAhead(car, reverser >= 0.5f);
                 Vector3 motion = (reverser >= 0.5f ? 1f : -1f) * car.transform.forward;
                 // Which way along the current track's span we are travelling — needed
                 // by the distance, look-ahead and obstacle checks alike.
@@ -699,7 +707,14 @@ namespace DvMod.Autopilot
                     // this check; the pull leg never did, and that is how a shunt ended
                     // up at GF. Give it a couple of seconds of grace first: the index
                     // reads -1 for a tick or two while a bogie crosses a frog.
-                    if (IndexNear(path, track, s) >= e)
+                    // Reached by the LOCO's index, or by any part of the train already
+                    // lying on the pivot track. The loco-only test made the leg wait for
+                    // the loco to be driven onto rail its own wagons were standing on.
+                    // What actually gates the reverse is still BehindPivotShortfall
+                    // below — the whole consist onto the reversal track — which is
+                    // consist-aware already; this only stops the loco's position adding
+                    // a second, stricter condition on top of it.
+                    if (IndexNear(path, track, s) >= e || ConsistReachedIndex(car, path, e))
                         reachedPivot = true;
                     // Only "lost" until the pivot has been reached. After that, being
                     // off the planned road is the pull doing its job: drawing the tail
@@ -1426,10 +1441,15 @@ namespace DvMod.Autopilot
                             run.avoid.Add(blockedTrack);
                             run.blockedReason = badReason;
                             run.detail = $"{phase}: {badReason} — looking for another way round";
+                            run.Note($"gave up on {blockedTrack.LogicTrack()?.ID} after "
+                                + $"{switchHold:F0}s — {badReason}; re-routing around it");
                             done(true); // hand back to Drive, which re-plans
                             yield break;
                         }
                         run.detail = $"{phase}: HOLDING — {badReason} ({badDist:F0} m)";
+                        // Collapsed to one line with a count, so a long wait reads as
+                        // one wait rather than filling the buffer at ten a second.
+                        run.Note($"holding: {badReason} ({badDist:F0} m ahead)");
                         continue;
                     }
                     run.detail += $" [{badReason} in {badDist:F0} m]";

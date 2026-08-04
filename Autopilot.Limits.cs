@@ -247,14 +247,43 @@ namespace DvMod.Autopilot
             return d;
         }
 
-        /// <summary>Rough distance from the reference bogie to the leading end of the
-        /// consist, m — the whole train's length is the safe bound when it is being
-        /// shoved, and it costs nothing to be pessimistic here.</summary>
-        private static double ConsistLengthAhead(TrainCar loco, Bogie bogie)
+        /// <summary>
+        /// Distance from the loco's reference bogie to the LEADING end of the consist,
+        /// m — walked through the couplers in the direction of travel, so it counts
+        /// only the cars actually ahead of the loco.
+        ///
+        /// This used to return the whole train's length whichever way round the train
+        /// was, on the grounds that being pessimistic costs nothing. It does. On a
+        /// SHOVE the two are the same, but on a PULL the rake is entirely BEHIND the
+        /// loco and the figure was a whole train too big — and every consumer measures
+        /// from the front with it: ExtendAuthority hands back `granted - ownLead`, so a
+        /// 500 m rake read as having no authority it actually held; SwitchesAheadOk does
+        /// `ahead -= ownLead`, so a train stopped half a kilometre short of a switch it
+        /// could see perfectly well; PlannedLimitKmh started braking for restrictions a
+        /// train's length early. Half the loco's own body is still counted in, because
+        /// the reference bogie sits inside it and erring a few metres long there is free.
+        /// </summary>
+        private static double ConsistLengthAhead(TrainCar loco, bool locoForward)
         {
-            double total = 0;
-            foreach (var c in loco.trainset.cars)
-                total += c.InterCouplerDistance;
+            var cars = loco.trainset?.cars;
+            if (cars == null)
+                return loco.InterCouplerDistance;
+            double total = loco.InterCouplerDistance;
+            var cur = loco;
+            bool forward = locoForward;
+            var seen = new HashSet<TrainCar> { loco };
+            while (true)
+            {
+                var exit = forward ? cur.frontCoupler : cur.rearCoupler;
+                var next = exit?.coupledTo?.train;
+                if (next == null || !seen.Add(next))
+                    break;
+                // Entering the next car by its REAR coupler means travel runs toward
+                // its front — the same orientation flip LeadingEnd walks.
+                forward = exit!.coupledTo == next.rearCoupler;
+                cur = next;
+                total += cur.InterCouplerDistance;
+            }
             return total;
         }
 

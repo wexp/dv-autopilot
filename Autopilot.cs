@@ -85,23 +85,16 @@ namespace DvMod.Autopilot
             /// the run cut strangers loose again and carry on.</summary>
             public readonly HashSet<string> members = new HashSet<string>();
             /// <summary>Which end of the destination to come in through: set by a via
-            /// junction, or — when the destination is the track the loco already
-            /// stands on and no via was given — guessed as the far end, meaning out,
-            /// round, and back in. Every re-route must keep the constraint or the
-            /// router would simply turn it back in by the end it just left.</summary>
+            /// junction, and from nothing else. Every re-route must keep the
+            /// constraint or the router would simply turn the train back in by the
+            /// end it just left.</summary>
             public bool? arriveEnteredIn;
-            /// <summary>The destination track, whether we have actually left it yet
-            /// (standing on it at the start must not count as having arrived), and
-            /// whether we are back on it having come in the far end. The constraint
-            /// has to hold until THAT point: dropping it the moment we left simply
-            /// routed the train back in by the end it had just come out of.</summary>
+            /// <summary>The destination track.</summary>
             public RailTrack? destTrack;
-            public bool leftDest;
-            public bool reEntered;
-            /// <summary>The arrive-end came from an EXPLICIT via junction. Then the
-            /// constraint holds for the whole run: the leftDest/reEntered machinery
-            /// belongs to the same-track runaround, and letting it clear the end
-            /// just because a pull leg happened to CROSS the destination sent a
+            /// <summary>The arrive-end came from an EXPLICIT via junction — which,
+            /// since the same-track guess was removed, is the only way it is ever
+            /// set. The constraint therefore holds for the WHOLE run: letting a pull
+            /// leg that happened to CROSS the destination clear it sent a
             /// "via J-204" move in through J-209.</summary>
             public bool viaLocked;
             /// <summary>How the dispatcher wants it to arrive: shoved (wagons first),
@@ -170,6 +163,54 @@ namespace DvMod.Autopilot
             /// giving way to each other and neither arrives.</summary>
             public readonly int seq = ++dispatched;
 
+            /// <summary>
+            /// The run's own account of itself, newest last. Everything the drive
+            /// loop decides used to go to Player.log and nowhere else, which meant
+            /// the one thing a dispatcher needed — WHY the train is doing this —
+            /// was the one thing no UI could show. These ride along in the status
+            /// JSON instead.
+            /// </summary>
+            public readonly List<RunNote> notes = new List<RunNote>();
+
+            public sealed class RunNote
+            {
+                public float at;
+                public float last;
+                public string text = "";
+                public int count = 1;
+            }
+
+            /// <summary>Long enough to cover a whole manoeuvre, short enough that a
+            /// run stuck for ten minutes does not grow without bound.</summary>
+            private const int MaxNotes = 60;
+            /// <summary>How many opening notes are never evicted. A run that goes
+            /// wrong is explained by how it STARTED as much as by what it is doing
+            /// now, and a pure ring buffer throws that away first.</summary>
+            private const int KeepHead = 12;
+            /// <summary>How far back a repeat is looked for. Two, because the
+            /// interesting failure is a CYCLE — "back clear of J-278", "re-plan",
+            /// "back clear of J-278" — and matching only the previous line lets an
+            /// alternating pair fill the whole buffer while collapsing nothing.</summary>
+            private const int CycleWindow = 3;
+
+            public void Note(string text)
+            {
+                float now = Time.realtimeSinceStartup;
+                for (int i = notes.Count - 1; i >= 0 && i >= notes.Count - CycleWindow; i--)
+                {
+                    if (notes[i].text != text)
+                        continue;
+                    notes[i].count++;
+                    notes[i].last = now;
+                    return;
+                }
+
+                notes.Add(new RunNote { at = now, last = now, text = text });
+                if (notes.Count > MaxNotes)
+                    notes.RemoveAt(KeepHead);
+                Main.DebugLog(() => $"[{id}] {text}");
+            }
+
             public Run(TrainCar car, RemoteControllerModule controller)
             {
                 this.car = car;
@@ -183,18 +224,135 @@ namespace DvMod.Autopilot
                 profile = Main.settings.autopilot.For(car.carLivery?.id);
             }
 
-            public JObject ToJson() => new JObject
+            /// <summary>
+            /// Everything a dispatcher's screen could want. The first block is the
+            /// original contract and its names must not move — remote-dispatch
+            /// reads them. The rest is additive: where the train physically is,
+            /// what it is holding, what it is waiting for, and its own running
+            /// account of why.
+            /// </summary>
+            public JObject ToJson()
             {
-                ["state"] = state,
-                ["detail"] = detail,
-                ["loco"] = id,
-                ["guid"] = guid,
-                ["mode"] = mode.ToString().ToLowerInvariant(),
-                ["couple"] = couple,
-                ["arrive"] = arrive.ToString().ToLowerInvariant(),
-                ["limit"] = Math.Round(limitKmh),
-                ["steps"] = new JArray(steps.Select(s => s.ToJson())),
-            };
+                var bogie = Bogie();
+                var json = new JObject
+                {
+                    ["state"] = state,
+                    ["detail"] = detail,
+                    ["loco"] = id,
+                    ["guid"] = guid,
+                    ["mode"] = mode.ToString().ToLowerInvariant(),
+                    ["couple"] = couple,
+                    ["arrive"] = arrive.ToString().ToLowerInvariant(),
+                    ["limit"] = Math.Round(limitKmh),
+                    ["steps"] = new JArray(steps.Select(s => s.ToJson())),
+
+                    // Where it is and what it is doing, so a stopped train can be
+                    // told apart from a slow one without watching it.
+                    ["dest"] = destTrack?.LogicTrack()?.ID?.ToString(),
+                    ["track"] = bogie?.track?.LogicTrack()?.ID?.ToString(),
+                    ["span"] = bogie == null ? null : (JToken)Math.Round(bogie.traveller.Span, 1),
+                    ["kmh"] = Math.Round(Math.Abs(car?.GetForwardSpeed() ?? 0f) * 3.6f, 1),
+                    ["cars"] = car?.trainset?.cars?.Count ?? 0,
+                    ["seq"] = seq,
+
+                    // How far through the plan, and what it still has to cover.
+                    ["pathFrom"] = pathFrom,
+                    ["pathCount"] = path.Count,
+                    ["finalLeg"] = finalLeg,
+                    ["path"] = new JArray(path.Skip(pathFrom).Take(12)
+                        .Select(t => (JToken)(t.LogicTrack()?.ID?.ToString() ?? "?"))),
+
+                    // Where the CONSIST actually is, which is a different question
+                    // from what the run holds: claims are a moving window that
+                    // still covers rail the train has left. "Is it clear of J-278
+                    // yet" can only be answered from the cars themselves.
+                    ["occupies"] = new JArray(OccupiedTracks()
+                        .Select(t => (JToken)(t.LogicTrack()?.ID?.ToString() ?? "?"))),
+                    // Junctions on the CURRENT plan that the consist is still
+                    // standing on. A switch here cannot be thrown, so a plan that
+                    // needs one of these is a plan the train cannot execute from
+                    // where it lies.
+                    ["fouls"] = new JArray(FouledPlanJunctions()
+                        .Select(j => (JToken)JunctionIndex(j))),
+
+                    // Why it might not be moving.
+                    ["blocked"] = blockedReason,
+                    ["avoid"] = new JArray(avoid
+                        .Select(t => (JToken)(t.LogicTrack()?.ID?.ToString() ?? "?"))),
+                    ["holdsTracks"] = new JArray(claimed
+                        .Select(t => (JToken)(t.LogicTrack()?.ID?.ToString() ?? "?"))),
+                    ["holdsJunctions"] = new JArray(claimedJunctions
+                        .Select(j => (JToken)JunctionIndex(j))),
+
+                    // The run's own reasoning, oldest first. "count" above 1 means
+                    // the decision was taken again and again — which is the shape a
+                    // livelock has, and the thing worth showing loudest.
+                    ["notes"] = new JArray(notes.Select(n => new JObject
+                    {
+                        ["at"] = Math.Round(n.at, 1),
+                        ["last"] = Math.Round(n.last, 1),
+                        ["count"] = n.count,
+                        ["text"] = n.text,
+                    })),
+                };
+
+                // The handles, so a train that is being braked by the autopilot is
+                // distinguishable from one that simply has no power.
+                var controls = controller?.controlsOverrider;
+                if (controls != null)
+                {
+                    json["throttle"] = Math.Round(controls.Throttle?.Value ?? 0f, 2);
+                    json["brake"] = Math.Round(controls.Brake?.Value ?? 0f, 2);
+                    json["dynamic"] = Math.Round(controls.DynamicBrake?.Value ?? 0f, 2);
+                    json["reverser"] = Math.Round(controls.Reverser?.Value ?? 0f, 2);
+                }
+                return json;
+            }
+
+            /// <summary>The bogie the whole mod measures this loco's position by.</summary>
+            private Bogie? Bogie()
+            {
+                var bogies = car?.Bogies;
+                return bogies != null && bogies.Length >= 2 ? bogies[1] : null;
+            }
+
+            /// <summary>Every track with one of our own bogies on it, in no
+            /// particular order — where the train physically LIES.</summary>
+            private IEnumerable<RailTrack> OccupiedTracks()
+            {
+                var seen = new HashSet<RailTrack>();
+                var cars = car?.trainset?.cars;
+                if (cars == null)
+                    return seen;
+                foreach (var c in cars)
+                {
+                    if (c?.Bogies == null)
+                        continue;
+                    foreach (var b in c.Bogies)
+                        if (b?.track != null)
+                            seen.Add(b.track);
+                }
+                return seen;
+            }
+
+            /// <summary>Junctions along the current plan that our own consist is
+            /// still fouling. The same test the drive loop gates its reversals on,
+            /// so what a dispatcher reads here is what the train is waiting for.</summary>
+            private IEnumerable<Junction> FouledPlanJunctions()
+            {
+                var found = new List<Junction>();
+                var set = car?.trainset;
+                if (set == null)
+                    return found;
+                for (int i = 0; i + 1 < path.Count; i++)
+                {
+                    var junction = JunctionBetween(path[i], path[i + 1]);
+                    if (junction != null && !found.Contains(junction)
+                        && ConsistFoulsJunction(junction, set))
+                        found.Add(junction);
+                }
+                return found;
+            }
         }
 
         // Every run, by car guid. Only ever touched on the main thread (every entry
@@ -416,6 +574,13 @@ namespace DvMod.Autopilot
         // Car body past its end bogie, m. Only used to turn a coupler-to-coupler
         // consist length into a bogie-to-bogie one, which is what spans measure.
         private const double CarEndOverhang = 2.0;
+        // Slack a cut must have INSIDE the marker window before the spot counts as
+        // achievable, m. A 397 m cut in a 398 m window is arithmetically a fit and
+        // practically not one: it has to land to the centimetre, the clearance test
+        // keeps answering "not yet", and the train hunts up and down the siding for
+        // ever. Below this much room it is treated as too long — one end goes to its
+        // mark, the tail lies where it falls, and the run STOPS.
+        private const double SpotFitSlack = 3.0;
         // Buffering up: close in at walking pace from this far out, m.
         private const double CoupleApproach = 25.0;
         // Speed for the last few metres onto the couplers, km/h. Slow enough not to
@@ -519,6 +684,14 @@ namespace DvMod.Autopilot
         /// <summary>The run's current speed limit, km/h; 0 without a run.</summary>
         internal static float RunLimitOf(string carGuid) =>
             runs.TryGetValue(carGuid, out var run) ? run.limitKmh : 0f;
+
+        /// <summary>The next planned move, as the web console's step list would
+        /// read it — "drive to CME", "cross J-217 and clear it" — or null
+        /// without a run or a plan. The console shows the whole list; the
+        /// tablet has one spare row, so it gets the step at the top.</summary>
+        internal static string? RunNextStepOf(string carGuid) =>
+            runs.TryGetValue(carGuid, out var run) && run.steps.Count > 0
+                ? run.steps[0].Describe() : null;
 
         public static string GetStatusJson()
         {
@@ -806,21 +979,18 @@ namespace DvMod.Autopilot
                 // deliberately, and the guess must not override it. A coupling move
                 // doesn't go round either: the cars are on this very track, so just
                 // drive up to them and hook on.
+                // The end to arrive by comes ONLY from a declared via junction. A
+                // dispatch to the track the train already stands on re-spots it
+                // along that track; it does not guess that a lap of the yard was
+                // meant. Guessing was worse than useless: the guess had to hold
+                // for the whole run, so it dragged the leftDest/reEntered state
+                // machine behind it, and when the road it wanted did not exist the
+                // run was left with a one-track plan it could not drive — the leg
+                // loop then span through its whole move budget without the train
+                // turning a wheel and reported "gave up after too many moves".
+                // Somebody who wants the train brought in the other end says so
+                // with a via junction, which is unambiguous and already supported.
                 bool? arriveEnteredIn = viaEnd;
-                if (viaEnd == null && viaJunction == null && !couple && path.Count == 1)
-                {
-                    var (lo, hi) = MarkerZone(start);
-                    bool farEndHigh = bogies[1].traveller.Span < (lo + hi) / 2.0;
-                    // Reaching the high end means entering by the high end, which is
-                    // the track's OUT end, hence enteredIn = false.
-                    arriveEnteredIn = !farEndHigh;
-                    var round = Routing.FindPath(
-                        start, destId, car, arriveEnteredIn, arrive, null, reversalPenalty);
-                    if (round == null)
-                        arriveEnteredIn = null; // no way round: leave it where it is
-                    else
-                        path = round;
-                }
                 var run = new Run(car, controller)
                 {
                     arriveEnteredIn = arriveEnteredIn,
@@ -835,6 +1005,20 @@ namespace DvMod.Autopilot
                     reversalPenalty = reversalPenalty,
                 };
                 runs[run.guid] = run;
+                LogSpotAtDispatch(car, run.destTrack, car.ID);
+                // Never spot against an invented window in silence. If the track's own
+                // marks could not be read, the run still goes — the dispatcher may not
+                // care, and refusing a move over a missing sign would be worse — but it
+                // says so, on the status line and in the log, instead of presenting a
+                // guessed stopping point as if it were surveyed.
+                if (run.destTrack != null && !MarkersAreReal(run.destTrack))
+                {
+                    run.detail = "marks for " + destId + " could not be read — "
+                        + "spotting against an ESTIMATED window";
+                    Main.mod?.Logger.Log(
+                        $"[SPOT] {car.ID} WARNING: {destId} has no readable marker signs; "
+                        + "using the fallback inset. The spot will be approximate.");
+                }
                 run.coroutine = Updater.Run(Drive(run, destId, cruiseKmh));
                 return new JObject
                 {
@@ -885,14 +1069,11 @@ namespace DvMod.Autopilot
                 var path = Routing.FindPath(start, destId, car, null, arrive);
                 if (path == null)
                     return Json("error", "no route to " + destId);
-                // Same rule as Start: a destination we already stand on means the
-                // runaround, so the plan must show that and not the empty route.
-                if (path.Count == 1)
-                {
-                    var (mlo, mhi) = MarkerZone(start);
-                    bool high = bogies[1].traveller.Span < (mlo + mhi) / 2.0;
-                    path = Routing.FindPath(start, destId, car, !high, arrive) ?? path;
-                }
+                // Same rule as Start, and it must STAY the same rule: a destination
+                // the train already stands on is a re-spot along that track, not a
+                // lap of the yard. This once guessed a runaround here while Start
+                // guessed separately, so the dry run showed an eleven-track plan for
+                // a move the drive loop then refused to make.
                 var legs = ComputeLegs(path);
 
                 string Id(RailTrack t) => t.LogicTrack()?.ID?.ToString() ?? "?";

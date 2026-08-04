@@ -57,9 +57,20 @@ namespace DvMod.Autopilot
                     }
                     if (bd > 8f)
                         continue; // sign belongs to another track
-                    var tmp = sh.GetType().GetField("trackID")?.GetValue(sh);
-                    var text = tmp?.GetType().GetProperty("text")?.GetValue(tmp) as string;
-                    if (text == part)
+                    // A track sign carries its id in TWO fields: the sub-yard letter
+                    // on its own (subYardID, "C") and the rest (trackID, "2I"). This
+                    // compared TrackPartOnly — "C2I", the whole thing — against the
+                    // trackID field alone, so it never matched a single sign on any
+                    // track in a lettered sub-yard. MarkerZone then fell back to a
+                    // flat 18 m inset off each physical end and EVERY spot on that
+                    // track aimed at an invented window: HB-C2I's real marks are at
+                    // 25 and 409 (384 m), the fallback claimed 18 and 416 (398 m),
+                    // and a 397 m cut therefore "fitted" by a metre when in truth it
+                    // was 13 m too long. The hunting, the overruns and the drive to
+                    // the buffer all came off that one number.
+                    var id = SignFieldText(sh, "trackID");
+                    var sub = SignFieldText(sh, "subYardID");
+                    if (id == part || sub + id == part)
                         spans.Add(best);
                 }
             }
@@ -77,6 +88,31 @@ namespace DvMod.Autopilot
             markerZones[track] = result;
             markerRetryAt.Remove(track);
             return result;
+        }
+
+        /// <summary>
+        /// Are this track's marks the REAL ones, read off its signs — or the invented
+        /// fallback window?
+        ///
+        /// MarkerZone answers with a window either way and says nothing about which,
+        /// so every caller has been treating a guess as a survey. A fabricated window
+        /// is not a small inaccuracy: it decides where the train stops, whether the
+        /// cut is judged to fit at all, and when the run calls itself arrived. Callers
+        /// that are about to act on it should ask this first and say so out loud.
+        /// </summary>
+        internal static bool MarkersAreReal(RailTrack track)
+        {
+            MarkerZone(track); // populates the cache on a hit
+            return markerZones.ContainsKey(track);
+        }
+
+        /// <summary>The text of one of a track sign's TMP label fields, or "" when the
+        /// field is absent. Reflective because DV.Signs.TrackSignHover's fields are not
+        /// part of any contract we can reference.</summary>
+        private static string SignFieldText(object sign, string field)
+        {
+            var tmp = sign.GetType().GetField(field)?.GetValue(sign);
+            return tmp?.GetType().GetProperty("text")?.GetValue(tmp) as string ?? "";
         }
 
         /// <summary>Parking zone for a track whose signs can't be read: a fixed
@@ -151,7 +187,20 @@ namespace DvMod.Autopilot
             if (off)
             {
                 double bogieSpan = Math.Max(0, ConsistLength(loco) - 2 * CarEndOverhang);
-                bool? way = towardHigh ?? SpotDirection(loco, destTrack);
+                // Direction used to come from MOTION alone, and motion says nothing at
+                // a stand — which is every dispatch, every re-plan, every restart after
+                // a block. With no direction the correction below was skipped entirely
+                // and the part of the train still OUTSIDE the track was treated as not
+                // existing: L-085 stood with 126 m of a 397 m cut on HB-C2I and reported
+                // 14.4 m still to run instead of 281. Every speed and stopping decision
+                // downstream was then planned against a number nearly 20x too small.
+                //
+                // It never needed motion. The cut hangs off ONE end of the track, and
+                // which end is plain geometry: the end its on-track bogies are bunched
+                // against. Travel has to be away from that end, because that is where
+                // the rest of the train still is.
+                bool? way = towardHigh ?? SpotDirection(loco, destTrack)
+                    ?? HangsOffLowEnd(destTrack, mn, mx);
                 if (way == true)
                     mn = Math.Min(mn, mx - bogieSpan);
                 else if (way == false)
@@ -165,10 +214,101 @@ namespace DvMod.Autopilot
             // marker we have already run past — so the max picks the live one.
             if (Oversize(loco, destTrack))
                 return Math.Max(0, Math.Max(-needUp, -needDown));
-            double remaining = Math.Max(0, Math.Max(needUp, needDown));
+
+            // DIRECTIONAL. This used to be Math.Max(0, Math.Max(needUp, needDown)) —
+            // an unsigned "how far off the marks am I", handed to a caller that reads
+            // it as "how much further do I have to travel". Those agree right up to
+            // the moment the train passes the marks, and then they invert: needUp goes
+            // negative, needDown goes positive and GROWS with every metre of overshoot,
+            // so the reported distance-to-run increases the further past the spot the
+            // train gets. ApproachSpeedKmh duly raises the target, the brake comes off,
+            // and the train accelerates away down the siding. That is the 60% - 100% -
+            // sail past the markers - 60% - accelerate sequence, and a more powerful
+            // loco simply leaves faster.
+            //
+            // Travelling in a known direction there is only ONE live term: the mark we
+            // are closing on. Past it, the distance still to run is zero, and it is the
+            // overshoot path's business, not this one's.
+            bool? going = towardHigh ?? SpotDirection(loco, destTrack)
+                ?? HangsOffLowEnd(destTrack, mn, mx);
+            double remaining;
+            if (going == true)
+                remaining = Math.Max(0, needUp);      // closing on the low mark
+            else if (going == false)
+                remaining = Math.Max(0, needDown);    // closing on the high mark
+            else
+                remaining = Math.Max(0, Math.Max(needUp, needDown));
             // Cars still off the track have to come on: at minimum the gap above, but
             // never report zero while part of the train is outside.
             return off ? Math.Max(remaining, ParkMargin) : remaining;
+        }
+
+        /// <summary>
+        /// Which end of the track the part of the cut that is NOT yet on it hangs off:
+        /// true when it trails off the LOW end, so travel runs toward increasing span.
+        /// Pure geometry, no motion needed — the on-track bogies bunch against the end
+        /// the rest of the train is still coming through.
+        /// </summary>
+        private static bool HangsOffLowEnd(RailTrack destTrack, double mn, double mx)
+        {
+            double span = PhysicalSpan(destTrack);
+            return mn <= span - mx;
+        }
+
+        /// <summary>
+        /// Which way to shuffle a train that is already ON its destination but not
+        /// yet inside the marks: true = toward increasing span, false = toward
+        /// decreasing, null = it is where it should be.
+        ///
+        /// The drive loop used to work this out itself, from the extent of the WHOLE
+        /// consist, as `mn &lt; lo || mx &lt;= hi` with an override for `mx &gt; hi &amp;&amp; mn &gt;= lo`.
+        /// That is wrong for the one case it most needs to get right: a cut too long
+        /// for the window straddles BOTH marks, so `mn &lt; lo` and `mx &gt; hi` hold at the
+        /// same time, the first clause answers "deeper", and the override cannot fire
+        /// because it demands `mn &gt;= lo`. The train then shoves further in on every
+        /// re-plan until the rail-end guard catches it, with the wagons long past both
+        /// markers. It also measured a different set of cars than the arrival test
+        /// does, so the two could never agree about where "there" was.
+        ///
+        /// This asks the same question DistanceToSpot answers, over the same cars, so
+        /// the direction the train is driven and the test that says it has arrived are
+        /// finally the same piece of arithmetic.
+        /// </summary>
+        private static bool? SpotShuffleDirection(TrainCar loco, RailTrack destTrack)
+        {
+            var (lo, hi) = MarkerZone(destTrack);
+            double m = hi - lo > 2 * ParkMargin ? ParkMargin : 0;
+            double mn = double.MaxValue, mx = double.MinValue;
+            foreach (var c in CarsToSpot(loco))
+                foreach (var b in c.Bogies)
+                    if (b?.track == destTrack)
+                    {
+                        mn = Math.Min(mn, b.traveller.Span);
+                        mx = Math.Max(mx, b.traveller.Span);
+                    }
+            if (mn > mx)
+                return null; // none of the spotted set is on it — nothing to shuffle
+
+            if (Oversize(loco, destTrack))
+            {
+                // It cannot be made to fit, so the job is to put ONE end on its far
+                // mark and leave the tail hanging. Pick whichever end is nearer to
+                // being right: that terminates, where "always deeper" did not.
+                double upMove = (hi - m) - mx;   // + to bring the high end onto its mark
+                double downMove = mn - (lo + m); // + to bring the low end onto its mark
+                if (Math.Abs(upMove) <= Math.Abs(downMove))
+                    return Math.Abs(upMove) <= ParkMargin ? (bool?)null : upMove > 0;
+                return Math.Abs(downMove) <= ParkMargin ? (bool?)null : downMove < 0;
+            }
+
+            double needUp = (lo + m) - mn;   // tail short of the low mark: go deeper
+            double needDown = mx - (hi - m); // front past the high mark: come back
+            // The cut fits, so at most one of these can be outstanding.
+            if (needUp > ParkMargin)
+                return true;
+            if (needDown > ParkMargin)
+                return false;
+            return null;
         }
 
         /// <summary>
@@ -207,16 +347,38 @@ namespace DvMod.Autopilot
             var (lo, hi) = MarkerZone(destTrack);
             double m = hi - lo > 2 * ParkMargin ? ParkMargin : 0;
             double mn = double.MaxValue, mx = double.MinValue;
+            bool off = false;
             foreach (var c in CarsToSpot(loco))
                 foreach (var b in c.Bogies)
                 {
-                    if (b == null || b.track != destTrack)
-                        return 0; // part of the train still off the track: not past anything
+                    if (b == null)
+                        continue;
+                    if (b.track != destTrack)
+                    {
+                        off = true;
+                        continue;
+                    }
                     mn = Math.Min(mn, b.traveller.Span);
                     mx = Math.Max(mx, b.traveller.Span);
                 }
             if (mn > mx)
                 return 0;
+            // A bogie off the track used to return 0 outright — "part of the train is
+            // still outside, so it cannot be past anything". That is true while a cut
+            // is running IN, and false for a cut that fills the siding: something is
+            // permanently off the end, so the guard returned 0 for ever and the
+            // overshoot branch never ran. The train sailed through the marks with
+            // nothing watching. Measure the same synthesised extent DistanceToSpot
+            // uses instead, so the length hanging off the end is accounted for rather
+            // than disabling the check.
+            if (off)
+            {
+                double bogieSpan = Math.Max(0, ConsistLength(loco) - 2 * CarEndOverhang);
+                if (towardHigh)
+                    mn = Math.Min(mn, mx - bogieSpan);
+                else
+                    mx = Math.Max(mx, mn + bogieSpan);
+            }
             if (towardHigh)
                 return mn > hi - m ? mn - (hi - m) : 0; // tail out beyond the high marker
             return mx < lo + m ? (lo + m) - mx : 0;     // tail out beyond the low marker
@@ -261,7 +423,25 @@ namespace DvMod.Autopilot
         private static bool Oversize(TrainCar loco, RailTrack destTrack)
         {
             var (lo, hi) = MarkerZone(destTrack);
-            return ConsistLength(loco) > Math.Max(0, hi - lo);
+            // Measure the SAME thing ConsistClearWithinDest measures, or the two
+            // disagree about whether a spot is even possible.
+            //
+            // This compared a coupler-to-coupler length against the RAW marker
+            // window, while the clearance test compares BOGIE spans against the
+            // window inset by ParkMargin at each end. Those differ by about 6 m,
+            // and any cut landing in that band was declared "fits" while being
+            // impossible to place: L-085's 397 m cut on HB-C2I's 398 m window
+            // needed its 393 m of bogie extent inside a 393 m target — zero slack
+            // — so Oversize said keep shuffling and the clearance test said not
+            // yet, for ever, and the train hunted up and down the siding.
+            //
+            // Slack on top, because a spot that only succeeds if every bogie lands
+            // to the centimetre is not a spot. Below that, treat it as too long:
+            // drive one end to its mark, leave the tail, and STOP.
+            double m = hi - lo > 2 * ParkMargin ? ParkMargin : 0;
+            double usable = Math.Max(0, (hi - m) - (lo + m));
+            double bogieExtent = Math.Max(0, ConsistLength(loco) - 2 * CarEndOverhang);
+            return bogieExtent > usable - SpotFitSlack;
         }
 
         /// <summary>True once our train has more cars than it set off with — the

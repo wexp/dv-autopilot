@@ -1384,5 +1384,40 @@ namespace DvMod.Autopilot
             // Same measurement and the same margin as JunctionShortfall — see the note
             // there. These two must never disagree.
             JunctionBlocker(junction, ours, OwnSwitchClearance + PullClearMargin) != null;
+
+        /// <summary>
+        /// The first switch on this leg that has to be thrown and cannot be, because
+        /// our own consist is standing on it.
+        ///
+        /// Asking BEFORE the leg starts is the whole point. The switch-setting pass
+        /// at the top of a leg throws away its result, so a refused throw was
+        /// invisible: the train rolled into the junction, took whichever leg the
+        /// points already lay on, found itself off-plan, and recovered by going the
+        /// long way round. That recovery is what made the move look like it had
+        /// chosen a daft road — the road was fine, it simply could not be taken from
+        /// where the train was standing.
+        ///
+        /// Read-only on purpose: this runs before the run has extended its
+        /// authority, and must not re-point junctions it does not yet hold.
+        /// </summary>
+        private static Junction? OwnConsistOnSwitchAhead(
+            TrainCar car, List<RailTrack> path, int s, int e)
+        {
+            var ours = car?.trainset;
+            if (ours == null)
+                return null;
+            for (int i = s; i < e && i + 1 < path.Count; i++)
+            {
+                var dj = DivergingJunction(path[i], path[i + 1]);
+                if (dj == null)
+                    continue; // a merge needs no throw — trailing points trail
+                var (junction, k) = dj.Value;
+                if (junction.selectedBranch == k)
+                    continue; // already lying our way, nothing to throw
+                if (ConsistFoulsJunction(junction, ours))
+                    return junction;
+            }
+            return null;
+        }
     }
 }

@@ -64,7 +64,7 @@ namespace DvMod.Autopilot
         /// per-loco read (slip, adhesion mass, temperatures) walks this group, not
         /// IsLoco across the trainset.
         /// </summary>
-        private static HashSet<TrainCar> MuGroup(TrainCar lead)
+        internal static HashSet<TrainCar> MuGroup(TrainCar lead)
         {
             var group = new HashSet<TrainCar> { lead };
             var queue = new Queue<TrainCar>();
@@ -475,8 +475,12 @@ namespace DvMod.Autopilot
         {
             run.state = status;
             run.detail = info;
+            // The last line of the run's account, and the one that matters most:
+            // every other way of finding out how a run ended meant reading the log.
+            run.Note($"{status.ToUpperInvariant()}: {info}");
             run.coroutine = null;
             ReleaseClaims(run); // an arrived or failed run must not hold the junction
+            LogSpot(run, status);
 
             // A finished shunt ties its cut down: handbrake on the first wagon, the
             // way a shunter pins a brake before stepping off. Optionally the loco
@@ -490,6 +494,84 @@ namespace DvMod.Autopilot
             {
                 Updater.Run(TieDownWhenStopped(run, info));
             }
+        }
+
+        /// <summary>
+        /// One line, at the moment a run ends, saying WHERE it actually stopped and
+        /// against what. Everything the spot decides on — the marker window, the
+        /// window's source (a real sign pair, or the fallback inset used when the
+        /// signs are not streamed in), the extent of the cars that had to fit, the
+        /// outstanding distance — lived only in run.detail, which nothing writes to
+        /// the log. A spot that lands wrong was therefore unarguable after the fact.
+        /// </summary>
+        private static void LogSpot(Run run, string status)
+        {
+            if (status != "arrived" && status != "coupled")
+                return;
+            LogSpot(run.car, run.destTrack, run.id, status);
+        }
+
+        /// <summary>The same figures at DISPATCH time. A spot that never finishes
+        /// never reaches Finish, so waiting for the arrival line to explain a run
+        /// that is still shuffling is waiting for ever.</summary>
+        internal static void LogSpotAtDispatch(TrainCar? car, RailTrack? dest, string id) =>
+            LogSpot(car, dest, id, "dispatch");
+
+        private static void LogSpot(TrainCar? car, RailTrack? dest, string id, string status)
+        {
+            if (car == null || dest == null)
+                return;
+            var (lo, hi) = MarkerZone(dest);
+            bool realSigns = markerZones.ContainsKey(dest);
+            double mn = double.MaxValue, mx = double.MinValue;
+            foreach (var c in CarsToSpot(car))
+                foreach (var b in c.Bogies)
+                    if (b?.track == dest)
+                    {
+                        mn = Math.Min(mn, b.traveller.Span);
+                        mx = Math.Max(mx, b.traveller.Span);
+                    }
+            string extent = mn > mx ? "none on dest" : $"{mn:F1}..{mx:F1}";
+            string destId = dest.LogicTrack()?.ID?.ToString() ?? "";
+            string source = realSigns ? "signs" : "FALLBACK inset";
+            // A fallback window means MarkerZone matched fewer than two signs. It is
+            // never obvious WHY: the signs may not be streamed, or they are there and
+            // the text it matches on is not the text they carry. Print the string we
+            // compare against and every sign text actually standing near this track,
+            // so the difference between "absent" and "mismatched" is one look.
+            string signs = "";
+            if (!realSigns)
+            {
+                var want = dest.LogicTrack()?.ID?.TrackPartOnly ?? "?";
+                var pts = dest.GetKinkedPointSet().points;
+                var move = WorldMover.currentMove;
+                var found = new List<string>();
+                foreach (var sh in Component.FindObjectsOfType<DV.Signs.TrackSignHover>())
+                {
+                    float bd = float.MaxValue;
+                    double at = 0;
+                    foreach (var p in pts)
+                    {
+                        float d = ((Vector3)p.position + move - sh.transform.position).magnitude;
+                        if (d < bd) { bd = d; at = p.span; }
+                    }
+                    if (bd > 12f)
+                        continue;
+                    var tmp = sh.GetType().GetField("trackID")?.GetValue(sh);
+                    var text = tmp?.GetType().GetProperty("text")?.GetValue(tmp) as string;
+                    found.Add($"'{text}'@{at:F0}({bd:F0}m)");
+                }
+                signs = $" want='{want}' near=[{string.Join(" ", found)}]";
+            }
+            Main.mod?.Logger.Log(
+                $"[SPOT] {id} {status} on {destId} "
+                + $"markers={lo:F1}..{hi:F1} ({source}) "
+                + $"physSpan={PhysicalSpan(dest):F1} "
+                + $"cut={ConsistLength(car):F1}m over {extent} "
+                + $"oversize={Oversize(car, dest)} "
+                + $"toSpot={DistanceToSpot(car, dest):F1} "
+                + $"clearWithin={ConsistClearWithinDest(car, destId, dest)}"
+                + signs);
         }
 
         /// <summary>Wait for the finished shunt to come to a stand, then pin the

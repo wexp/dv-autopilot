@@ -71,6 +71,34 @@ namespace DvMod.Autopilot
             return legs;
         }
 
+        /// <summary>
+        /// Has any part of the consist reached the leg's end track, or anything beyond
+        /// it on the plan? Asked of the WHOLE train, not the loco: a rake already lying
+        /// on the reversal track has reached the pivot however far back its loco still
+        /// is, and testing the loco's own path index alone meant the leg could not end
+        /// until the loco had been driven onto a track its wagons were already standing
+        /// on.
+        /// </summary>
+        private static bool ConsistReachedIndex(TrainCar loco, List<RailTrack> path, int e)
+        {
+            var cars = loco.trainset?.cars;
+            if (cars == null)
+                return false;
+            for (int i = e; i < path.Count; i++)
+            {
+                var t = path[i];
+                foreach (var c in cars)
+                {
+                    if (c == null)
+                        continue;
+                    foreach (var b in c.Bogies)
+                        if (b?.track == t)
+                            return true;
+                }
+            }
+            return false;
+        }
+
         /// <summary>The junction's number as the map and the console show it.</summary>
         private static int JunctionIndex(Junction? junction)
         {

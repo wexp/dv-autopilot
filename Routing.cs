@@ -426,8 +426,36 @@ namespace DvMod.Autopilot
             bool pushLeavingLow, pushLeavingHigh;
             var lb1 = loco != null && loco.Bogies != null && loco.Bogies.Length >= 2
                 ? loco.Bogies[1] : null;
-            bool wagonsFront = loco?.frontCoupler?.coupledTo != null;
-            bool wagonsRear = loco?.rearCoupler?.coupledTo != null;
+            // What leads is decided by the first car on that side that we are NOT
+            // driving. A bare "is anything coupled here" counted an MU'd locomotive
+            // as a wagon, so a lash-up with units at both ends read as wagons BOTH
+            // sides — and with both seeds then marked pushing, an arrive=Shove could
+            // only be satisfied by an EVEN number of reversals. The ordinary yard
+            // move (pull out, reverse in) is one reversal, odd, so it was rejected
+            // outright and the router went looking for somewhere to turn twice:
+            // HB-E9I -> HB-D7L came back as 27 tracks out of the yard. The rest of
+            // the mod already draws this distinction (MuGroup / WagonsTowardOut /
+            // CarsToSpot); the seed was the one place that did not.
+            var driven = loco != null ? Autopilot.MuGroup(loco) : null;
+            TrainCar? FirstOutside(Coupler? from)
+            {
+                var coupler = from;
+                var seen = new HashSet<TrainCar>();
+                while (coupler?.coupledTo != null)
+                {
+                    var next = coupler.coupledTo.train;
+                    if (next == null || !seen.Add(next))
+                        break;
+                    if (driven == null || !driven.Contains(next))
+                        return next;
+                    coupler = coupler.coupledTo.GetOppositeCoupler();
+                }
+                return null;
+            }
+            var frontLoad = FirstOutside(loco?.frontCoupler);
+            var rearLoad = FirstOutside(loco?.rearCoupler);
+            bool wagonsFront = frontLoad != null;
+            bool wagonsRear = rearLoad != null;
             if (lb1?.track == start && (wagonsFront || wagonsRear))
             {
                 bool frontHigh = lb1.TrackDirectionSign > 0;
@@ -435,10 +463,13 @@ namespace DvMod.Autopilot
                 bool wagonsBelow = (wagonsFront && !frontHigh) || (wagonsRear && frontHigh);
                 pushLeavingHigh = wagonsAbove;
                 pushLeavingLow = wagonsBelow;
+                // Name the first NON-DRIVEN car each side, and the driven group with
+                // it: "front=L-082" never said whether that unit was one of ours or a
+                // load, which is the whole question the seed turns on.
                 Main.mod?.Logger.Log(
                     $"[SEED] {loco!.ID} start={start.LogicTrack()?.ID} sign={lb1.TrackDirectionSign} "
-                    + $"front={(wagonsFront ? NameAcross(loco.frontCoupler) : "-")} "
-                    + $"rear={(wagonsRear ? NameAcross(loco.rearCoupler) : "-")} "
+                    + $"mu={(driven == null ? "?" : string.Join("+", driven.Select(c => c.ID)))} "
+                    + $"loadFront={(frontLoad?.ID ?? "-")} loadRear={(rearLoad?.ID ?? "-")} "
                     + $"spanLoco={lb1.traveller.Span:F0} "
                     + $"pushHigh={pushLeavingHigh} pushLow={pushLeavingLow}");
             }
@@ -541,8 +572,26 @@ namespace DvMod.Autopilot
                         if (exitIn == enteredIn && !onBridgeTrack
                             && !ReversalRoom(track, enteredIn, trainLength, occupancy))
                             continue;
-                        cost = (exitIn == enteredIn ? (onBridgeTrack ? 0.0 : reversalPenalty) : span)
-                            + busy;
+                        // What a reversal COSTS depends on how long the train is: before
+                        // the points can be thrown the whole consist must be drawn past
+                        // the pivot, which is a train's length of running the plan would
+                        // otherwise never see (the drive loop measures exactly that at
+                        // the time — PullRemaining / BehindPivotShortfall).
+                        //
+                        // ROAD MOVES ONLY. In a yard a change of ends is the ordinary way
+                        // of working — nearly every move into a siding is one — and
+                        // charging a 25-car rake ~400 m for it made the router go to
+                        // absurd lengths to dodge one: an intra-yard HB-E9I -> HB-D7L
+                        // came back as a 27-track plan out of the yard and round. That is
+                        // the exact failure YardReversalPenalty was tuned low to prevent,
+                        // so the length term is kept for the road, where stopping a main
+                        // line train to change ends really is worth going a long way to
+                        // avoid.
+                        bool roadMove = reversalPenalty >= LineReversalPenalty;
+                        double reversalCost = onBridgeTrack
+                            ? 0.0
+                            : reversalPenalty + (roadMove ? trainLength : 0.0);
+                        cost = (exitIn == enteredIn ? reversalCost : span) + busy;
                     }
 
                     // Leaving by the end we came in turns the train round, so the end
@@ -582,30 +631,73 @@ namespace DvMod.Autopilot
 
         /// <summary>
         /// Can a train of this length draw itself fully past a reversal on this
-        /// track? Walks from the track's far end along the switches as they lie,
-        /// accumulating clear rail; any stock in that overrun corridor, or the
-        /// rail simply ending, means the pivot has no room.
+        /// track? Looks beyond the pivot for enough clear rail to hold the whole
+        /// consist; stock in that overrun corridor, or the rail running out, means
+        /// the pivot has no room.
+        ///
+        /// Every road the switches COULD be set to counts, not merely the one they
+        /// happen to lie on now. Measuring by the current setting made a pivot look
+        /// roomless whenever a switch beyond it happened to point down a short
+        /// spur — so the router discarded the pivot ahead of the train and used one
+        /// behind it, and the train drew clear backwards down the road it had just
+        /// come up. Setting switches is the one thing the autopilot is certain to
+        /// do on its way through, so refusing to count a road it would have set was
+        /// measuring the wrong railway.
+        ///
+        /// Occupied rail is still no room: a road can be set, but stock standing on
+        /// it will not move for us.
         /// </summary>
         private static bool ReversalRoom(
             RailTrack track, bool enteredIn, double trainLength, Occupancy? occupancy)
         {
             double room = track.GetKinkedPointSet().span;
-            var current = track;
+            if (room >= trainLength)
+                return true;
             // Entered by the IN end means the far end is the OUT end.
-            bool outward = enteredIn;
-            var seen = new HashSet<RailTrack> { track };
-            while (room < trainLength)
+            int budget = ReversalProbeTracks;
+            return RoomBeyond(track, enteredIn, trainLength - room, occupancy,
+                new HashSet<RailTrack> { track }, ref budget);
+        }
+
+        /// <summary>How many tracks the overrun probe may look at before giving up.
+        /// It runs for every reversal candidate the search considers, so it has to
+        /// stay cheap; a yard ladder is a handful of short tracks and a running
+        /// line is one long one, so this reaches far enough for both.</summary>
+        private const int ReversalProbeTracks = 40;
+
+        /// <summary>
+        /// Is there <paramref name="needed"/> metres of clear, reachable rail off
+        /// this end of the track? Takes the first road that satisfies it — the
+        /// question is only whether the train FITS, so any road that holds it is
+        /// as good as another.
+        /// </summary>
+        private static bool RoomBeyond(
+            RailTrack current, bool outward, double needed, Occupancy? occupancy,
+            HashSet<RailTrack> seen, ref int budget)
+        {
+            var branches = outward ? current.GetAllOutBranches() : current.GetAllInBranches();
+            if (branches == null)
+                return false;
+            foreach (var branch in branches)
             {
-                var branch = outward ? current.GetOutBranch() : current.GetInBranch();
+                if (budget <= 0)
+                    return false;
                 if (branch?.track == null || !seen.Add(branch.track))
-                    return false;
-                current = branch.track;
-                outward = branch.first;
-                if (occupancy != null && occupancy.Any(current))
-                    return false;
-                room += current.GetKinkedPointSet().span;
+                    continue;
+                budget--;
+                if (occupancy == null || !occupancy.Any(branch.track))
+                {
+                    double span = branch.track.GetKinkedPointSet().span;
+                    if (span >= needed
+                        || RoomBeyond(branch.track, branch.first, needed - span,
+                            occupancy, seen, ref budget))
+                        return true;
+                }
+                // This road is no good; let another branch reach the same track by
+                // a different way round rather than writing it off for the search.
+                seen.Remove(branch.track);
             }
-            return true;
+            return false;
         }
 
         /// <summary>The track the loco with the given car GUID is sitting on — or the

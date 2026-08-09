@@ -207,6 +207,10 @@ namespace DvMod.Autopilot
             // it kills the drive coroutines where they stand, which would leave a loco
             // rolling with its throttle open.
             Autopilot.StopAllHere();
+            // Belt and braces: stopping the runs strips their markings, but a set
+            // left behind by a run that died some other way would outlive the mod
+            // and could not then be removed by anything.
+            Markings.UnfitAll();
             Tablet.Detach();
             Updater.Destroy();
         }

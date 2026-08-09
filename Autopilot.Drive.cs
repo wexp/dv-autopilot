@@ -97,9 +97,15 @@ namespace DvMod.Autopilot
                     yield break;
                 }
 
+                // Planning is the one thing here that can stall the game: it happens
+                // on the main thread, and Plan runs several full searches over the
+                // whole network when another train is out. Time it, so a freeze is
+                // a number in the status instead of something only the player feels.
+                var planClock = System.Diagnostics.Stopwatch.StartNew();
                 var path = Routing.FindPath(
                     track, destId, car, run.arriveEnteredIn,
                     run.arrive, run.avoid, run.reversalPenalty);
+                planClock.Stop();
                 if (path == null)
                 {
                     overrider.Brake?.Set(1f);
@@ -113,7 +119,11 @@ namespace DvMod.Autopilot
                 // instead of collapsing to one entry with a count.
                 run.Note($"planned {path.Count} tracks to {destId}"
                     + $" via {string.Join(" ", path.Skip(1).Take(4).Select(t => t.LogicTrack()?.ID?.ToString()))}"
-                    + (Routing.BlockedRoute ? " (through standing stock)" : ""));
+                    + (Routing.BlockedRoute ? " (through standing stock)" : "")
+                    // Only when it is slow enough to be felt — a number on every
+                    // line would bury the routing decision it is attached to.
+                    + (planClock.ElapsedMilliseconds >= 100
+                        ? $" [{planClock.ElapsedMilliseconds} ms]" : ""));
 
                 // The router falls back to the blocked road when there is no other, so
                 // a plan that still runs through it means there IS no way round. Say so
@@ -123,9 +133,16 @@ namespace DvMod.Autopilot
                 {
                     overrider.Throttle?.Set(0f);
                     overrider.Brake?.Set(1f);
+                    // Name the rail that beat us either way. "Blocked and no way
+                    // round" on its own is unactionable: it does not say what to
+                    // clear, and a dispatcher reading it has nothing to go on.
+                    string beatenBy = string.Join(", ", path
+                        .Where(t => run.avoid.Contains(t))
+                        .Select(t => t.LogicTrack()?.ID?.ToString() ?? "?")
+                        .Distinct());
                     Finish(run, "error", run.blockedReason.Length > 0
                         ? run.blockedReason + " — and there is no way round; clear it and start again"
-                        : "blocked and no way round");
+                        : $"no way round {beatenBy}; clear it and start again");
                     yield break;
                 }
 
@@ -155,8 +172,19 @@ namespace DvMod.Autopilot
                         // the road onward when we stand on the bridge, our own
                         // track when we are waiting to drive onto it.
                         var stall = onBridge ? path[1] : path[0];
+                        // The table is a block like any other. Winding one that
+                        // another run holds is how a second autopilot took the
+                        // bridge out from under the first at a roundhouse.
+                        if (!TurnFor(run, overBridge,
+                                () => Turntables.RotateBridgeTo(overBridge, stall),
+                                out string ttHolder))
+                        {
+                            run.detail = $"waiting for the turntable — {ttHolder} has it";
+                            run.Note($"waiting for the turntable — {ttHolder} has it");
+                            yield return WaitForSecondsRealtime(0.5f);
+                            continue;
+                        }
                         run.detail = $"turning the table to reach {path[1].LogicTrack()?.ID}";
-                        Turntables.RotateBridgeTo(overBridge, stall);
                         float turned = 0f;
                         while (!ExitIsOut(path[0], path[1]) && !EnterIsIn(path[0], path[1]))
                         {
@@ -197,10 +225,17 @@ namespace DvMod.Autopilot
                         overrider.Brake?.Set(1f);
                         while (car != null && Mathf.Abs(car.GetForwardSpeed()) * 3.6f > 0.3f)
                             yield return WaitForSecondsRealtime(0.2f);
+                        if (!TurnFor(run, tt0, () => Turntables.RotateBy180(tt0),
+                                out string halfHolder))
+                        {
+                            run.detail = $"waiting for the turntable — {halfHolder} has it";
+                            run.Note($"waiting for the turntable — {halfHolder} has it");
+                            yield return WaitForSecondsRealtime(0.5f);
+                            continue;
+                        }
                         run.detail = "winding the table half round — "
                             + (wantWagons ? "the dead weight" : "the loco")
                             + $" must meet {path[1].LogicTrack()?.ID}";
-                        Turntables.RotateBy180(tt0);
                         yield return WaitForSecondsRealtime(2f);
                         float wound = 0f;
                         while (!ExitIsOut(path[0], path[1]) && !EnterIsIn(path[0], path[1]))
@@ -327,6 +362,9 @@ namespace DvMod.Autopilot
                     while (Mathf.Abs(car.GetForwardSpeed()) * 3.6f > MovingKmh)
                         yield return WaitForSecondsRealtime(0.1f);
                     overrider.Reverser?.Set(backRev);
+                    // Backing clear runs its own loop, which never reaches the main
+                    // tick above, so it has to say so for itself.
+                    Markings.SetDirection(car, backRev >= 0.5f);
                     yield return WaitForSecondsRealtime(0.4f);
                     prevReverser = backRev;
 
@@ -375,7 +413,7 @@ namespace DvMod.Autopilot
                         ApplyThrottle(controller, ref bThrottle, car, tgt, sp,
                             run.profile, ref bLast, ref bAccel, ref run.accelBudget,
                             ref bSander, ref bDyn, ref bDynHandle, ref bDynCap,
-                            false, false, false);
+                            false, run.heatCap, false, false);
                         if (tgt < 0.8f && sp < 0.5f && stopIn < 1)
                             break; // pinned against something behind — cannot back further
                     }
@@ -540,7 +578,11 @@ namespace DvMod.Autopilot
             // restarted ten times a second while the train waits at the pit.
             bool bridgeAsked = false;
             // Independent brake pinned while the train pipe recharges at a stand.
+            // The flag is per-leg, so a leg that ended while pinned would hand the
+            // next one a loco brake hard on and no memory that it had applied it.
+            // Start every leg with it off; only the wait below may put it on.
             bool indepPinned = false;
+            overrider.IndependentBrake?.Set(0f);
             // Whether the train is creeping back onto marks it drove past, and
             // which way along the destination the spot was travelling (true =
             // toward increasing span), learned while moving.
@@ -549,7 +591,8 @@ namespace DvMod.Autopilot
             // Road runs slow on the dynamic, which pulls far more gently than air —
             // every planned slowing must start correspondingly earlier or the air
             // ends up doing the work anyway.
-            float planDecel = run.mode == AutopilotMode.Drive ? DynamicPlanDecel : StopDecel;
+            float planDecel = UseDynamicBrake && run.mode == AutopilotMode.Drive
+                ? DynamicPlanDecel : StopDecel;
 
             while (true)
             {
@@ -581,7 +624,7 @@ namespace DvMod.Autopilot
                 // (we know exactly which cars are ours) and the move carries on.
                 if (car.trainset?.cars != null
                     && car.trainset.cars.Count > run.carsAtStart
-                    && !(run.couple && GainedTouchesDest(run)))
+                    && !(run.couple && GainedIsTarget(run)))
                 {
                     overrider.Throttle?.Set(0f);
                     foreach (var c in car.trainset.cars.ToList())
@@ -600,6 +643,12 @@ namespace DvMod.Autopilot
                 }
 
                 float speed = Mathf.Abs(car.GetForwardSpeed()) * 3.6f; // km/h
+                // The average the ETA is built on. Seeded from the first reading
+                // rather than crept up from zero, or every run would report a
+                // wildly pessimistic time for its first minute and a half.
+                run.avgKmh = run.avgKmh <= 0f
+                    ? speed
+                    : run.avgKmh + (speed - run.avgKmh) * (DriveTick / EtaSmoothingSeconds);
                 // How far our own cars reach beyond the reference bogie, so switch and
                 // limit distances are measured from the front of the train.
                 double ownLeadHint = ConsistLengthAhead(car, reverser >= 0.5f);
@@ -621,7 +670,8 @@ namespace DvMod.Autopilot
                     float here = ConsistLimitKmh(car);
                     cachedLimit = PlannedLimitKmh(
                         track, bogie.traveller.Span, towardOut, ownLeadHint, here, LimitLookahead,
-                        run.mode == AutopilotMode.Drive ? DynamicPlanDecel : (float?)null);
+                        UseDynamicBrake && run.mode == AutopilotMode.Drive
+                            ? DynamicPlanDecel : (float?)null);
                     cachedNearSwitch = NearDivergingSwitch(car, path);
 
                     // Movement authority: hold enough rail ahead to brake in, with
@@ -640,6 +690,9 @@ namespace DvMod.Autopilot
                         out cachedAuthorityBlocked,
                         lastLeg ? int.MaxValue : e);
                     ReleaseJunctionsBehind(run, path, Math.Max(0, authIdx));
+                    ReleaseTurntablesBehind(run, path, Math.Max(0, authIdx));
+                    run.routeRemaining = RouteRemaining(
+                        path, authIdx, track, bogie.traveller.Span, towardOut);
                     PreemptWantedBlocks(run);
 
                     // Tripwire: any of our wheels on rail somebody else holds is a
@@ -828,22 +881,53 @@ namespace DvMod.Autopilot
                     }
 
                     // Only the DESTINATION's train is a coupling target. Anything
-                    // else in range - a rake parked on a leg of the route - is an
+                    // else in range — a rake parked on a leg of the route — is an
                     // obstacle, and hooking it dragged the D5I train around GF.
-                    bool destTrainNear = run.destTrack != null
-                        && ForeignStockOn(run.destTrack, car.trainset)
-                        && (AnyCarOnTrack(car, destId)
-                            || NextForeignIsOn(run.destTrack, car, track,
-                                bogie.traveller.Span, towardOut));
-                    bool inRange = destTrainNear && remote != null
-                        && remote.IsCouplerInRange(ExternalCouplingHandler.COUPLING_RANGE);
-                    if (inRange)
+                    //
+                    // This used to ask the remote-control interface to hook "whatever
+                    // is in range", behind a test that only established the train was
+                    // NEAR its destination. Neither half is target-aware:
+                    // IsCouplerInRange answers for the whole consist, and Couple()
+                    // takes the first free coupler it finds with the FRONT preferred,
+                    // so a tail brushing something behind us was coupled just as
+                    // readily as the train ahead. Worse, hooking the wrong thing
+                    // leaves GainedTouchesDest false, so coupledDone never latched and
+                    // the run went round again and hooked the next thing too — which
+                    // is how a couple run ended up joined to everything it touched.
+                    //
+                    // So the target is identified first and coupled explicitly: the
+                    // coupler at the end we are DRIVING toward, and only if what it
+                    // has found belongs to a train standing on the destination.
+                    var hookEnd = LeadingEnd(car, reverser >= 0.5f);
+                    Coupler? hook = hookEnd == null
+                        ? null
+                        : hookEnd.Value.forward
+                            ? hookEnd.Value.car.frontCoupler
+                            : hookEnd.Value.car.rearCoupler;
+                    Coupler? mate = hook != null && !hook.IsCoupled()
+                        ? hook.GetFirstCouplerInRange(ExternalCouplingHandler.COUPLING_RANGE)
+                        : null;
+                    // Standing on the destination ourselves settles it too: the cut
+                    // we came for can be parked with its bogies on the lead outside
+                    // the siding, and a jobless wagon is not filed under the marked
+                    // track at all. Refusing those left the loco shoving a cut it
+                    // never hooked, handbrakes and all.
+                    if (mate != null && run.destTrack != null
+                        && (TrainsetStandsOn(mate.train, run.destTrack)
+                            || AnyCarOnTrack(car, destId)))
                     {
                         // Close enough for the coupler to take: stop shoving and hook on.
                         overrider.Throttle?.Set(0f);
                         overrider.Brake?.Set(1f);
                         throttle = 0f;
-                        controller.RemoteControllerCouple();
+                        CouplerLogic.CoupleFirstInRange(hook!,
+                            ExternalCouplingHandler.COUPLING_RANGE,
+                            releaseHandbrakesOnCoupledCars: true);
+                        // What the game's own remote coupling does afterwards, so a
+                        // rake with locos in it behaves the same either way.
+                        if (hook!.IsCoupled())
+                            DV.MultipleUnit.MultipleUnitModule.ConnectCablesOfConnectedCouplersIfMultipleUnitSupported(
+                                hook, hook.coupledTo);
                         run.detail = $"{phase}: coupling to the train on {destId}";
                         yield return WaitForSecondsRealtime(0.5f);
                         continue;
@@ -903,12 +987,12 @@ namespace DvMod.Autopilot
                             done(true);
                             yield break;
                         }
-                        // A road move ends by pulling up on a running line, not by
-                        // being tucked between two markers, so it is not held to a
-                        // shunter's pace over the last stretch. On a 600 m main that
-                        // difference is the better part of two minutes.
+                        // A road move runs IN faster — it covers the length of a
+                        // main line to reach its destination, and holding it to a
+                        // shunter's pace for that is the better part of two minutes
+                        // on a 600 m track. What it does NOT get is a faster final
+                        // stop: the last metres are the same physics for both.
                         bool road = run.mode == AutopilotMode.Drive;
-                        float crawl = road ? DriveSpotKmh : SpotKmh;
                         float approach = road ? DriveApproachKmh : SpotApproachKmh;
                         if (onDest)
                         {
@@ -988,10 +1072,21 @@ namespace DvMod.Autopilot
                                 // Air does this stop, so plan it at the air's rate — the
                                 // gentle dynamic curve started the crawl far too early
                                 // AND still drifted past the marks it was aimed at.
-                                // The last metres go at walking pace: a marker window
-                                // barely a metre wide cannot be landed at 5 km/h.
-                                float creep = toSpot < FinalCreepZone ? FinalCreepKmh : crawl;
-                                float planned = ApproachSpeedKmh(creep, toSpot - ParkMargin, StopDecel);
+                                //
+                                // Plan all the way to a STAND at the spot, with the
+                                // walking-pace creep only as a floor so the train keeps
+                                // closing until it is there. This used to aim at a crawl
+                                // speed that then STEPPED DOWN to the creep inside the
+                                // last ten metres, and the step is not brakeable: a road
+                                // move reached the ten-metre mark at 16 km/h, needed 28 m
+                                // to stop from there, and duly ran 25 m past the spot on
+                                // SM-B3I. A shunt made the same mistake at 12 km/h and so
+                                // only ever overran by a couple of metres, which is why
+                                // this looked like a road-mode bug and is not one.
+                                // A curve with no step in it cannot be arrived at too
+                                // fast to brake, whatever the mode.
+                                float planned = Mathf.Max(FinalCreepKmh,
+                                    ApproachSpeedKmh(0f, toSpot - ParkMargin, StopDecel));
                                 target = Mathf.Min(Mathf.Min(cruiseKmh, approach), planned);
                                 run.detail = road
                                     ? $"{phase}: pulling up on {destId}, {toSpot:F0} m"
@@ -1087,18 +1182,40 @@ namespace DvMod.Autopilot
                         // fit; a light engine braking late at it went into the pit.
                         if (Turntables.AsBridge(track) != null && AllOnTrack(car, track))
                         {
-                            target = 0f;
+                            // Aboard, but "aboard" is not "in the middle": every
+                            // bogie being on the bridge only means the tail has
+                            // just cleared the pit, which leaves the train hard
+                            // against the near end. Creep on until the consist's
+                            // midpoint sits over the table's, so it turns about
+                            // its own centre and both ends have room.
+                            double? off = BridgeCentreError(car, track);
+                            bool centred = off == null
+                                || Math.Abs(off.Value) <= BridgeCentreTolerance;
+                            // Only creep the way we are already going. Having
+                            // overshot, stopping short of centre beats reversing
+                            // on a bridge for the sake of half a metre.
+                            target = !centred && (off!.Value > 0) == towardOut
+                                ? Mathf.Min(target, BridgeCentreKmh)
+                                : 0f;
                             if (speed < 0.5f && !bridgeAsked)
                             {
                                 var ttHere = Turntables.AsBridge(track);
                                 if (ttHere != null)
                                 {
-                                    Turntables.RotateBridgeTo(ttHere, path[bi + 1]);
-                                    bridgeAsked = true;
+                                    bridgeAsked = TurnFor(run, ttHere,
+                                        () => Turntables.RotateBridgeTo(ttHere, path[bi + 1]),
+                                        out string holdTt);
+                                    if (!bridgeAsked)
+                                    {
+                                        run.detail = $"{phase}: waiting for the turntable — {holdTt} has it";
+                                        run.Note($"waiting for the turntable — {holdTt} has it");
+                                    }
                                 }
                             }
                             if (bridgeAsked)
                                 run.detail = $"{phase}: waiting for the turntable bridge";
+                            else if (!centred)
+                                run.detail = $"{phase}: centring on the bridge ({off:+0.0;-0.0} m)";
                         }
                         else
                         {
@@ -1133,10 +1250,18 @@ namespace DvMod.Autopilot
                             && (wagonsOut.Value == stallAtOut) != wantWagons.Value
                             && AllOnTrack(car, track))
                         {
-                            run.detail = $"{phase}: half a turn more — "
-                                + (wantWagons.Value ? "the dead weight" : "the loco")
-                                + $" must meet {path[ji + 1].LogicTrack()?.ID}";
-                            Turntables.RotateBy180(joinedTt);
+                            if (TurnFor(run, joinedTt,
+                                    () => Turntables.RotateBy180(joinedTt), out string moreTt))
+                            {
+                                run.detail = $"{phase}: half a turn more — "
+                                    + (wantWagons.Value ? "the dead weight" : "the loco")
+                                    + $" must meet {path[ji + 1].LogicTrack()?.ID}";
+                            }
+                            else
+                            {
+                                run.detail = $"{phase}: waiting for the turntable — {moreTt} has it";
+                                run.Note($"waiting for the turntable — {moreTt} has it");
+                            }
                             // bridgeAsked stays latched; the next join is the other end
                         }
                         else
@@ -1216,27 +1341,42 @@ namespace DvMod.Autopilot
                                     done(false);
                                     yield break;
                                 }
+                                string ttHeld = "";
                                 if (onBridge != null && i >= 0 && i + 1 < path.Count)
                                 {
-                                    Turntables.RotateBridgeTo(onBridge, path[i + 1]);
-                                    bridgeAsked = true;
-                                }
-                                else if (leadB != null)
-                                {
-                                    bridgeAsked = Turntables.RequestBridgeAhead(
-                                        leadB.Value.bogie.track, leadB.Value.bogie.traveller.Span,
-                                        leadB.Value.towardOut, TurntableSlowZone + ownLead);
+                                    bridgeAsked = TurnFor(run, onBridge,
+                                        () => Turntables.RotateBridgeTo(onBridge, path[i + 1]),
+                                        out ttHeld);
                                 }
                                 else
                                 {
-                                    bridgeAsked = Turntables.RequestBridgeAhead(
-                                        track, bogie.traveller.Span, towardOut,
-                                        TurntableSlowZone + ownLead);
+                                    // Find the table first, RESERVE it, then wind.
+                                    // The old call did all three at once and could
+                                    // not be told to wait for anybody.
+                                    var ahead = leadB != null
+                                        ? Turntables.FindBridgeAhead(
+                                            leadB.Value.bogie.track,
+                                            leadB.Value.bogie.traveller.Span,
+                                            leadB.Value.towardOut, TurntableSlowZone + ownLead)
+                                        : Turntables.FindBridgeAhead(
+                                            track, bogie.traveller.Span, towardOut,
+                                            TurntableSlowZone + ownLead);
+                                    if (ahead != null)
+                                        bridgeAsked = TurnFor(run, ahead.Value.table,
+                                            () => Turntables.RotateBridgeTo(
+                                                ahead.Value.table, ahead.Value.stall),
+                                            out ttHeld);
+                                }
+                                if (!bridgeAsked && ttHeld.Length > 0)
+                                {
+                                    run.detail = $"{phase}: waiting for the turntable — {ttHeld} has it";
+                                    run.Note($"waiting for the turntable — {ttHeld} has it");
                                 }
                             }
-                            run.detail = bridgeAsked
-                                ? $"{phase}: waiting for the turntable bridge"
-                                : $"{phase}: holding — rail ends {railEnd:F0} m ahead";
+                            if (!run.detail.Contains("waiting for the turntable —"))
+                                run.detail = bridgeAsked
+                                    ? $"{phase}: waiting for the turntable bridge"
+                                    : $"{phase}: holding — rail ends {railEnd:F0} m ahead";
                         }
                     }
                 }
@@ -1269,12 +1409,29 @@ namespace DvMod.Autopilot
                         // Parked stock fouling the block never will: after a while
                         // write that road off and go round.
                         bool liveHolder = false;
+                        // The holder is EITHER another run's name OR a description of
+                        // what is physically in the way — a car id, or "stock standing
+                        // on X". Only the first can ever clear itself, which is the
+                        // whole basis of the wait-or-go-round decision below.
+                        string holderState = "not a run — standing in the way";
                         foreach (var r in runs.Values)
-                            if (r.coroutine != null && r.id == cachedAuthorityHolder)
+                            if (r.id == cachedAuthorityHolder)
                             {
-                                liveHolder = true;
+                                liveHolder = r.coroutine != null;
+                                holderState = liveHolder
+                                    ? $"running ({r.state})"
+                                    : $"NOT running ({r.state}) — should have released";
                                 break;
                             }
+                        // Whether we queue behind the holder or write the road off
+                        // turns entirely on this, and until now it decided in
+                        // silence. A block held by something that is not running is
+                        // the interesting case: a finished run releases its claims,
+                        // so still being told it holds one means the ledger and the
+                        // runs disagree.
+                        run.Note($"held short of {cachedAuthorityAt} — "
+                            + $"{(cachedAuthorityHolder.Length > 0 ? cachedAuthorityHolder : "someone")}"
+                            + $" has it, {holderState}");
                         if (!liveHolder)
                         {
                             authorityStallFor += DriveTick * LimitRecheckTicks;
@@ -1285,6 +1442,12 @@ namespace DvMod.Autopilot
                                 {
                                     run.detail = $"{phase}: {cachedAuthorityAt} is fouled"
                                         + " - looking for another way round";
+                                    // Record WHY this road was written off. Without it a
+                                    // later "no way round" carries no reason at all, and
+                                    // the run dies saying nothing about what beat it.
+                                    run.blockedReason = $"{cachedAuthorityAt} is fouled";
+                                    run.Note($"wrote off {cachedAuthorityAt} — fouled for "
+                                        + $"{authorityStallFor:F0}s; looking for another way round");
                                     done(true);
                                     yield break;
                                 }
@@ -1393,6 +1556,9 @@ namespace DvMod.Autopilot
                             if (run.avoid.Add(track))
                             {
                                 run.detail = $"{phase}: cars ahead on {here} — looking for another way round";
+                                run.blockedReason = $"cars standing on {here}";
+                                run.Note($"wrote off {here} — cars ahead for "
+                                    + $"{blockedFor:F0}s; looking for another way round");
                                 done(true);
                                 yield break;
                             }
@@ -1462,6 +1628,15 @@ namespace DvMod.Autopilot
                 // run — and on every trailing MU unit even with the player up front —
                 // it reports Nominal while the engine boils.
                 var (tempWarning, tempCritical) = EngineTempState(car);
+                // The ceiling the heat puts on the handle. Ratchets down as the
+                // temperature closes on the line and then holds, so the train
+                // settles at a power it can carry instead of cycling.
+                UpdateHeatCap(run, car, speed);
+                // Marker boards and headlights follow the reverser. Read here rather
+                // than at each Reverser.Set because the spot can turn the train round
+                // mid-approach, and one place that always sees the live value cannot
+                // miss one of those. It costs nothing when the direction is unchanged.
+                Markings.SetDirection(car, reverser >= 0.5f);
                 // The traction motors run their own separate heat budget and blow
                 // their own fuse (DeadTractionMotorsController) with no relation to
                 // the engine temperature, so a heavy pull could trip that fuse with
@@ -1474,7 +1649,10 @@ namespace DvMod.Autopilot
                     // restrictions at line speed. A shunt never gets fast enough
                     // for it to bite and just wants the air — and even on the
                     // road, a planned STOP is the air's job (see airStop).
-                    run.mode == AutopilotMode.Drive && !airStop,
+                    // Currently held off entirely by UseDynamicBrake: see the
+                    // constant for why the DH4 could not live with it.
+                    UseDynamicBrake && run.mode == AutopilotMode.Drive && !airStop,
+                    run.heatCap,
                     tempWarning || tmWarning,
                     tempCritical || tmCritical);
 
@@ -1543,6 +1721,18 @@ namespace DvMod.Autopilot
                     // again on the same grade should keep the power it has worked up.
                     stuckFor = Mathf.Max(0f, stuckFor - 0.2f);
                     fullPowerFor = 0f;
+                }
+
+                // Unpin OUTSIDE the watchdog. The pin is applied while the pipe
+                // charges, but it used to be released only in the same branch that
+                // applied it — so anything that ended the wait another way left the
+                // loco's own brake hard on with nothing to take it off: the target
+                // dropping to zero (held short of a block, or arrived), or the train
+                // beginning to roll. The next leg then tried to drive against it.
+                if (indepPinned && !(speed < 0.5f && target > 2f))
+                {
+                    overrider.IndependentBrake?.Set(0f);
+                    indepPinned = false;
                 }
             }
         }

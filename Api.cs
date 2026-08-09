@@ -57,6 +57,15 @@ namespace DvMod.Autopilot
         /// and driving can be run outside the game. Returns a JSON report.</summary>
         public static string DumpMap(string? dir) => MapDump.Write(dir);
 
+        /// <summary>Write every streamed-in loco type's handles and simulation
+        /// ports to controls.txt — what a machine has, as opposed to what the
+        /// drive loop assumes it has.</summary>
+        public static string DumpControls(string? dir) => ControlDump.Write(null, dir);
+
+        /// <summary>Write every gadget fitted to the cars streamed in, and every
+        /// gadget prefab loaded, to gadgets.txt.</summary>
+        public static string DumpGadgets(string? dir) => GadgetDump.Write(dir);
+
         private static ArriveMode ParseArrive(string? value) => value switch
         {
             "shove" => ArriveMode.Shove,

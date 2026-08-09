@@ -2,10 +2,12 @@ using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
+using System.Reflection;
 using System.Threading.Tasks;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using UnityEngine;
+using UnityModManagerNet;
 
 namespace DvMod.Autopilot
 {
@@ -209,9 +211,26 @@ namespace DvMod.Autopilot
         public static bool RequestBridgeAhead(
             RailTrack start, double startSpan, bool towardOut, double maxDist)
         {
+            var found = FindBridgeAhead(start, startSpan, towardOut, maxDist);
+            if (found == null)
+                return false;
+            RotateBridgeTo(found.Value.table, found.Value.stall);
+            return true;
+        }
+
+        /// <summary>
+        /// The same search without the wind: which table, and which stall of it,
+        /// the rail ahead dead-ends into. Split out so a caller that has to RESERVE
+        /// the table before touching it can find out what it is about to ask for —
+        /// winding first and asking afterwards is how two runs ended up fighting
+        /// over one bridge.
+        /// </summary>
+        public static (TurntableRailTrack table, RailTrack stall)? FindBridgeAhead(
+            RailTrack start, double startSpan, bool towardOut, double maxDist)
+        {
             EnsureIndex();
             if (stalls!.Count == 0)
-                return false;
+                return null;
 
             double cum = 0;
             RailTrack? t = start;
@@ -232,15 +251,14 @@ namespace DvMod.Autopilot
                 // Dead end. Only worth a wind when it is the PIT side of a stall
                 // — the far end of a roundhouse road is just a wall.
                 if (!stalls.TryGetValue(t, out var controller))
-                    return false;
+                    return null;
                 var tt = controller.turntable;
                 var end = tt?.GetTrackEnd(t);
                 if (tt == null || end == null || outward == end.isFirst)
-                    return false;
-                RotateBridgeTo(tt, t);
-                return true;
+                    return null;
+                return (tt, t);
             }
-            return false;
+            return null;
         }
 
         /// <summary>
@@ -268,6 +286,36 @@ namespace DvMod.Autopilot
         public static void RotateBy180(TurntableRailTrack tt)
         {
             Rotate(IdOf(tt), TurntableRailTrack.AngleRange0To360(tt.currentYRotation + 180f));
+        }
+
+        /* ------------------------------------------- who drives the table -- */
+
+        private static Assembly? rdAssembly;
+        private static MethodInfo? rdRotate;
+
+        /// <summary>
+        /// RemoteDispatch's own Turntables.Rotate(id, angle), or null when that
+        /// mod is absent or disabled. The ids agree: both sides derive them the
+        /// same way — uniqueID when the scene set one, else the table's fixed
+        /// world position — so an id from here names the same table there.
+        /// </summary>
+        private static MethodInfo? RemoteDispatchRotate()
+        {
+            var mod = UnityModManager.FindMod("RemoteDispatch");
+            if (mod?.Assembly == null || !mod.Active)
+            {
+                rdAssembly = null;
+                rdRotate = null;
+                return null;
+            }
+            if (!ReferenceEquals(rdAssembly, mod.Assembly))
+            {
+                rdAssembly = mod.Assembly;
+                rdRotate = rdAssembly.GetType("DvMod.RemoteDispatch.Turntables")
+                    ?.GetMethod("Rotate", BindingFlags.Public | BindingFlags.Static,
+                        null, new[] { typeof(string), typeof(float) }, null);
+            }
+            return rdRotate;
         }
 
         /* ---------------------------------------------------------- watch -- */
@@ -330,6 +378,43 @@ namespace DvMod.Autopilot
                 Updater.StopRun(previous);
 
             float goal = TurntableRailTrack.AngleRange0To360(angle);
+
+            // ONE driver per table. RemoteDispatch carries the same turn
+            // coroutine this file does — the two were written from the same
+            // source — and each keeps its own `turning` and `goals`. Turning the
+            // table ourselves therefore left its map with no goal to draw (it
+            // reads its own `goals`, which we never touch) and, worse, its
+            // Rotate only ever cancels a turn in ITS dictionary: a wind ordered
+            // from the web console while we were turning ran BOTH coroutines,
+            // each writing targetYRotation toward a different angle every frame.
+            // So when it is there, it drives and we ask. Resolved per call: the
+            // addon can be hot-reloaded, which swaps the assembly out from under
+            // any cached handle.
+            var handOver = RemoteDispatchRotate();
+            if (handOver != null)
+            {
+                try
+                {
+                    handOver.Invoke(null, new object[] { id, goal });
+                    Changed?.Invoke();
+                    return new JObject
+                    {
+                        ["id"] = id,
+                        ["target"] = Math.Round(goal, 2),
+                        ["rot"] = Math.Round(TurntableRailTrack.AngleRange0To360(
+                            controller.turntable.currentYRotation), 2),
+                        ["by"] = "remote-dispatch",
+                    }.ToString(Formatting.None);
+                }
+                catch (Exception e)
+                {
+                    // Its signature moved, or it threw. Turning the table matters
+                    // more than who does it — fall through and drive it here.
+                    Main.mod?.Logger.Log(
+                        $"[TURNTABLE] could not hand {id} to remote-dispatch, turning it here: {e.GetBaseException().Message}");
+                }
+            }
+
             goals[id] = goal;
             turning[id] = Updater.Run(Turn(controller, id, goal))!;
             Changed?.Invoke();

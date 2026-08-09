@@ -490,26 +490,19 @@ namespace DvMod.Autopilot
             };
             var dist = new Dictionary<(RailTrack, bool, bool, bool), double>();
             var prev = new Dictionary<(RailTrack, bool, bool, bool), (RailTrack, bool, bool, bool)?>();
-            var queue = new List<(double d, RailTrack t, bool enteredIn, bool seed, bool pushing)>();
+            var queue = new NodeHeap();
             foreach (var seed in seeds)
             {
                 dist[seed] = 0;
                 prev[seed] = null;
-                queue.Add((0, seed.Item1, seed.Item2, true, seed.Item4));
+                queue.Push(0, seed.Item1, seed.Item2, true, seed.Item4);
             }
             var visited = new HashSet<(RailTrack, bool, bool, bool)>();
             (RailTrack, bool, bool, bool)? goal = null;
 
             while (queue.Count > 0)
             {
-                // Linear extract-min: the network is only a couple thousand tracks,
-                // so a heap isn't worth the complexity.
-                int min = 0;
-                for (int i = 1; i < queue.Count; i++)
-                    if (queue[i].d < queue[min].d)
-                        min = i;
-                var (d, track, enteredIn, isSeed, pushing) = queue[min];
-                queue.RemoveAt(min);
+                var (d, track, enteredIn, isSeed, pushing) = queue.Pop();
                 var node = (track, enteredIn, isSeed, pushing);
                 if (!visited.Add(node))
                     continue;
@@ -609,7 +602,7 @@ namespace DvMod.Autopilot
                         {
                             dist[next] = nd;
                             prev[next] = node;
-                            queue.Add((nd, hop.track, hop.enteredIn, false, nextPushing));
+                            queue.Push(nd, hop.track, hop.enteredIn, false, nextPushing);
                         }
                     }
                 }
@@ -627,6 +620,80 @@ namespace DvMod.Autopilot
                 path.Add(c.Value.Item1);
             path.Reverse();
             return path;
+        }
+
+        /// <summary>
+        /// The search frontier, as a binary heap.
+        ///
+        /// This was a plain list scanned end to end for the minimum, on the
+        /// reasoning that the network is only a couple thousand tracks. But a NODE
+        /// is not a track — it is (track, entry end, seed, pushing), so the state
+        /// space is more like sixteen thousand, and both the scan and the RemoveAt
+        /// that followed it were linear. Planning a single move ran to hundreds of
+        /// millions of comparisons, and Plan runs the search several times over
+        /// when another train is out: dispatching a second autopilot froze the
+        /// game for seconds.
+        ///
+        /// Ties are broken by insertion order, which is what the linear scan did —
+        /// it kept the earliest index among equal distances. Equal-cost routes are
+        /// common (a yard is full of identical connectors), and the branch order
+        /// the graph offers is meaningful, so changing that would quietly change
+        /// which road the router picks.
+        /// </summary>
+        private sealed class NodeHeap
+        {
+            private readonly List<(double d, long seq, RailTrack t, bool enteredIn, bool seed, bool pushing)>
+                items = new List<(double, long, RailTrack, bool, bool, bool)>();
+            private long pushes;
+
+            public int Count => items.Count;
+
+            public void Push(double d, RailTrack track, bool enteredIn, bool seed, bool pushing)
+            {
+                items.Add((d, pushes++, track, enteredIn, seed, pushing));
+                int child = items.Count - 1;
+                while (child > 0)
+                {
+                    int parent = (child - 1) / 2;
+                    if (!Precedes(items[child], items[parent]))
+                        break;
+                    Swap(child, parent);
+                    child = parent;
+                }
+            }
+
+            public (double d, RailTrack t, bool enteredIn, bool seed, bool pushing) Pop()
+            {
+                var top = items[0];
+                items[0] = items[items.Count - 1];
+                items.RemoveAt(items.Count - 1);
+                int parent = 0;
+                while (true)
+                {
+                    int left = parent * 2 + 1, right = left + 1, best = parent;
+                    if (left < items.Count && Precedes(items[left], items[best]))
+                        best = left;
+                    if (right < items.Count && Precedes(items[right], items[best]))
+                        best = right;
+                    if (best == parent)
+                        break;
+                    Swap(parent, best);
+                    parent = best;
+                }
+                return (top.d, top.t, top.enteredIn, top.seed, top.pushing);
+            }
+
+            private static bool Precedes(
+                (double d, long seq, RailTrack t, bool enteredIn, bool seed, bool pushing) a,
+                (double d, long seq, RailTrack t, bool enteredIn, bool seed, bool pushing) b) =>
+                a.d < b.d || (a.d == b.d && a.seq < b.seq);
+
+            private void Swap(int i, int j)
+            {
+                var tmp = items[i];
+                items[i] = items[j];
+                items[j] = tmp;
+            }
         }
 
         /// <summary>
@@ -653,10 +720,44 @@ namespace DvMod.Autopilot
             double room = track.GetKinkedPointSet().span;
             if (room >= trainLength)
                 return true;
+
             // Entered by the IN end means the far end is the OUT end.
+            //
+            // Try the road as the switches ALREADY lie first. It is a single walk,
+            // it is the answer in the overwhelming majority of cases, and it costs
+            // a fraction of the branching probe below. That matters: this runs for
+            // every reversal candidate the search weighs, and the search itself
+            // runs several times over when another train is out — which is exactly
+            // when a stall would be noticed.
+            if (RoomAsSwitchesLie(track, enteredIn, trainLength, occupancy, room))
+                return true;
+
             int budget = ReversalProbeTracks;
             return RoomBeyond(track, enteredIn, trainLength - room, occupancy,
                 new HashSet<RailTrack> { track }, ref budget);
+        }
+
+        /// <summary>The old measure: one walk along the road as it is set. Cheap,
+        /// and usually enough — only when it comes up short is it worth asking what
+        /// the switches COULD be set to.</summary>
+        private static bool RoomAsSwitchesLie(
+            RailTrack track, bool enteredIn, double trainLength, Occupancy? occupancy, double room)
+        {
+            var current = track;
+            bool outward = enteredIn;
+            var seen = new HashSet<RailTrack> { track };
+            while (room < trainLength)
+            {
+                var branch = outward ? current.GetOutBranch() : current.GetInBranch();
+                if (branch?.track == null || !seen.Add(branch.track))
+                    return false;
+                current = branch.track;
+                outward = branch.first;
+                if (occupancy != null && occupancy.Any(current))
+                    return false;
+                room += current.GetKinkedPointSet().span;
+            }
+            return true;
         }
 
         /// <summary>How many tracks the overrun probe may look at before giving up.

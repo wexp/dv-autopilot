@@ -186,6 +186,41 @@ namespace DvMod.Autopilot
             return false;
         }
 
+        /// <summary>
+        /// Is this foreign car standing on the same leg as us, but FURTHER from the
+        /// frog than our own train is? Then it is behind us on the road we are
+        /// leaving, and nothing it does can foul our way through the junction.
+        ///
+        /// Only "further than us" counts. Stock between us and the frog is a real
+        /// obstruction and must still refuse the grant — the drive loop's own
+        /// proximity guard is what stops short of it.
+        /// </summary>
+        private static bool ParkedBehindUsAt(Junction junction, TrainCar fouler, Trainset? ours)
+        {
+            if (ours?.cars == null || fouler.Bogies == null)
+                return false;
+
+            RailTrack? leg = null;
+            foreach (var candidate in JunctionLegs(junction))
+                if (fouler.Bogies.Any(b => b?.track == candidate))
+                {
+                    leg = candidate;
+                    break;
+                }
+            if (leg == null)
+                return false; // on the frog itself, or off the junction entirely
+
+            double foulerGap = BodyDistanceToJunction(junction, fouler);
+            foreach (var c in ours.cars)
+            {
+                if (c?.Bogies == null || !c.Bogies.Any(b => b?.track == leg))
+                    continue;
+                if (BodyDistanceToJunction(junction, c) <= foulerGap)
+                    return true;
+            }
+            return false;
+        }
+
         /// <summary>Give up every reservation this run holds - tracks and junctions.</summary>
         private static void ReleaseClaims(Run run)
         {
@@ -197,6 +232,89 @@ namespace DvMod.Autopilot
                 if (junctionClaims.TryGetValue(j, out var guid) && guid == run.guid)
                     junctionClaims.Remove(j);
             run.claimedJunctions.Clear();
+            foreach (var tt in run.claimedTurntables)
+                if (turntableClaims.TryGetValue(tt, out var guid) && guid == run.guid)
+                    turntableClaims.Remove(tt);
+            run.claimedTurntables.Clear();
+        }
+
+        /// <summary>
+        /// Take the ORIENTATION of a turntable, or say who has it. Exclusive and
+        /// dispatch-ordered like a junction: whoever wound it first keeps it until
+        /// they are finished with it, because the bridge angle IS their route.
+        /// Without this a second run at another stall wound the table round while
+        /// the first was still standing on the bridge waiting for its own road.
+        /// </summary>
+        private static bool GrantTurntable(Run run, TurntableRailTrack tt, out string holder)
+        {
+            holder = "";
+            if (turntableClaims.TryGetValue(tt, out var guid))
+            {
+                if (guid == run.guid)
+                    return true;
+                // A dead run's claim would lock the table for the session.
+                if (runs.TryGetValue(guid, out var other)
+                    && (other.state == "driving" || other.state == "waiting"))
+                {
+                    holder = RunNameOf(guid);
+                    return false;
+                }
+                turntableClaims.Remove(tt);
+            }
+            if (WantedByOlder(tt, run, out holder))
+                return false;
+            turntableClaims[tt] = run.guid;
+            run.claimedTurntables.Add(tt);
+            return true;
+        }
+
+        /// <summary>
+        /// Wind a turntable on this run's behalf, if the run may have it. False
+        /// means somebody else holds the table and named it in <paramref
+        /// name="holder"/> — the caller stands still and asks again, exactly as it
+        /// would at a junction it could not get.
+        /// </summary>
+        private static bool TurnFor(Run run, TurntableRailTrack tt, Action turn, out string holder)
+        {
+            if (!GrantTurntable(run, tt, out holder))
+            {
+                RegisterWant(tt, run);
+                return false;
+            }
+            turn();
+            return true;
+        }
+
+        /// <summary>Hand back a turntable once the run has no further use for it:
+        /// no car of ours on the bridge, and no bridge left on the road ahead.
+        /// Held any longer, one shunt at a roundhouse would lock the table for
+        /// every other run until it finished its whole job.</summary>
+        private static void ReleaseTurntablesBehind(Run run, List<RailTrack> path, int pathIdx)
+        {
+            if (run.claimedTurntables.Count == 0)
+                return;
+            var ahead = new HashSet<TurntableRailTrack>();
+            for (int i = Math.Max(0, pathIdx); i < path.Count; i++)
+            {
+                var tt = Turntables.AsBridge(path[i]);
+                if (tt != null)
+                    ahead.Add(tt);
+            }
+            var done = new List<TurntableRailTrack>();
+            foreach (var tt in run.claimedTurntables)
+            {
+                if (ahead.Contains(tt))
+                    continue;
+                if (tt.Track != null && run.car != null && OurCarsOn(run.car, tt.Track))
+                    continue; // still standing on the bridge
+                done.Add(tt);
+            }
+            foreach (var tt in done)
+            {
+                if (turntableClaims.TryGetValue(tt, out var guid) && guid == run.guid)
+                    turntableClaims.Remove(tt);
+                run.claimedTurntables.Remove(tt);
+            }
         }
 
         /* ------------------------------------------- movement authority -- */
@@ -312,11 +430,19 @@ namespace DvMod.Autopilot
             {
                 if (fouler == null || fouler.trainset == ours)
                     continue;
-                if (BodyDistanceToJunction(junction, fouler) < JunctionGrantClearance)
-                {
-                    holder = fouler.ID;
-                    return false;
-                }
+                if (BodyDistanceToJunction(junction, fouler) >= JunctionGrantClearance)
+                    continue;
+                // Stock BEHIND us on the road we are leaving cannot obstruct our
+                // way through the frog: we are going out of that leg, not in past
+                // it. Refusing anyway stopped a light engine from using the very
+                // junction it was standing at, because other locos were parked
+                // behind it on the same siding — and the run then re-routed
+                // straight into them and gave up. The claims loop below has always
+                // drawn this distinction; the car check never did.
+                if (ParkedBehindUsAt(junction, fouler, ours))
+                    continue;
+                holder = fouler.ID;
+                return false;
             }
             // Legs: all free (or standing-only) before any is taken.
             foreach (var leg in JunctionLegs(junction))

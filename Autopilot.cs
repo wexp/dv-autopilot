@@ -143,6 +143,12 @@ namespace DvMod.Autopilot
             /// it on different track pairs an actual conflict.</summary>
             public readonly HashSet<Junction> claimedJunctions = new HashSet<Junction>();
 
+            /// <summary>Turntables this run holds the ORIENTATION of. Separate from
+            /// the bridge's track claim: the rail can be ours while the angle is
+            /// somebody else's, and the angle is what a turntable move is.</summary>
+            public readonly HashSet<TurntableRailTrack> claimedTurntables =
+                new HashSet<TurntableRailTrack>();
+
             /// <summary>How hard this kind of loco may be driven — see LocoProfiles.
             /// Read once at the start: the settings are edited between runs, not during.</summary>
             public readonly LocoProfile profile;
@@ -157,6 +163,30 @@ namespace DvMod.Autopilot
             /// they will do on the next, so the lesson must survive a reversal.
             /// Seeded on the first tick from the adhesion sum.</summary>
             public float accelBudget = float.MaxValue;
+
+            /// <summary>Ceiling the engine heat puts on the throttle, 0..1. On the
+            /// run for the same reason as the budget above: the grade and the load
+            /// that cooked the loco on this leg are still there on the next, and a
+            /// ceiling that reset at every leg boundary handed full power back to a
+            /// train that had just been pulled down for overheating.</summary>
+            public float heatCap = 1f;
+
+            /// <summary>Metres of planned route still ahead, and the speed the ETA
+            /// is figured from. The speed is a long average, not the current one:
+            /// an ETA computed from the needle reads "never" every time the train
+            /// is held at a block and "ten minutes" the moment it opens up, which
+            /// is no use to anyone watching a screen.</summary>
+            public double routeRemaining = double.MaxValue;
+            public float avgKmh;
+
+            /// <summary>Trend of the hottest driven unit, °C per second, and the
+            /// sampling state behind it. The ceiling moves on the TREND, not on the
+            /// reading: a loco sitting stable at 86 °C is carrying its load without
+            /// getting worse and has no business being pulled down to half power,
+            /// which is exactly what cutting on the reading alone did.</summary>
+            public float heatRise;
+            public float heatLastTemp = float.NaN;
+            public float heatSampleFor;
 
             /// <summary>Order this run was dispatched in. When two runs want the same
             /// rail, the one asked for first goes first — otherwise they take turns
@@ -251,9 +281,25 @@ namespace DvMod.Autopilot
                     ["dest"] = destTrack?.LogicTrack()?.ID?.ToString(),
                     ["track"] = bogie?.track?.LogicTrack()?.ID?.ToString(),
                     ["span"] = bogie == null ? null : (JToken)Math.Round(bogie.traveller.Span, 1),
-                    ["kmh"] = Math.Round(Math.Abs(car?.GetForwardSpeed() ?? 0f) * 3.6f, 1),
+                    // `car != null` and NOT `car?.`: a loco cleared out from under a
+                    // run (sandbox clear, restoration reset) leaves a DESTROYED
+                    // TrainCar, which is null only through Unity's own operator. The
+                    // null-conditional does a plain reference check, sails past it,
+                    // and GetForwardSpeed dies on the destroyed transform — once per
+                    // status poll, for as long as the finished run is listed.
+                    ["kmh"] = Math.Round(Math.Abs(car != null ? car.GetForwardSpeed() : 0f) * 3.6f, 1),
                     ["cars"] = car?.trainset?.cars?.Count ?? 0,
                     ["seq"] = seq,
+
+                    // How far there is left to go and when it should get there.
+                    // "remaining" counts the planned route ahead, so on a shunt
+                    // with reversals it reads short — the rail covered twice is
+                    // counted once.
+                    ["remaining"] = routeRemaining == double.MaxValue
+                        ? null : (JToken)Math.Round(routeRemaining),
+                    ["avgKmh"] = Math.Round(avgKmh, 1),
+                    ["etaSeconds"] = EtaSeconds() is double s ? (JToken)Math.Round(s) : null,
+                    ["eta"] = EtaText(),
 
                     // How far through the plan, and what it still has to cover.
                     ["pathFrom"] = pathFrom,
@@ -283,6 +329,12 @@ namespace DvMod.Autopilot
                         .Select(t => (JToken)(t.LogicTrack()?.ID?.ToString() ?? "?"))),
                     ["holdsJunctions"] = new JArray(claimedJunctions
                         .Select(j => (JToken)JunctionIndex(j))),
+                    // Turntables whose ORIENTATION this run owns. Without this on
+                    // the screen, two runs at one roundhouse look identical
+                    // whether they are queueing politely or fighting.
+                    ["holdsTurntables"] = new JArray(claimedTurntables
+                        .Select(t => (JToken)(t.Track?.LogicTrack()?.ID?.ToString()
+                            ?? t.uniqueID ?? "?"))),
 
                     // The run's own reasoning, oldest first. "count" above 1 means
                     // the decision was taken again and again — which is the shape a
@@ -305,14 +357,75 @@ namespace DvMod.Autopilot
                     json["brake"] = Math.Round(controls.Brake?.Value ?? 0f, 2);
                     json["dynamic"] = Math.Round(controls.DynamicBrake?.Value ?? 0f, 2);
                     json["reverser"] = Math.Round(controls.Reverser?.Value ?? 0f, 2);
+                    json["indep"] = Math.Round(controls.IndependentBrake?.Value ?? 0f, 2);
+                }
+                // The heat, per driven unit: the throttle backs off against these
+                // and there was no way to see it happening from outside the cab.
+                if (car != null)
+                {
+                    var temps = new JArray();
+                    foreach (var c in MuGroup(car))
+                    {
+                        var observer = c?.GetComponentInChildren<MultipleUnitStateObserver>();
+                        var simFlow = c?.SimController?.simFlow;
+                        if (observer == null || simFlow == null
+                            || string.IsNullOrEmpty(observer.temperaturePortId)
+                            || !simFlow.TryGetPort(observer.temperaturePortId, out var port, true))
+                            continue;
+                        temps.Add(new JObject
+                        {
+                            ["car"] = c!.ID,
+                            ["temp"] = Math.Round(port.Value, 1),
+                            ["warn"] = Math.Round(observer.overheatStandardThreshold, 1),
+                            ["crit"] = Math.Round(observer.overheatCriticalThreshold, 1),
+                        });
+                    }
+                    if (temps.Count > 0)
+                        json["temps"] = temps;
+                    json["heatCap"] = Math.Round(heatCap, 2);
+                    json["heatRise"] = Math.Round(heatRise, 3);
                 }
                 return json;
+            }
+
+            /// <summary>
+            /// Seconds to the destination at the average speed made so far, or
+            /// null when there is nothing sensible to say: the run is over, the
+            /// route length is unknown, or the train has not been moving.
+            /// Deliberately built on the average INCLUDING time spent standing —
+            /// a train that spends half its journey held at blocks really does
+            /// take twice as long, and an ETA that ignores that lies every time.
+            /// </summary>
+            private double? EtaSeconds()
+            {
+                if (state != "driving" && state != "waiting")
+                    return null;
+                if (routeRemaining == double.MaxValue || avgKmh < EtaMinKmh)
+                    return null;
+                return routeRemaining / (avgKmh / 3.6f);
+            }
+
+            /// <summary>The same figure for a human: "4 min", "1 h 12 min".</summary>
+            private string EtaText()
+            {
+                if (!(EtaSeconds() is double seconds))
+                    return "";
+                int total = (int)Math.Round(seconds);
+                int hours = total / 3600;
+                int minutes = (total % 3600) / 60;
+                if (hours > 0)
+                    return $"{hours} h {minutes} min";
+                if (minutes > 0)
+                    return $"{minutes} min";
+                return $"{total} s";
             }
 
             /// <summary>The bogie the whole mod measures this loco's position by.</summary>
             private Bogie? Bogie()
             {
-                var bogies = car?.Bogies;
+                if (car == null) // destroyed reads as null only through Unity's operator
+                    return null;
+                var bogies = car.Bogies;
                 return bogies != null && bogies.Length >= 2 ? bogies[1] : null;
             }
 
@@ -381,6 +494,16 @@ namespace DvMod.Autopilot
         private static readonly Dictionary<Junction, string> junctionClaims =
             new Dictionary<Junction, string>();
 
+        // Turntable blocks: exclusive, one holder, and NOT covered by the track
+        // claim on the bridge. Holding the bridge rail says nothing about which
+        // way the bridge POINTS, and pointing it is the whole move — so a second
+        // run could stand at another stall and wind the table out from under the
+        // first, which is exactly what happened when two runs were dispatched at
+        // one roundhouse. The claim covers the ORIENTATION, and it is held from
+        // the first wind until the run has no further use for the table.
+        private static readonly Dictionary<TurntableRailTrack, string> turntableClaims =
+            new Dictionary<TurntableRailTrack, string>();
+
         // Dispatch-order queueing: a run stopped at a block it could not get says so
         // here every authority pass; a LATER-dispatched run must not grab that block
         // out from under it. Entries go stale in a few seconds so a run that moved
@@ -396,8 +519,16 @@ namespace DvMod.Autopilot
         private const double AuthorityMaxMeters = 1200.0;
         private const float AuthorityBrakeFactor = 1.5f;
         private const double AuthorityPad = 50.0;
-        /// <summary>Stop this far short of the end of held rail, m.</summary>
-        private const double SignalMargin = 10.0;
+        /// <summary>
+        /// Stop this far short of the end of held rail, m.
+        ///
+        /// Must exceed JunctionGrantClearance. At 10 m a train that pulled up at
+        /// its limit came to a stand INSIDE the 15 m no-grant zone of the frog
+        /// ahead — so it fouled a junction it had never been granted, and the run
+        /// waiting for that junction could not be given it either. Two trains then
+        /// held each other up over rail neither was using.
+        /// </summary>
+        private const double SignalMargin = 20.0;
         /// <summary>A junction block is only handed back once the tail is THIS far
         /// past it, m of body clearance. The switch-clearance margin (~5 m) was
         /// enough to throw points but not to admit the next train: a follower's
@@ -427,6 +558,14 @@ namespace DvMod.Autopilot
         // ended as an air stop. Plan gentler and the braking starts earlier
         // instead, far enough out that the dynamic alone usually makes it.
         private const float DynamicPlanDecel = 0.18f;
+        // ...but the dynamic is SWITCHED OFF for now. On the DH4 the retarder
+        // churns the same transmission oil the temperature gauge reads, so
+        // slowing on it cooked the loco - and the overheat handling then
+        // alternated air and dynamic without ever settling into a real brake
+        // application, because the tempWarning branch below only bites while
+        // the throttle is still open and during braking it is already shut.
+        // Nothing is deleted: flip this back to true to have it all again.
+        private const bool UseDynamicBrake = false;
 
         // Never open the throttle past this — a full-power launch spins the wheels
         // and cooks the traction motors. Notch up/down at these rates per 0.1 s
@@ -441,6 +580,54 @@ namespace DvMod.Autopilot
         // s. The slip signal flickers around the threshold as grip comes and goes,
         // and following it directly clicked the sander on and off every tick.
         private const float SanderHoldSeconds = 4f;
+        // Heat management works off a MARGIN below each loco's own serialized
+        // overheat threshold (DH4: 90 warning), never off absolute degrees — the
+        // thresholds differ per machine. Waiting for the threshold itself is far
+        // too late on a hydraulic: by then the oil is on the mark and still
+        // climbing on heat already stored in the transmission.
+        //
+        // Margins below the loco's own warning line. Within 2 °C of it the
+        // ceiling eases down; within 1 °C it comes down hard. Anywhere cooler,
+        // and not still climbing, it works its way back up.
+        //
+        // These sit deliberately CLOSE to the line: on a DH4 (warning 90) that
+        // is easing off at 88 and cutting hard at 89, so the loco is worked at
+        // the top of its usable range instead of being nursed. Backing off at
+        // 85 threw away five degrees of perfectly good engine and left a heavy
+        // train unable to hold its speed uphill for no thermal benefit — the
+        // buzzer is at 90 and nothing below it costs anything.
+        private const float PreOverheatMargin = 2f;
+        private const float HardOverheatMargin = 1f;
+        // Rates the ceiling moves at, per second. Cutting is far faster than
+        // recovery on purpose: back off hard, come back gently.
+        private const float HeatCapCutFast = 0.5f;
+        private const float HeatCapCutSlow = 0.08f;
+        private const float HeatCapRecover = 0.02f;
+        // Window the temperature trend is measured over, s, and the rise that
+        // counts as "still climbing", °C/s. Below it the loco is thermally steady
+        // and keeps the power it has, however warm the reading.
+        private const float HeatTrendSeconds = 2f;
+        private const float HeatRiseEpsilon = 0.02f;
+        // Time constant of the average speed the ETA is built on, s. Long enough
+        // that signal checks and yard crawls are absorbed rather than swinging
+        // the estimate about; short enough to follow a genuine change of pace.
+        private const float EtaSmoothingSeconds = 90f;
+        // Below this the average is treated as "not moving" and no ETA is given
+        // at all, rather than dividing by something near zero and reporting a
+        // number of hours that means nothing, km/h.
+        private const float EtaMinKmh = 1.5f;
+        // The ceiling never goes below this: a cut that forbids movement cools
+        // nothing and just reads as a stuck train. Low enough, though, that it
+        // can actually arrest a climb — half power on a long bank could not, so
+        // the temperature crept past the band to the buzzer anyway and the cap
+        // was decoration.
+        private const float HotThrottleCapHard = 0.4f;
+        // Working hard below this speed is where a hydraulic transmission dumps
+        // most of its heat: the engine is at full revs and the converter is
+        // slipping against wheels that are barely turning, so the difference goes
+        // into the oil rather than into the rail. While warm, cap harder there.
+        private const float ConverterSlipKmh = 20f;
+        private const float HotThrottleCapLow = 0.75f;
         // Dynamic braking: below this speed a dynamic fades to nothing, km/h.
         private const float DynamicBrakeMinKmh = 8f;
         // The dynamic handle RAMPS instead of snapping to the speed error. Snapping
@@ -533,14 +720,16 @@ namespace DvMod.Autopilot
         // is on it), so the slow-down doesn't overshoot, km/h.
         private const float SpotApproachKmh = 15f;
         // Slow crawl once a car is on the destination — accurate spot, minimal coast,
-        // km/h.
+        // km/h. Used for backing onto the marks after an overshoot; the forward spot
+        // itself is planned to a stand rather than to a crawl.
         private const float SpotKmh = 5f;
-        // The same two speeds for a road move, which finishes by stopping on a running
-        // line rather than spotting between markers. A main line is long: held to the
-        // shunting figures, a train that had already arrived spent minutes crawling up
-        // its own destination.
+        // Approach speed for a road move, which may have to cover the whole length of
+        // a main line to reach its destination. Held to the shunting figure, a train
+        // that had already arrived spent minutes crawling up its own destination.
+        // There is deliberately no road equivalent of SpotKmh: the final stop is the
+        // same physics whatever the move, and giving the road a faster one is what
+        // put a 13-car train 25 m past its spot on SM-B3I.
         private const float DriveApproachKmh = 40f;
-        private const float DriveSpotKmh = 12f;
         // How far to pull into the destination track before stopping, m.
         private const float InsertionDepth = 12f;
         // Once the whole train is on the destination, pull this much DEEPER so the
@@ -608,6 +797,13 @@ namespace DvMod.Autopilot
         // Turntables are taken at walking pace: the crossing cap, km/h, and how far
         // out (m, to the front of the train) it starts applying.
         private const float TurntableKmh = 8f;
+        // Once aboard, creep on until the consist's middle is over the table's,
+        // at this speed and to within this much. "Every bogie is on the bridge"
+        // only means the tail has just cleared the pit, which parks the train
+        // hard against the near end and swings its far end out over the pit
+        // when the table turns.
+        private const float BridgeCentreKmh = 3f;
+        private const double BridgeCentreTolerance = 0.75;
         private const double TurntableSlowZone = 50.0;
         // What another run's rail costs to route over, m of equivalent rail. A track
         // it has RESERVED is dearer than one merely on its remaining plan: the claim
@@ -621,9 +817,9 @@ namespace DvMod.Autopilot
         // out. Within a couple of metres nobody would touch the handle again;
         // beyond that the spot is simply missed, m.
         private const double OvershootAcceptMeters = 3.0;
-        // Inside this distance of the marks the crawl drops to walking-onto-the-
-        // marks pace, so a metre-wide marker window is not hit at 5 km/h, m.
-        private const double FinalCreepZone = 10.0;
+        // Floor under the planned approach speed, km/h. The spot is planned to a
+        // stand, which alone would ask for zero before the train is there and leave
+        // it stalled short; this keeps it walking onto the marks instead.
         private const float FinalCreepKmh = 2f;
         // How long the train may read as off its planned road before the leg is
         // abandoned and re-planned, s. Long enough to ride out the tick or two where a
@@ -699,7 +895,30 @@ namespace DvMod.Autopilot
             {
                 var all = new JObject();
                 foreach (var kv in runs)
-                    all[kv.Key] = kv.Value.ToJson();
+                {
+                    try
+                    {
+                        all[kv.Key] = kv.Value.ToJson();
+                    }
+                    catch (Exception e)
+                    {
+                        // One run that cannot describe itself used to take the
+                        // WHOLE status down: the task faulted, .Result rethrew,
+                        // and remote-dispatch turned the lot into "the Autopilot
+                        // addon threw — see its log" — with nothing in any log,
+                        // because nobody on either side ever printed it. Report
+                        // the one broken run in place, name the fault where it
+                        // can actually be read, and let the others through.
+                        Main.mod?.Logger.Log($"[STATUS] {kv.Value.id} could not be described: {e}");
+                        all[kv.Key] = new JObject
+                        {
+                            ["state"] = "error",
+                            ["detail"] = $"status failed: {e.GetType().Name}: {e.Message}",
+                            ["loco"] = kv.Value.id,
+                            ["guid"] = kv.Value.guid,
+                        };
+                    }
+                }
                 return all.ToString(Formatting.None);
             }).Result;
         }
@@ -1005,6 +1224,9 @@ namespace DvMod.Autopilot
                     reversalPenalty = reversalPenalty,
                 };
                 runs[run.guid] = run;
+                // Mark the loco as driving itself, so anybody looking at the
+                // train from outside can see it without opening a status page.
+                Markings.Fit(car);
                 LogSpotAtDispatch(car, run.destTrack, car.ID);
                 // Never spot against an invented window in silence. If the track's own
                 // marks could not be read, the run still goes — the dispatcher may not
@@ -1410,6 +1632,7 @@ namespace DvMod.Autopilot
                 return false;
             runs.Remove(guid);
             ReleaseClaims(run);
+            Markings.Unfit(guid);
             if (run.coroutine != null)
                 Updater.StopRun(run.coroutine);
             // The loco can have been despawned since; a destroyed TrainCar compares

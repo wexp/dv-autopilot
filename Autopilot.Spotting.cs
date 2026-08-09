@@ -156,7 +156,7 @@ namespace DvMod.Autopilot
         private static double DistanceToSpot(
             TrainCar loco, RailTrack destTrack, bool? towardHigh = null)
         {
-            var (lo, hi) = MarkerZone(destTrack);
+            var (lo, hi) = SpotZone(loco, destTrack);
             double m = hi - lo > 2 * ParkMargin ? ParkMargin : 0;
             double mn = double.MaxValue, mx = double.MinValue;
             bool off = false;
@@ -276,7 +276,7 @@ namespace DvMod.Autopilot
         /// </summary>
         private static bool? SpotShuffleDirection(TrainCar loco, RailTrack destTrack)
         {
-            var (lo, hi) = MarkerZone(destTrack);
+            var (lo, hi) = SpotZone(loco, destTrack);
             double m = hi - lo > 2 * ParkMargin ? ParkMargin : 0;
             double mn = double.MaxValue, mx = double.MinValue;
             foreach (var c in CarsToSpot(loco))
@@ -344,7 +344,7 @@ namespace DvMod.Autopilot
         {
             if (Oversize(loco, destTrack))
                 return 0;
-            var (lo, hi) = MarkerZone(destTrack);
+            var (lo, hi) = SpotZone(loco, destTrack);
             double m = hi - lo > 2 * ParkMargin ? ParkMargin : 0;
             double mn = double.MaxValue, mx = double.MinValue;
             bool off = false;
@@ -414,34 +414,69 @@ namespace DvMod.Autopilot
         }
 
         /// <summary>
-        /// True when the train is longer than the destination's marker zone, so no
-        /// amount of driving will ever get every bogie inside it. Such a move is still
-        /// worth making — filling the siding and leaving the tail over the throat is
-        /// exactly what a real shunter does — but the arrival tests have to be told,
-        /// or the run drives past its destination looking for a fit that cannot happen.
+        /// The window a spot is actually driven to. Normally the marker zone — that
+        /// is where the signs say to leave a train.
+        ///
+        /// When the cut is too long for the signs but the RAIL can still hold it,
+        /// the signs are the wrong target: aiming at a marker means deliberately
+        /// leaving the tail hanging over the throat, and the arrival test — every
+        /// bogie inside the window — can then never be satisfied. That is how a
+        /// 211.8 m cut on FF-D1L (marker window 214 m, 264 m of rail) shuffled up
+        /// and down the siding and was re-dispatched five times: 1.8 m short of a
+        /// fit by the sign window, with 52 m of rail to spare.
+        ///
+        /// So fall back to the rail itself, inset for switch clearance exactly as a
+        /// track with no readable signs is. The train ends up fully on the siding,
+        /// clear of the throat, with its tail past the marker sign — which is where
+        /// a shunter would leave it. Only a cut too long for the RAIL keeps the old
+        /// behaviour: one end on its mark, tail where it falls.
         /// </summary>
-        private static bool Oversize(TrainCar loco, RailTrack destTrack)
+        private static (double lo, double hi) SpotZone(TrainCar loco, RailTrack destTrack)
         {
             var (lo, hi) = MarkerZone(destTrack);
-            // Measure the SAME thing ConsistClearWithinDest measures, or the two
-            // disagree about whether a spot is even possible.
-            //
-            // This compared a coupler-to-coupler length against the RAW marker
-            // window, while the clearance test compares BOGIE spans against the
-            // window inset by ParkMargin at each end. Those differ by about 6 m,
-            // and any cut landing in that band was declared "fits" while being
-            // impossible to place: L-085's 397 m cut on HB-C2I's 398 m window
-            // needed its 393 m of bogie extent inside a 393 m target — zero slack
-            // — so Oversize said keep shuffling and the clearance test said not
-            // yet, for ever, and the train hunted up and down the siding.
-            //
-            // Slack on top, because a spot that only succeeds if every bogie lands
-            // to the centimetre is not a spot. Below that, treat it as too long:
-            // drive one end to its mark, leave the tail, and STOP.
+            if (Fits(loco, lo, hi))
+                return (lo, hi);
+            var rail = FallbackZone(destTrack);
+            return Fits(loco, rail.lo, rail.hi) ? rail : (lo, hi);
+        }
+
+        /// <summary>Can the spotted cut be placed inside this window at all? Measures
+        /// the SAME thing ConsistClearWithinDest measures — bogie extent against the
+        /// window inset by ParkMargin at each end — or the two disagree about whether
+        /// a spot is even possible.
+        ///
+        /// This compared a coupler-to-coupler length against the RAW window, while the
+        /// clearance test compares BOGIE spans against the inset one. Those differ by
+        /// about 6 m, and any cut landing in that band was declared "fits" while being
+        /// impossible to place: L-085's 397 m cut on HB-C2I's 398 m window needed its
+        /// 393 m of bogie extent inside a 393 m target — zero slack — so Oversize said
+        /// keep shuffling and the clearance test said not yet, for ever, and the train
+        /// hunted up and down the siding.
+        ///
+        /// Slack on top, because a spot that only succeeds if every bogie lands to the
+        /// centimetre is not a spot.</summary>
+        private static bool Fits(TrainCar loco, double lo, double hi)
+        {
             double m = hi - lo > 2 * ParkMargin ? ParkMargin : 0;
             double usable = Math.Max(0, (hi - m) - (lo + m));
             double bogieExtent = Math.Max(0, ConsistLength(loco) - 2 * CarEndOverhang);
-            return bogieExtent > usable - SpotFitSlack;
+            return bogieExtent <= usable - SpotFitSlack;
+        }
+
+        /// <summary>
+        /// True when the train is longer than the window it is being spotted into —
+        /// the signs, or the rail itself when the signs are the tighter of the two —
+        /// so no amount of driving will ever get every bogie inside it. Such a move
+        /// is still worth making: filling the siding and leaving the tail over the
+        /// throat is exactly what a real shunter does. But the arrival tests have to
+        /// be told, or the run drives past its destination looking for a fit that
+        /// cannot happen. Below this line: one end on its mark, tail where it falls,
+        /// and STOP.
+        /// </summary>
+        private static bool Oversize(TrainCar loco, RailTrack destTrack)
+        {
+            var (lo, hi) = SpotZone(loco, destTrack);
+            return !Fits(loco, lo, hi);
         }
 
         /// <summary>True once our train has more cars than it set off with — the
@@ -466,10 +501,38 @@ namespace DvMod.Autopilot
             return false;
         }
 
+        /// <summary>
+        /// Is what we just picked up the train we came for? Standing ON the
+        /// destination is the plain case, and the only one that can be trusted while
+        /// we are still on the way in.
+        ///
+        /// But "the train on SW-B3I" is not always filed under SW-B3I. A cut left at
+        /// the mouth of a siding can have every bogie on the yard lead outside it,
+        /// and a jobless wagon dumped wherever there was room is not on the marked
+        /// track at all. For those the strict test says no, and the consequences are
+        /// not "no coupling": buffers touching couple THEMSELVES, so the run gained
+        /// the cars, the unwanted-gain guard cut them straight off again, and the
+        /// loco went on shoving a cut it was not coupled to — with that cut's
+        /// handbrakes still pinned, which is what made it work so hard.
+        ///
+        /// So a gain also counts once our OWN train is standing on the destination:
+        /// at that point we are there, and what the leading end has just hooked is
+        /// what was standing in the way. En route — the case the guard exists for —
+        /// nothing changes.
+        /// </summary>
+        private static bool GainedIsTarget(Run run)
+        {
+            if (GainedTouchesDest(run))
+                return true;
+            var car = run.car;
+            var destId = run.destTrack?.LogicTrack()?.ID?.ToString();
+            return car != null && destId != null && AnyCarOnTrack(car, destId);
+        }
+
         private static bool Coupled(Run run)
         {
             int now = run.car?.trainset?.cars?.Count ?? 0;
-            return now > run.carsAtStart && GainedTouchesDest(run);
+            return now > run.carsAtStart && GainedIsTarget(run);
         }
 
         /// <summary>True when no bogie of our consist is on the given track.</summary>
@@ -480,6 +543,24 @@ namespace DvMod.Autopilot
                     if (b != null && b.track == track)
                         return false;
             return true;
+        }
+
+        /// <summary>
+        /// True when the train this car belongs to is standing on the given track.
+        /// Asked of the whole trainset rather than the one car, because the car a
+        /// coupler has found may be the end of a rake whose leading vehicle has just
+        /// crossed the joint — that rake is still the train standing there.
+        /// </summary>
+        private static bool TrainsetStandsOn(TrainCar? car, RailTrack track)
+        {
+            var cars = car?.trainset?.cars;
+            if (cars == null)
+                return false;
+            foreach (var c in cars)
+                foreach (var b in c.Bogies)
+                    if (b != null && b.track == track)
+                        return true;
+            return false;
         }
 
         /// <summary>True when any car of the consist has a bogie on the destination.</summary>
@@ -532,7 +613,7 @@ namespace DvMod.Autopilot
                     if (!onDest)
                         return false; // a bogie not (yet) on the destination track
 
-                    var (lo, hi) = MarkerZone(track);
+                    var (lo, hi) = SpotZone(loco, track);
                     // Require a small margin inside the markers so the coast after the
                     // stop command still lands the train within them.
                     double m = hi - lo > 2 * ParkMargin ? ParkMargin : 0;

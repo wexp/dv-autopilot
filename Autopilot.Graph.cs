@@ -47,6 +47,57 @@ namespace DvMod.Autopilot
         }
 
         /// <summary>
+        /// Metres of planned route still ahead: the rest of the track under the
+        /// reference bogie plus every track after it on the path.
+        ///
+        /// Counts each track once, so a shunt that reverses over its own road
+        /// reads short. That is the honest simple answer — the alternative is to
+        /// walk the legs and add the doubled sections, which for a road run (the
+        /// only case where an ETA is worth anything) makes no difference at all.
+        /// </summary>
+        private static double RouteRemaining(
+            List<RailTrack> path, int idx, RailTrack track, double span, bool towardOut)
+        {
+            if (idx < 0 || idx >= path.Count)
+                return double.MaxValue;
+            double d = towardOut ? track.GetKinkedPointSet().span - span : span;
+            for (int i = idx + 1; i < path.Count; i++)
+                d += path[i].GetKinkedPointSet().span;
+            return Math.Max(0, d);
+        }
+
+        /// <summary>
+        /// How far the consist's midpoint sits from the MIDDLE of this track,
+        /// in metres along it, signed toward increasing span. Null when no bogie
+        /// of ours is on it.
+        ///
+        /// A turntable turns about its centre, so a train parked hard against one
+        /// end of the bridge swings its far end out over the pit and leaves the
+        /// near end short — which looks wrong and, on a bridge the consist nearly
+        /// fills, IS wrong. Measured from the outermost bogies rather than the
+        /// couplers: the bogies are what the bridge actually carries.
+        /// </summary>
+        private static double? BridgeCentreError(TrainCar loco, RailTrack track)
+        {
+            double lo = double.MaxValue, hi = double.MinValue;
+            foreach (var c in loco.trainset.cars)
+            {
+                if (c == null)
+                    continue;
+                foreach (var b in c.Bogies)
+                {
+                    if (b?.track != track)
+                        continue;
+                    lo = Math.Min(lo, b.traveller.Span);
+                    hi = Math.Max(hi, b.traveller.Span);
+                }
+            }
+            if (lo > hi)
+                return null;
+            return track.GetKinkedPointSet().span / 2.0 - (lo + hi) / 2.0;
+        }
+
+        /// <summary>
         /// Split the path into legs at reversal tracks. On a straight-through track
         /// the train enters one end and leaves the other; where it must enter and
         /// leave the <em>same</em> end it has to stop and reverse, which starts a new

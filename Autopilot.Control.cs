@@ -184,6 +184,103 @@ namespace DvMod.Autopilot
             return (warning, critical);
         }
 
+        /// <summary>
+        /// Update the ceiling the heat puts on the throttle, 0..1, against the
+        /// hottest driven unit's own warning threshold.
+        ///
+        /// This is a SETTLING controller, not a thermostat. Cutting power on the
+        /// red line and restoring it as soon as the reading dipped is what made
+        /// the loco cycle — buzz, throttle down, cool, throttle up, buzz — for the
+        /// whole journey, because full power always leads back to the same line.
+        /// Instead the ceiling ratchets down while the temperature is climbing
+        /// into the band, then HOLDS across a wide middle window: it comes to rest
+        /// at whatever power this train, this grade and this weather can carry
+        /// indefinitely. Full power is only earned back once the loco has gone
+        /// properly cold, and then only at a crawl.
+        /// </summary>
+        private static void UpdateHeatCap(Run run, TrainCar loco, float speedKmh)
+        {
+            float hottest = float.MinValue;
+            float margin = float.MaxValue; // °C of headroom below the warning line
+            foreach (var c in MuGroup(loco))
+            {
+                if (c == null)
+                    continue;
+                var observer = c.GetComponentInChildren<MultipleUnitStateObserver>();
+                var simFlow = c.SimController?.simFlow;
+                if (observer == null || simFlow == null
+                    || string.IsNullOrEmpty(observer.temperaturePortId)
+                    || !simFlow.TryGetPort(observer.temperaturePortId, out var port, true))
+                    continue;
+                if (observer.overheatStandardThreshold - port.Value < margin)
+                {
+                    margin = observer.overheatStandardThreshold - port.Value;
+                    hottest = port.Value;
+                }
+            }
+            if (margin == float.MaxValue)
+            {
+                // Nothing in the consist reports a temperature (steam, or a modded
+                // loco without the port). Never invent a restriction from silence.
+                run.heatCap = 1f;
+                run.heatRise = 0f;
+                run.heatLastTemp = float.NaN;
+                return;
+            }
+
+            // Trend over a couple of seconds. A single tick's difference is below
+            // the resolution of anything the gauge does - the oil takes tens of
+            // seconds to move a degree - so measuring per tick reads as pure noise.
+            run.heatSampleFor += DriveTick;
+            if (run.heatSampleFor >= HeatTrendSeconds)
+            {
+                if (!float.IsNaN(run.heatLastTemp))
+                    run.heatRise = (hottest - run.heatLastTemp) / run.heatSampleFor;
+                run.heatLastTemp = hottest;
+                run.heatSampleFor = 0f;
+            }
+            bool climbing = run.heatRise > HeatRiseEpsilon;
+
+            if (margin <= HardOverheatMargin)
+            {
+                // On the line. Get off it whatever the trend says - there is no
+                // headroom left to wait and see in.
+                run.heatCap -= HeatCapCutFast * DriveTick;
+            }
+            else if (margin <= PreOverheatMargin && climbing)
+            {
+                // Warm AND still going up: this power level is not sustainable
+                // here. Ease down until the climb stops, then hold there.
+                run.heatCap -= HeatCapCutSlow * DriveTick;
+            }
+            else if (!climbing)
+            {
+                // Clear of the cut band and not heating: earn power back, slowly.
+                //
+                // The recovery point used to sit a further CoolOffMargin below
+                // the cut point, on the theory that a dead band stops the
+                // ceiling chasing the reading. What it actually did was strand
+                // it: a DH4 working hard settles around 83.5 C, which is 6.5 C
+                // below its line - past the cut band, short of the recovery
+                // band - so the ceiling held at whatever it had fallen to for
+                // the rest of the journey and the train slowed to a crawl on
+                // the first grade. The hysteresis comes from the climbing test
+                // instead, which is the honest question anyway.
+                run.heatCap += HeatCapRecover * DriveTick;
+            }
+            // else: warm and still climbing - hold what we have.
+
+            // Working hard while barely moving is where a hydraulic dumps most of
+            // its heat, so while warm the ceiling is lower at low speed. Applied as
+            // a ceiling rather than baked into heatCap, so it lifts again with
+            // speed instead of being remembered as a permanent cut.
+            float ceiling = speedKmh < ConverterSlipKmh && margin <= PreOverheatMargin
+                ? HotThrottleCapLow : 1f;
+            // Never below half power: a ceiling that forbids movement outright does
+            // not cool anything, it just reads as "stuck" and abandons the run.
+            run.heatCap = Mathf.Clamp(run.heatCap, HotThrottleCapHard, ceiling);
+        }
+
         /// <summary>Worst wheelslip across every loco in the consist. The lead unit
         /// alone is a lie in an MU lash-up: the trailing units get the same throttle
         /// and can break loose first — and did, unseen.</summary>
@@ -243,7 +340,7 @@ namespace DvMod.Autopilot
             ref float lastSpeedMs, ref float accelFilter, ref float accelBudget,
             ref float sanderHold, ref float dynStallFor,
             ref float dynHandle, ref float dynCap, bool allowDynamic,
-            bool tempWarning, bool tempCritical)
+            float heatCap, bool tempWarning, bool tempCritical)
         {
             var overrider = controller.controlsOverrider;
 
@@ -388,6 +485,29 @@ namespace DvMod.Autopilot
                 // first notches in one tick and only then crawled up.
                 if (speed < 1f && throttle < profile.minMoveThrottle)
                     throttle = Mathf.Min(profile.minMoveThrottle, throttle + profile.throttleUp);
+                // Warm but not yet on the red line: come DOWN to what the heat
+                // allows rather than snapping there — a step off the top of the
+                // handle surges the couplers on a long rake. The loco's own
+                // minimum-move throttle still wins, so a heavy train can always
+                // start; a cap that forbade movement outright would just read as
+                // "stuck" and abandon the run.
+                // No relief for being behind on speed. That was tried and it
+                // brought the buzzer back: on a long grade the train is behind
+                // for the whole climb, so a ceiling that yields to a speed
+                // deficit is a ceiling that is never applied, and the engine
+                // walked straight up to its warning line every time.
+                //
+                // Which constraint binds is decided by TEMPERATURE, upstream in
+                // UpdateHeatCap: below the band the ceiling is on its way back
+                // to 1 and the train may use everything it has; inside the band
+                // the heat governs and the train goes as fast as the engine can
+                // carry it, which on a steep enough grade is slower than asked.
+                // That is the machine, not the policy — a DH4 that cannot hold
+                // 60 up a bank at 88 °C also cannot hold it at 95 °C, it just
+                // breaks instead.
+                float cap = Mathf.Max(profile.minMoveThrottle, heatCap);
+                if (throttle > cap)
+                    throttle = Mathf.Max(cap, throttle - ThrottleDown);
                 overrider.Throttle?.Set(throttle);
                 dynHandle = 0f;
                 overrider.DynamicBrake?.Set(0f);
@@ -405,7 +525,15 @@ namespace DvMod.Autopilot
                 overrider.Throttle?.Set(throttle);
                 float service = Mathf.Min(ServiceBrakeMax, Mathf.Clamp01(-error / 8f));
                 var dynamic = overrider.DynamicBrake;
-                if (allowDynamic && dynamic != null && speed > DynamicBrakeMinKmh && throttle <= 0.01f)
+                // !tempWarning matters even though the branch above claims to
+                // handle heat: that one only fires while the throttle is still
+                // open, and when BRAKING the throttle is already shut, so a hot
+                // loco fell straight through to here and put the retarder back
+                // on. On the DH4 - whose dynamic churns the very oil the gauge
+                // reads - that alternated air and dynamic across the critical
+                // line and never settled into a brake application.
+                if (allowDynamic && !tempWarning && !tempCritical
+                    && dynamic != null && speed > DynamicBrakeMinKmh && throttle <= 0.01f)
                 {
                     // Ramp toward what the error asks, capped by what the rail has
                     // shown it will hold. Setting the error straight onto the handle
@@ -482,17 +610,32 @@ namespace DvMod.Autopilot
             ReleaseClaims(run); // an arrived or failed run must not hold the junction
             LogSpot(run, status);
 
-            // A finished shunt ties its cut down: handbrake on the first wagon, the
-            // way a shunter pins a brake before stepping off. Optionally the loco
+            // A finished run ties its train down: handbrake on the first wagon, the
+            // way a driver pins a brake before stepping off. Optionally the loco
             // then cuts itself off, ready for its next job. Deferred until the
             // train actually STANDS — Finish fires the moment the arrival test
             // passes, which is still at rolling speed, and cutting a moving train
             // sent the wagons on without their loco.
-            if (run.mode == AutopilotMode.Shunt
-                && (status == "arrived" || status == "coupled")
-                && run.car != null)
+            //
+            // Not just shunts. A road move ends with the train left standing on a
+            // running line for exactly the same reasons, and it is the heavier and
+            // more consequential train of the two to leave on nothing but air —
+            // which leaks off. The uncoupling half stays yard work: dispatch
+            // already forces uncoupleOnFinish false outside a shunt.
+            if ((status == "arrived" || status == "coupled") && run.car != null)
             {
+                // The markings come off in there, once the train STANDS. Finish
+                // fires while it is still rolling, and a train still being brought
+                // to a stand by the autopilot is still under autopilot.
                 Updater.Run(TieDownWhenStopped(run, info));
+            }
+            else
+            {
+                // Any other ending: both ends red, then the set comes off a few
+                // seconds later. Note that a finished run stays in `runs` so its
+                // status can still be read, so this is the ONLY place its markings
+                // are concluded — StopRun never sees it.
+                Markings.Conclude(run.guid, arrived: false);
             }
         }
 
@@ -521,8 +664,12 @@ namespace DvMod.Autopilot
         {
             if (car == null || dest == null)
                 return;
-            var (lo, hi) = MarkerZone(dest);
+            // The window the run is actually driven to, which is not the sign window
+            // when the cut is too long for the signs but still fits the rail.
+            var (lo, hi) = SpotZone(car, dest);
+            var signZone = MarkerZone(dest);
             bool realSigns = markerZones.ContainsKey(dest);
+            bool onRail = lo != signZone.lo || hi != signZone.hi;
             double mn = double.MaxValue, mx = double.MinValue;
             foreach (var c in CarsToSpot(car))
                 foreach (var b in c.Bogies)
@@ -533,7 +680,9 @@ namespace DvMod.Autopilot
                     }
             string extent = mn > mx ? "none on dest" : $"{mn:F1}..{mx:F1}";
             string destId = dest.LogicTrack()?.ID?.ToString() ?? "";
-            string source = realSigns ? "signs" : "FALLBACK inset";
+            string source = onRail
+                ? $"RAIL, too long for signs {signZone.lo:F1}..{signZone.hi:F1}"
+                : realSigns ? "signs" : "FALLBACK inset";
             // A fallback window means MarkerZone matched fewer than two signs. It is
             // never obvious WHY: the signs may not be streamed, or they are there and
             // the text it matches on is not the text they carry. Print the string we
@@ -586,15 +735,29 @@ namespace DvMod.Autopilot
                 yield return WaitForSecondsRealtime(0.2f);
                 waited += 0.2f;
             }
+            // Standing still, so it is no longer driving itself: both ends green,
+            // and the set comes off a few seconds later. Keyed on the GUID rather
+            // than the car, so a loco that was despawned mid-stop still clears its
+            // entry instead of leaving one that blocks the next fitting.
+            Markings.Conclude(run.guid, arrived: true);
+
             var car = run.car;
             if (car == null)
                 yield break;
             var (wagon, cutAt) = FirstWagonOut(car);
-            if (wagon == null)
-                yield break;
-            var brakes = wagon.brakeSystem;
+            // A light engine has no wagon to pin, and used to be left secured by
+            // nothing at all. It is a train standing on a grade like any other, so
+            // it pins its own. Every leg winds the handbrakes off before moving, so
+            // this cannot strand the next dispatch.
+            var tieDown = wagon ?? car;
+            var brakes = tieDown.brakeSystem;
             if (brakes != null && brakes.hasHandbrake)
                 brakes.SetHandbrakePosition(1f);
+            if (wagon == null)
+            {
+                run.detail = info + " — handbrake set";
+                yield break;
+            }
             if (run.uncoupleOnFinish && cutAt != null)
             {
                 // Split the rake wherever the JOB changes before stepping away —

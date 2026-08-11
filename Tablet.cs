@@ -2,6 +2,7 @@ using DV.InventorySystem;
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Reflection;
 using UnityEngine;
 
 namespace DvMod.Autopilot
@@ -50,10 +51,11 @@ namespace DvMod.Autopilot
         /// <summary>The red panic button: stops every autopilot run.</summary>
         public Transform? homeButton;
         public Renderer? homeRenderer;
-        public Vector3 homeLocalPos;
-        public Quaternion homeLocalRot;
         public int hoverCol = -1;
         public int hoverRow = -1;
+        /// <summary>Whether the cursor is over the value column rather than the
+        /// label one. Only the GO/STOP row cares: they share it.</summary>
+        public bool hoverRight;
         /// <summary>Full-screen overlay text (a "page"); empty = normal board.</summary>
         public string overlay = "";
         /// <summary>Destination-picker page: the quadrant it is choosing for,
@@ -96,9 +98,16 @@ namespace DvMod.Autopilot
         /// <summary>Rows in a window, top to bottom. 0 header, 1..8 selectable,
         /// 9 status. Mouse maps the glass to this grid.</summary>
         private const int Rows = 10;
+        /// <summary>The row GO and STOP share — GO in the label column, STOP in
+        /// the value one. Row 1 is left empty to set the header apart, so the
+        /// fields run 2..7 and the flash has the last row to itself.</summary>
+        private const int GoRow = 8;
+        /// <summary>How much status detail fits across half the glass. Longer
+        /// than this and the line runs out over the divider.</summary>
+        private const int DetailChars = 28;
         /// <summary>Where the value column starts inside a quadrant, in the same
         /// pre-scale x units the window planes use. Labels get this much width.</summary>
-        private const float ValueColX = 0.030f;
+        private const float ValueColX = 0.036f;
         /// <summary>Character size of a window row. Ten rows have to fit inside a
         /// quadrant: at 0.00050 the block stood about a row proud of it, so the
         /// last row — the DISPATCHED/STOPPED flash — printed over the divider on
@@ -138,6 +147,9 @@ namespace DvMod.Autopilot
             public bool showStatus;
             public string lastResult = "";
             public float lastResultUntil;
+            /// <summary>Whether that result was a refusal or a failed run —
+            /// printed red, and left up longer, because it has to be read.</summary>
+            public bool lastResultBad;
         }
 
         private static readonly Dictionary<string, Draft> drafts =
@@ -185,7 +197,7 @@ namespace DvMod.Autopilot
 
             foreach (var t in tablets)
                 if (t != null)
-                    ApplyPose(t);
+                    ApplyHoldPose(t);
         }
 
         private static Draft DraftOf(string guid)
@@ -197,37 +209,63 @@ namespace DvMod.Autopilot
 
         /* ------------------------------------------------------------ pose -- */
 
-        private void ApplyPose(TabletMarker t)
+        // The screen is built as a child of the host item's own face, so the
+        // game's hands carry it, raise it and put it away exactly as they do
+        // the map itself. The mod used to pin the model in front of the camera
+        // every frame instead, which overrode all of that.
+        //
+        // The one thing set here is the item's OWN hold pose: the two vectors
+        // on its CustomNonVrGrabAnchor, which the hands read. Written every
+        // frame so the settings sliders show their effect as they move.
+
+        private static FieldInfo? anchorPos;
+        private static FieldInfo? anchorRot;
+
+        private static void ApplyHoldPose(TabletMarker t)
         {
-            if (t.model == null)
+            var anchor = t.GetComponents<MonoBehaviour>()
+                .FirstOrDefault(c => c != null
+                    && c.GetType().Name == "CustomNonVrGrabAnchor");
+            if (anchor == null)
                 return;
+            var ty = anchor.GetType();
+            anchorPos = anchorPos ?? ty.GetField("customLocalPosition");
+            anchorRot = anchorRot ?? ty.GetField("customLocalRotation");
+            var s = Main.settings;
+            // The glance, done in the hold pose rather than over it: looking
+            // ahead the tablet rides low and leaned away, and it comes up to
+            // the tuned pose as the head goes down. Same blend the old
+            // camera-pinned pose used, now in the hands' own frame.
             var cam = Camera.main;
-            bool held = HeldTablet() == t;
-            if (held && cam != null)
+            // How far below the horizon the head is looking, in degrees, so the
+            // two thresholds read as angles rather than as a height on the view
+            // vector. Fully up can never be at or under the start: that would
+            // divide by nothing and snap the tablet up with no travel.
+            float pitch = cam == null ? 0f
+                : Mathf.Asin(Mathf.Clamp(-cam.transform.forward.y, -1f, 1f)) * Mathf.Rad2Deg;
+            float full = Mathf.Max(s.tabletGlanceFull, s.tabletGlanceStart + 1f);
+            float down = s.tabletGlance && cam != null
+                ? Mathf.Clamp01((pitch - s.tabletGlanceStart) / (full - s.tabletGlanceStart))
+                : 1f;
+            var pos = new Vector3(s.tabletHoldX,
+                s.tabletHoldY - Mathf.Lerp(s.tabletTuckDrop, 0f, down),
+                s.tabletHoldZ + Mathf.Lerp(s.tabletTuckPush, 0f, down));
+            var rot = new Vector3(
+                s.tabletHoldPitch + Mathf.Lerp(s.tabletTuckLean, 0f, down),
+                s.tabletHoldYaw, s.tabletHoldRoll);
+
+            // The anchor is read ONCE, by GrabHandlerItem.StartInteraction, which
+            // does nothing more than parent the item to the hand's attach point
+            // and set these two on its transform. So the fields decide the pose
+            // the tablet is picked up in, and after that only the transform moves
+            // it — same two values, in the same frame, every frame.
+            anchorPos?.SetValue(anchor, pos);
+            anchorRot?.SetValue(anchor, rot);
+            var tf = t.transform;
+            if (tf.parent != null)
             {
-                // Looking ahead: tucked low. Looking down at it: close reading
-                // pose covering about half the view. Continuous blend — unless
-                // the glance is switched off, in which case the tablet stays in
-                // the read pose the whole time it is held.
-                float down = Main.settings.tabletGlance
-                    ? Mathf.Clamp01((-cam.transform.forward.y - 0.22f) / 0.30f)
-                    : 1f;
-                float dist = Mathf.Lerp(0.26f, 0.11f, down);
-                float drop = Mathf.Lerp(0.16f, 0.01f, down);
-                // Tucked: sits low and leans away, like a device resting in the
-                // hand. Glanced at: rises flat to the view.
-                float lean = Mathf.Lerp(35f, 0f, down);
-                var pos = cam.transform.position
-                    + cam.transform.forward * dist
-                    - cam.transform.up * drop;
-                var rot = Quaternion.AngleAxis(lean, cam.transform.right)
-                    * Quaternion.LookRotation(cam.transform.up, -cam.transform.forward);
-                t.model.SetPositionAndRotation(pos, rot);
-            }
-            else if (t.model.localPosition != t.homeLocalPos)
-            {
-                t.model.localPosition = t.homeLocalPos;
-                t.model.localRotation = t.homeLocalRot;
+                tf.localPosition = pos;
+                tf.localRotation = Quaternion.Euler(rot);
             }
         }
 
@@ -264,11 +302,11 @@ namespace DvMod.Autopilot
         private static readonly Dictionary<string, List<(string label, int? junction)>> viaCache =
             new Dictionary<string, List<(string label, int? junction)>>();
 
-        /// <summary>Via choices for a shunt destination: "auto" plus the
+        /// <summary>Via choices for a shunt destination: "Auto" plus the
         /// junction at each end of the track, as the web console offers.</summary>
         private List<(string label, int? junction)> ViaOptions(Draft d, string guid)
         {
-            var options = new List<(string, int?)> { ("auto", (int?)null) };
+            var options = new List<(string, int?)> { ("Auto", (int?)null) };
             if (!d.shunt)
                 return options;
             var tracks = ShuntTracks(guid);
@@ -326,7 +364,7 @@ namespace DvMod.Autopilot
                 {
                     Autopilot.Stop(null);
                     foreach (var g in TabletPins.Guids)
-                        Flash(DraftOf(g), "ALL STOPPED");
+                        Flash(DraftOf(g), "ALL STOPPED", true);
                     Repaint(t);
                 }
                 return;
@@ -336,10 +374,17 @@ namespace DvMod.Autopilot
             int col = (local.x > 0f ? 1 : 0) + (local.z > 0f ? 0 : 2);
             float zq = local.z > 0f ? local.z : local.z + 0.5f; // within-quadrant, 0..0.5
             int row = Mathf.Clamp((int)((0.5f - zq) / 0.5f * Rows), 0, Rows - 1);
-            if (t.hoverCol != col || t.hoverRow != row)
+            // Which of the two columns, for the one row that has a live cell in
+            // each. The value column starts at ValueColX along a quadrant that
+            // is half the glass wide; the split sits just short of it so a click
+            // on the word itself counts.
+            float xq = local.x > 0f ? local.x : local.x + 0.5f;
+            bool right = xq > ValueColX / 0.1315f - 0.05f;
+            if (t.hoverCol != col || t.hoverRow != row || t.hoverRight != right)
             {
                 t.hoverCol = col;
                 t.hoverRow = row;
+                t.hoverRight = right;
                 Repaint(t);
             }
 
@@ -402,13 +447,15 @@ namespace DvMod.Autopilot
             var hoverDraft = DraftOf(guid);
             bool status = hoverDraft.showStatus;
             var hints = hoverDraft.shunt ? ShuntHints : DriveHints;
-            if (!status && row >= 1 && row < hints.Length && hints[row].Length > 0)
+            if (row == GoRow)
+                Prompt(t.hoverRight ? "Click: stop this locomotive" : "Click: dispatch");
+            else if (!status && row >= 1 && row < hints.Length && hints[row].Length > 0)
                 Prompt(hints[row]);
             if (row == 0)
                 Prompt("Click: switch between setup and status");
             if (click || wheel != 0)
             {
-                Act(t, col, guid, row, click, wheel);
+                Act(t, col, guid, row, click, wheel, t.hoverRight);
                 Repaint(t);
             }
         }
@@ -419,19 +466,20 @@ namespace DvMod.Autopilot
         private static readonly string[] ShuntHints =
         {
             "",
+            "",
             "Click: switch between Driving and Shunting",
             "Click or scroll: choose the track to move to",
             "Click or scroll: which end goes in first",
             "Click or scroll: which junction to arrive through",
             "Click: couple onto the train standing there",
             "Click: uncouple the locomotive when done",
-            "Click: dispatch",
-            "Click: stop this locomotive",
+            "",
             "",
         };
 
         private static readonly string[] DriveHints =
         {
+            "",
             "",
             "Click: switch between Driving and Shunting",
             "Click or scroll: choose the destination yard",
@@ -439,8 +487,7 @@ namespace DvMod.Autopilot
             "Scroll: top speed",
             "",
             "",
-            "Click: dispatch",
-            "Click: stop this locomotive",
+            "",
             "",
         };
 
@@ -464,7 +511,8 @@ namespace DvMod.Autopilot
 
         /// <summary>One interaction on a window row: click toggles/cycles/fires,
         /// the wheel cycles values in either direction.</summary>
-        private void Act(TabletMarker t, int col, string guid, int row, bool click, int wheel)
+        private void Act(TabletMarker t, int col, string guid, int row, bool click,
+            int wheel, bool right)
         {
             var d = DraftOf(guid);
             int step = wheel != 0 ? wheel : click ? 1 : 0;
@@ -476,22 +524,39 @@ namespace DvMod.Autopilot
                     d.showStatus = !d.showStatus;
                 return;
             }
-            // On the status screen only GO/STOP stay live.
-            if (d.showStatus && row != 7 && row != 8)
+            // GO and STOP share one row: dispatch on the label side, stop on the
+            // value side. It is the only live row on the status screen.
+            if (row == GoRow)
+            {
+                if (!click)
+                    return;
+                if (right)
+                {
+                    Autopilot.Stop(guid);
+                    Flash(d, "STOPPED", true);
+                    d.showStatus = false; // ...and back to setup on stop
+                }
+                else
+                {
+                    Dispatch(guid, d);
+                }
+                return;
+            }
+            if (d.showStatus)
                 return;
 
-            // Rows 1..6 mean different things in the two jobs, exactly as the two
-            // forms of the web console do; 7 and 8 are GO/STOP either way.
+            // Rows 2..7 mean different things in the two jobs, exactly as the two
+            // forms of the web console do. Row 1 is the gap under the header.
             switch (row)
             {
-                case 1:
+                case 2:
                     if (click)
                     {
                         d.shunt = !d.shunt;
                         d.via = 0; // the junction list belongs to the mode's dest
                     }
                     break;
-                case 2:
+                case 3:
                     if (click)
                     {
                         // The picker page: every destination on one glass instead
@@ -513,7 +578,7 @@ namespace DvMod.Autopilot
                         d.destDriveTrack = 0; // roads belong to the yard just left
                     }
                     break;
-                case 3:
+                case 4:
                     if (d.shunt)
                     {
                         d.arrive = Wrap(d.arrive + step, LeadNames.Length);
@@ -530,7 +595,7 @@ namespace DvMod.Autopilot
                         d.destDriveTrack = Wrap(d.destDriveTrack + step, targets.Count);
                     }
                     break;
-                case 4:
+                case 5:
                     if (d.shunt)
                     {
                         var options = ViaOptions(d, guid);
@@ -544,25 +609,13 @@ namespace DvMod.Autopilot
                         d.speed = Mathf.Clamp(d.speed + step * SpeedStep, SpeedMin, SpeedMax);
                     }
                     break;
-                case 5:
+                case 6:
                     if (d.shunt && click)
                         d.couple = !d.couple;
                     break;
-                case 6:
+                case 7:
                     if (d.shunt && click)
                         d.uncouple = !d.uncouple;
-                    break;
-                case 7:
-                    if (click)
-                        Dispatch(guid, d);
-                    break;
-                case 8:
-                    if (click)
-                    {
-                        Autopilot.Stop(guid);
-                        Flash(d, "STOPPED");
-                        d.showStatus = false; // ...and back to setup on stop
-                    }
                     break;
             }
         }
@@ -600,16 +653,48 @@ namespace DvMod.Autopilot
                     false, arrive, null, AutopilotMode.Drive, yard, false);
             }
             bool refused = result.Contains("\"error\"");
-            Flash(d, refused ? "REFUSED" : "DISPATCHED");
+            if (refused)
+            {
+                string why = ErrorReason(result);
+                Flash(d, "REFUSED: " + (why.Length > 40 ? why.Substring(0, 40) : why), true);
+            }
+            else
+            {
+                Flash(d, "DISPATCHED");
+            }
             // A dispatched quadrant flips to its status screen by itself...
             if (!refused)
                 d.showStatus = true;
         }
 
-        private static void Flash(Draft d, string message)
+        private static void Flash(Draft d, string message, bool bad = false)
         {
             d.lastResult = message;
-            d.lastResultUntil = Time.unscaledTime + 4f;
+            d.lastResultBad = bad;
+            // A refusal says WHY, and that takes longer to read than a word.
+            d.lastResultUntil = Time.unscaledTime + (bad ? 8f : 4f);
+        }
+
+        /// <summary>The flash line: green for what went through, red for what
+        /// did not.</summary>
+        private static string ResultLine(Draft d) =>
+            Time.unscaledTime < d.lastResultUntil
+                ? $"<color={(d.lastResultBad ? "#e60d0d" : "#7fff7f")}>{d.lastResult}</color>"
+                : "";
+
+        /// <summary>The reason out of a server refusal — {"error":"why"} — so
+        /// the tablet can print WHAT was wrong instead of only that something
+        /// was. Anything unparseable falls back to the whole reply.</summary>
+        private static string ErrorReason(string result)
+        {
+            const string key = "\"error\"";
+            int at = result.IndexOf(key, StringComparison.Ordinal);
+            if (at < 0)
+                return result;
+            int open = result.IndexOf('"', at + key.Length + 1);
+            int close = open < 0 ? -1 : result.IndexOf('"', open + 1);
+            return open < 0 || close < 0
+                ? result : result.Substring(open + 1, close - open - 1);
         }
 
         private static int Wrap(int v, int count)
@@ -658,7 +743,8 @@ namespace DvMod.Autopilot
                 else if (!overlayActive && i < TabletPins.Guids.Count)
                 {
                     var (labels, vals) = RenderWindow(
-                        TabletPins.Guids[i], t.hoverCol == i ? t.hoverRow : -1);
+                        TabletPins.Guids[i], t.hoverCol == i ? t.hoverRow : -1,
+                        t.hoverRight);
                     SetText(window, labels);
                     if (value != null)
                         SetText(value, vals);
@@ -785,7 +871,18 @@ namespace DvMod.Autopilot
             return string.Join("\n", rows);
         }
 
-        private (string labels, string values) RenderWindow(string guid, int hoverRow)
+        /// <summary>What kind of machine it is, as the livery id says it:
+        /// "LocoDE2" is a DE2. Anything not named that way is printed as it
+        /// comes, and a car with no livery at all gets nothing.</summary>
+        private static string LocoType(TrainCar loco)
+        {
+            string id = loco.carLivery?.id ?? "";
+            return id.StartsWith("Loco", StringComparison.Ordinal)
+                ? id.Substring(4) : id;
+        }
+
+        private (string labels, string values) RenderWindow(
+            string guid, int hoverRow, bool hoverRight)
         {
             var loco = LocoOf(guid);
             if (loco == null)
@@ -815,7 +912,15 @@ namespace DvMod.Autopilot
             {
                 d.showStatus = false;
                 if (state != "idle")
-                    Flash(d, state.ToUpperInvariant());
+                {
+                    // An error carries the run's own last word with it; the
+                    // state alone does not say what went wrong.
+                    string detail = state == "error"
+                        ? (Autopilot.RunDetailOf(guid) ?? "") : "";
+                    Flash(d, state.ToUpperInvariant()
+                            + (detail.Length > 0 ? ": " + detail : ""),
+                        state == "error" || state == "stopped");
+                }
             }
             // Two-column table: labels on the window plane, values on their own
             // plane at ValueColX so they line up. Full-width text (header,
@@ -823,51 +928,57 @@ namespace DvMod.Autopilot
             // with an empty value cell.
             var rows = new string[Rows];
             var vals = new string[Rows];
+            // Colour is held aside rather than written into the text, so the
+            // hover tint can replace it for one row instead of wrapping it —
+            // nested colour tags leave the inner one winning, and the hovered
+            // row would keep its own colour and look unhovered.
+            var rowCol = new string[Rows];
+            var valCol = new string[Rows];
             if (d.showStatus)
             {
                 // Second screen of the quadrant: what the run is doing right now.
                 string detail = Autopilot.RunDetailOf(guid) ?? "";
                 float limit = Autopilot.RunLimitOf(guid);
-                rows[0] = $"<b>{loco.ID}</b>  [status]";
-                rows[1] = "State";
-                vals[1] = state;
-                rows[2] = detail.Length > 34 ? detail.Substring(0, 34) : detail;
-                rows[3] = detail.Length > 34
-                    ? detail.Substring(34, Mathf.Min(34, detail.Length - 34)) : "";
-                rows[4] = limit > 0 ? "Limit" : "";
-                vals[4] = limit > 0 ? $"{limit:0} km/h" : "";
-                rows[5] = "Target";
-                vals[5] = dest;
-                rows[6] = "";
-                rows[7] = "GO";
-                rows[8] = "STOP";
-                rows[9] = Time.unscaledTime < d.lastResultUntil
-                    ? $"<color=#7fff7f>{d.lastResult}</color>" : "";
+                rows[0] = $"<b>{loco.ID}</b>  <color=#add8e6>[status]</color>";
+                vals[0] = LocoType(loco);
+                rows[2] = "State";
+                vals[2] = state;
+                valCol[2] = state == "error" ? "#e60d0d" : "#add8e6";
+                rows[3] = detail.Length > DetailChars
+                    ? detail.Substring(0, DetailChars) : detail;
+                rows[4] = detail.Length > DetailChars
+                    ? detail.Substring(DetailChars,
+                        Mathf.Min(DetailChars, detail.Length - DetailChars))
+                    : "";
+                rows[5] = limit > 0 ? "Limit" : "";
+                vals[5] = limit > 0 ? $"{limit:0} km/h" : "";
+                rows[6] = "Target";
+                vals[6] = dest;
+                rows[9] = ResultLine(d);
             }
             else if (d.shunt)
             {
                 // Shunting, in the console's own order: where to, which end goes
                 // in, which junction through, and what to do on arrival.
                 var viaOptions = ViaOptions(d, guid);
-                rows[0] = $"<b>{loco.ID}</b>  [setup]";
-                rows[1] = "Job";
-                vals[1] = "Shunting";
-                rows[2] = "To track";
-                vals[2] = dest;
-                rows[3] = "Arrive";
-                vals[3] = LeadNames[d.arrive];
-                rows[4] = "Via";
-                vals[4] = viaOptions[Mathf.Clamp(d.via, 0, viaOptions.Count - 1)].label;
-                rows[5] = "Couple there";
-                vals[5] = d.couple ? "yes" : "no";
-                rows[6] = "Uncouple loco";
-                vals[6] = d.uncouple ? "yes" : "no";
-                rows[7] = "GO";
-                rows[8] = "STOP";
+                rows[0] = $"<b>{loco.ID}</b>  <color=#ffd700>[setup]</color>";
+                vals[0] = LocoType(loco);
+                rows[2] = "Job";
+                vals[2] = "Shunting";
+                valCol[2] = "#f08080";
+                rows[3] = "To track";
+                vals[3] = dest;
+                rows[4] = "Arrive";
+                vals[4] = LeadNames[d.arrive];
+                rows[5] = "Via";
+                vals[5] = viaOptions[Mathf.Clamp(d.via, 0, viaOptions.Count - 1)].label;
+                rows[6] = "Couple train";
+                vals[6] = d.couple ? "Yes" : "No";
+                rows[7] = "Uncouple train";
+                vals[7] = d.uncouple ? "Yes" : "No";
                 // State lives on the status screen now; here only a fresh
                 // dispatch/stop result flashes.
-                rows[9] = Time.unscaledTime < d.lastResultUntil
-                    ? $"<color=#7fff7f>{d.lastResult}</color>" : "";
+                rows[9] = ResultLine(d);
             }
             else
             {
@@ -875,33 +986,55 @@ namespace DvMod.Autopilot
                 // Coupling, shoving and via belong to yard work and the server
                 // drops them for a drive, so they are not offered here either.
                 string yard = DriveYard(d);
-                rows[0] = $"<b>{loco.ID}</b>  [setup]";
-                rows[1] = "Job";
-                vals[1] = "Driving";
-                rows[2] = "To yard";
-                vals[2] = yard.Length > 0 ? yard : "-";
-                rows[3] = "Arrive on";
-                vals[3] = DriveTarget(d).label;
-                rows[4] = "Top speed";
-                vals[4] = $"{d.speed} km/h";
-                rows[5] = "";
-                rows[6] = "";
-                rows[7] = "GO";
-                rows[8] = "STOP";
-                rows[9] = Time.unscaledTime < d.lastResultUntil
-                    ? $"<color=#7fff7f>{d.lastResult}</color>" : "";
+                rows[0] = $"<b>{loco.ID}</b>  <color=#ffd700>[setup]</color>";
+                vals[0] = LocoType(loco);
+                rows[2] = "Job";
+                vals[2] = "Driving";
+                valCol[2] = "#90ee90";
+                rows[3] = "To yard";
+                vals[3] = yard.Length > 0 ? yard : "-";
+                rows[4] = "Arrive on";
+                vals[4] = DriveTarget(d).label;
+                rows[5] = "Top speed";
+                vals[5] = $"{d.speed} km/h";
+                rows[9] = ResultLine(d);
             }
+
+            // GO and STOP share the last row before the flash, one per column,
+            // and read as what they do on every screen. STOP takes the red of
+            // the home button — the other thing on the tablet that stops a run.
+            rows[GoRow] = "GO";
+            vals[GoRow] = "STOP";
+            rowCol[GoRow] = "#3cb371";
+            valCol[GoRow] = "#e60d0d";
 
             for (int i = 0; i < Rows; i++)
             {
                 vals[i] ??= "";
-                if (i == hoverRow && i >= 1 && i <= 8)
+                if (i == hoverRow && i >= 1 && i <= GoRow)
                 {
-                    // The hover tint covers the whole row — both columns.
-                    rows[i] = $"<color=#ffa500>{rows[i]}</color>";
+                    // The hover tint covers the whole row — both columns, and
+                    // it takes the row's own colour with it. Except on the row
+                    // the two buttons share, where only the one under the
+                    // cursor lights.
+                    bool half = i == GoRow;
+                    if (!half || !hoverRight)
+                        rows[i] = $"<color=#ffa500>{rows[i]}</color>";
+                    else if (rowCol[i] != null)
+                        rows[i] = $"<color={rowCol[i]}>{rows[i]}</color>";
                     if (vals[i].Length > 0)
-                        vals[i] = $"<color=#ffa500>{vals[i]}</color>";
+                    {
+                        if (!half || hoverRight)
+                            vals[i] = $"<color=#ffa500>{vals[i]}</color>";
+                        else if (valCol[i] != null)
+                            vals[i] = $"<color={valCol[i]}>{vals[i]}</color>";
+                    }
+                    continue;
                 }
+                if (rowCol[i] != null && rows[i] != null && rows[i].Length > 0)
+                    rows[i] = $"<color={rowCol[i]}>{rows[i]}</color>";
+                if (valCol[i] != null && vals[i].Length > 0)
+                    vals[i] = $"<color={valCol[i]}>{vals[i]}</color>";
             }
             return (string.Join("\n", rows), string.Join("\n", vals));
         }
@@ -1044,6 +1177,23 @@ namespace DvMod.Autopilot
                 new Vector2(0.5f, 0.5f), 128f);
         }
 
+        /// <summary>The host item's parts, indented, meshes marked. Which part
+        /// to draw on and which way its axes point can only be read off a live
+        /// prefab, so it goes in the log every time a tablet is made.</summary>
+        private static string Tree(Transform t, int depth)
+        {
+            // Components too: what a held item is MADE of is the whole question
+            // when deciding whether to clone one or build one.
+            string parts = string.Join(", ", t.GetComponents<Component>()
+                .Where(c => c != null && !(c is Transform))
+                .Select(c => c.GetType().Name));
+            string self = "\n" + new string(' ', depth * 2) + t.name
+                + (parts.Length > 0 ? "  {" + parts + "}" : "");
+            return depth >= 3
+                ? self
+                : self + string.Concat(t.Cast<Transform>().Select(c => Tree(c, depth + 1)));
+        }
+
         private void GiveTablet()
         {
             if (tablets.Any(m => m != null))
@@ -1063,16 +1213,23 @@ namespace DvMod.Autopilot
                 return;
             }
 
-            // The DVBonusTimer recipe: clone the compass — a proven, holdable,
-            // stowable item — hide its face, and draw ours where the dial was.
-            var spec = Resources.FindObjectsOfTypeAll<InventoryItemSpec>()
-                .FirstOrDefault(s => s != null
-                    && (s.LocalizationKey == "item/compass" || s.ItemPrefabName == "Compass"));
+            // The DVBonusTimer recipe: clone a real item — holdable, stowable,
+            // carried by the game's own hands — hide its mesh, and draw ours in
+            // its place. The map is the first choice: it is the flat item the
+            // game already holds up to be read, which is exactly the pose a
+            // tablet wants. The compass is the fallback the recipe was proven on.
+            InventoryItemSpec? FindItem(string key, string prefabName) =>
+                Resources.FindObjectsOfTypeAll<InventoryItemSpec>()
+                    .FirstOrDefault(s => s != null
+                        && (s.LocalizationKey == key || s.ItemPrefabName == prefabName));
+            var spec = FindItem("item/map", "Map") ?? FindItem("item/compass", "Compass");
             if (spec == null)
             {
-                Main.mod?.Logger.Log("Compass item spec not found — no tablet");
+                Main.mod?.Logger.Log("No map or compass item spec found — no tablet");
                 return;
             }
+            Main.mod?.Logger.Log("Tablet host item: " + spec.ItemPrefabName
+                + " (" + spec.LocalizationKey + ")");
             var prefab = Resources.Load(spec.ItemPrefabName) as GameObject;
             if (prefab == null)
             {
@@ -1097,19 +1254,62 @@ namespace DvMod.Autopilot
                 itemSpec.ItemIconSpriteDropped = TabletIcon(dropped: true);
             }
 
-            var model = go.transform.Find("model");
-            var dial = model != null ? model.Find("CompassDial") : null;
-            if (model == null || dial == null)
-            {
-                Main.mod?.Logger.Log("Compass model/dial not found — no tablet");
-                UnityEngine.Object.Destroy(go);
-                return;
-            }
-            int layer = dial.gameObject.layer;
+            // "model" is the compass's own wrapper; other items name it their
+            // own way, so the item root stands in when it is missing. The
+            // hierarchy goes in the log either way — the part names are only
+            // readable from a live prefab, not from the code.
+            var model = go.transform.Find("model") ?? go.transform;
+            Main.mod?.Logger.Log("Tablet host hierarchy: " + Tree(go.transform, 0));
+            // What the screen could be lettered in. A TextMesh takes a legacy
+            // UnityEngine.Font and nothing else, so a TMP asset in the list is
+            // only a lead — it carries a source font sometimes, an atlas always.
+            // dynamic = the glyphs are rasterised from a font FILE ON THIS
+            // MACHINE by name; anything else carries its own atlas and ships
+            // with the game.
+            Main.mod?.Logger.Log("Fonts loaded: " + string.Join(", ",
+                Resources.FindObjectsOfTypeAll<Font>()
+                    .Select(f => f.name + (f.dynamic ? " (dynamic)" : ""))));
+            Main.mod?.Logger.Log("TMP fonts loaded: " + string.Join(", ",
+                Resources.FindObjectsOfTypeAll<ScriptableObject>()
+                    .Where(o => o.GetType().Name == "TMP_FontAsset")
+                    .Select(o => o.name)));
+
+            // Everything below is drawn in the frame of one anchor transform:
+            // the flat face of the host the player already reads. On the map
+            // that is MapPaper (the sheet the station markers sit on), on the
+            // compass the dial. The root only stands in if neither exists, and
+            // then its own axes decide which way the screen points.
+            Transform? Part(string name) => go.transform
+                .GetComponentsInChildren<Transform>(true)
+                .FirstOrDefault(x => x.name == name);
+            var face = Part("MapPaper") ?? Part("CompassDial") ?? model;
+
+            // Built in the face's own frame, unrotated. Up is the face normal
+            // there: the map's paper measures 0.3 x 0 x 0.3 in its own axes, so
+            // its sheet lies in X/Z exactly as the compass dial's does.
+            var dial = face;
+            int layer = face.gameObject.layer;
             foreach (var rend in model.GetComponentsInChildren<Renderer>(true))
                 rend.enabled = false;
+            // The map keeps drawing station markers of its own — new objects
+            // with new renderers, which the sweep above never sees. Nothing
+            // left to mark, so the controller goes.
+            foreach (var comp in go.GetComponents<MonoBehaviour>())
+                if (comp != null && comp.GetType().Name == "MapMarkersController")
+                    UnityEngine.Object.Destroy(comp);
+            // Where the hands put the item in non-VR, as data on the item —
+            // the game's own hold pose knob, and the only one that does not
+            // fight the animation. Logged as the map has it, to tune from.
+            foreach (var comp in go.GetComponents<MonoBehaviour>())
+                if (comp != null && comp.GetType().Name == "CustomNonVrGrabAnchor")
+                {
+                    var ty = comp.GetType();
+                    Main.mod?.Logger.Log("Grab anchor: pos "
+                        + ty.GetField("customLocalPosition")?.GetValue(comp)
+                        + " rot " + ty.GetField("customLocalRotation")?.GetValue(comp));
+                }
 
-            var pl = model.lossyScale;
+            var pl = dial.lossyScale;
             // Landscape, sized like the job booklet (~21 x 15 cm).
             const float S = 1.45f;
             Vector3 World(float x, float y, float z) => new Vector3(
@@ -1124,7 +1324,7 @@ namespace DvMod.Autopilot
                 piece.name = name;
                 if (!keepCollider)
                     UnityEngine.Object.Destroy(piece.GetComponent<Collider>());
-                piece.transform.SetParent(model, true);
+                piece.transform.SetParent(dial, true);
                 piece.layer = layer;
                 piece.transform.rotation = dial.rotation;
                 piece.transform.position = dial.position
@@ -1214,17 +1414,30 @@ namespace DvMod.Autopilot
             marker.dividerH = dividerH;
             marker.homeButton = homeButton.transform;
             marker.homeRenderer = homeRenderer;
-            marker.homeLocalPos = model.localPosition;
-            marker.homeLocalRot = model.localRotation;
 
-            // Window texts: the DVBonusTimer recipe verbatim — a plain
-            // TextMesh with the default font. It is the one text setup proven
-            // clean on a held DV item; every TMP variant grew new artifacts.
+            // Window texts: the DVBonusTimer recipe — a plain TextMesh. It is
+            // the one text setup proven clean on a held DV item; every TMP
+            // variant grew new artifacts. The lettering is the game's own
+            // though: din1451alt is the face on DV's signs, and it is one of
+            // the legacy fonts the game keeps loaded, which is the only kind a
+            // TextMesh will take. Anything missing falls back down the list,
+            // and past that to the built-in Arial.
+            var screenFont = Resources.FindObjectsOfTypeAll<Font>();
+            Font? font = null;
+            foreach (var want in new[] { "RobotoMono-Bold", "RobotoMono-Regular",
+                "COURBD_Console_13", "COURBD", "din1451alt", "Roboto-Bold" })
+            {
+                font = screenFont.FirstOrDefault(f => f != null && f.name == want);
+                if (font != null)
+                    break;
+            }
+            Main.mod?.Logger.Log("Tablet lettering: " + (font?.name ?? "built-in"));
+
             TextMesh MakeText(string name, float worldX, float worldZ,
                 float charSize, TextAnchor anchor)
             {
                 var textGo = new GameObject(name);
-                textGo.transform.SetParent(model, true);
+                textGo.transform.SetParent(dial, true);
                 textGo.layer = layer;
                 textGo.transform.position = dial.position
                     + dial.up * 0.0034f + dial.right * (worldX * S)
@@ -1236,6 +1449,8 @@ namespace DvMod.Autopilot
                     1f / Mathf.Max(0.0001f, pl.y),
                     1f / Mathf.Max(0.0001f, pl.z));
                 var tm = textGo.AddComponent<TextMesh>();
+                if (font != null)
+                    tm.font = font;
                 tm.anchor = anchor;
                 tm.alignment = anchor == TextAnchor.UpperLeft
                     ? TextAlignment.Left : TextAlignment.Center;
@@ -1246,6 +1461,11 @@ namespace DvMod.Autopilot
                 var mr = textGo.GetComponent<MeshRenderer>();
                 if (mr != null)
                 {
+                    // A TextMesh draws with its font's own material — set the
+                    // font and leave the default material and the glyphs come
+                    // out of the wrong atlas.
+                    if (font != null)
+                        mr.sharedMaterial = font.material;
                     mr.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
                     mr.receiveShadows = false;
                     mr.motionVectorGenerationMode = MotionVectorGenerationMode.ForceNoMotion;
@@ -1294,7 +1514,7 @@ namespace DvMod.Autopilot
                 marker.icons[i] = sprite;
             }
             marker.emptyMsg = MakeText("TabletEmpty", 0f, 0f,
-                0.00110f, TextAnchor.MiddleCenter);
+                0.00075f, TextAnchor.MiddleCenter);
 
             tablets.Add(marker);
             int result = inv.AddItemToInventory(go, slot, false);

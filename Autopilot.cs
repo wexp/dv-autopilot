@@ -91,6 +91,10 @@ namespace DvMod.Autopilot
             public bool? arriveEnteredIn;
             /// <summary>The destination track.</summary>
             public RailTrack? destTrack;
+            /// <summary>Where the run started. Together with the destination it says
+            /// whether this is a loading move — which outranks a move that is only
+            /// passing through the same rail. See Outranks.</summary>
+            public RailTrack? originTrack;
             /// <summary>The arrive-end came from an EXPLICIT via junction — which,
             /// since the same-track guess was removed, is the only way it is ever
             /// set. The constraint therefore holds for the WHOLE run: letting a pull
@@ -130,8 +134,13 @@ namespace DvMod.Autopilot
             public string blockedReason = "";
             /// <summary>Track we have found we cannot use: a junction there refuses to
             /// throw because someone has left a wagon on it. Fed back into the router so
-            /// the next plan goes round rather than queueing behind it for ever.</summary>
-            public readonly HashSet<RailTrack> avoid = new HashSet<RailTrack>();
+            /// the next plan goes round rather than queueing behind it for ever. Every
+            /// entry carries a clock — see Avoidance.</summary>
+            public readonly Avoidance avoid = new Avoidance();
+            /// <summary>Runs this one has given way to, and how many times. Meeting the
+            /// same train twice is not bad luck: its road is written off for longer each
+            /// time, so the re-plan bends further out instead of walking back into it.</summary>
+            public readonly Dictionary<string, int> yielded = new Dictionary<string, int>();
             /// <summary>Track (and the side it is entered from) this run has reserved.
             /// Nobody else may drive over or throw a switch into one of these from the
             /// same side while it holds them — the OPPOSITE side of the same track is a
@@ -142,6 +151,17 @@ namespace DvMod.Autopilot
             /// the frog and all its legs — which is what makes two routes through
             /// it on different track pairs an actual conflict.</summary>
             public readonly HashSet<Junction> claimedJunctions = new HashSet<Junction>();
+
+            /// <summary>The junctions the LAST authority walk took — the road standing
+            /// set ahead of the train right now. Rebuilt by every walk.
+            ///
+            /// The release passes work out what is "behind" from the planned path
+            /// alone, while the walk runs PAST the end of the current leg onto overrun
+            /// rail no path entry covers. The two disagreed three times a second: the
+            /// trace caught J-496 granted, dropped as behind, and re-granted on the
+            /// next tick, over and over — a hole in the ledger at 3 Hz that another
+            /// train could be authorised straight into.</summary>
+            public readonly HashSet<Junction> authJunctions = new HashSet<Junction>();
 
             /// <summary>Turntables this run holds the ORIENTATION of. Separate from
             /// the bridge's track claim: the rail can be ours while the angle is
@@ -208,6 +228,84 @@ namespace DvMod.Autopilot
                 public float last;
                 public string text = "";
                 public int count = 1;
+            }
+
+            /// <summary>
+            /// Rail this run has written off, each entry with a clock on it. A track
+            /// is banned for a while and forgiven again; only rail that beats the run
+            /// AvoidStrikes times is banned for the rest of the job. The list used to
+            /// be an add-only set, so one shunter standing on a throat for half a
+            /// minute barred that road for the whole run — and, where there was no way
+            /// round, killed the run outright long after the road had cleared.
+            /// </summary>
+            public sealed class Avoidance
+            {
+                private readonly Dictionary<RailTrack, (float until, int strikes)> entries =
+                    new Dictionary<RailTrack, (float, int)>();
+
+                /// <summary>Write a track off because it has actually defeated the run.
+                /// False once it has failed too often to be worth another look: the
+                /// caller then gives up instead of re-planning round it again.</summary>
+                public bool Strike(RailTrack track, float seconds)
+                {
+                    entries.TryGetValue(track, out var entry);
+                    int strikes = entry.strikes + 1;
+                    entries[track] = (
+                        strikes >= AvoidStrikes
+                            ? float.MaxValue
+                            : Time.realtimeSinceStartup + seconds,
+                        strikes);
+                    return strikes < AvoidStrikes;
+                }
+
+                /// <summary>Ban a track for a while WITHOUT counting it against the
+                /// track's strikes. Giving way to another train is a matter of timing,
+                /// not a road that is shut: three meets on the same rail must not bar
+                /// it for the rest of the job.</summary>
+                public void Hold(RailTrack track, float seconds)
+                {
+                    entries.TryGetValue(track, out var entry);
+                    if (entry.until == float.MaxValue)
+                        return;
+                    entries[track] = (
+                        Mathf.Max(Time.realtimeSinceStartup + seconds, entry.until),
+                        entry.strikes);
+                }
+
+                /// <summary>Written off for the rest of the run — no amount of waiting
+                /// will hand this road back.</summary>
+                public bool Permanent(RailTrack track) =>
+                    entries.TryGetValue(track, out var entry) && entry.until == float.MaxValue;
+
+                public bool Contains(RailTrack track) =>
+                    entries.TryGetValue(track, out var entry)
+                    && Time.realtimeSinceStartup < entry.until;
+
+                /// <summary>Take a track off the list, keeping its strike count: the
+                /// only plan there is needs this road after all, so the drive loop's
+                /// own guard has to deal with whatever is standing on it.</summary>
+                public void Forgive(RailTrack track)
+                {
+                    if (entries.TryGetValue(track, out var entry))
+                        entries[track] = (0f, entry.strikes);
+                }
+
+                /// <summary>The live bans, for the router. Null when there are none —
+                /// which is the "no avoid set" the planner is already written for.</summary>
+                public HashSet<RailTrack>? Live()
+                {
+                    float now = Time.realtimeSinceStartup;
+                    HashSet<RailTrack>? live = null;
+                    foreach (var kv in entries)
+                    {
+                        if (now >= kv.Value.until)
+                            continue;
+                        if (live == null)
+                            live = new HashSet<RailTrack>();
+                        live.Add(kv.Key);
+                    }
+                    return live;
+                }
             }
 
             /// <summary>Long enough to cover a whole manoeuvre, short enough that a
@@ -323,7 +421,10 @@ namespace DvMod.Autopilot
 
                     // Why it might not be moving.
                     ["blocked"] = blockedReason,
-                    ["avoid"] = new JArray(avoid
+                    // Only the LIVE bans: an entry whose clock has run out is not
+                    // something the dispatcher's screen should still be showing as a
+                    // road this train refuses.
+                    ["avoid"] = new JArray((avoid.Live() ?? Enumerable.Empty<RailTrack>())
                         .Select(t => (JToken)(t.LogicTrack()?.ID?.ToString() ?? "?"))),
                     ["holdsTracks"] = new JArray(claimed
                         .Select(t => (JToken)(t.LogicTrack()?.ID?.ToString() ?? "?"))),
@@ -504,13 +605,26 @@ namespace DvMod.Autopilot
         private static readonly Dictionary<TurntableRailTrack, string> turntableClaims =
             new Dictionary<TurntableRailTrack, string>();
 
-        // Dispatch-order queueing: a run stopped at a block it could not get says so
-        // here every authority pass; a LATER-dispatched run must not grab that block
-        // out from under it. Entries go stale in a few seconds so a run that moved
-        // on stops blocking anyone.
-        private static readonly Dictionary<object, (int seq, float time)> blockWants =
-            new Dictionary<object, (int, float)>();
+        // Queueing: a run stopped at a block it could not get says so here every
+        // authority pass; a JUNIOR run must not grab that block out from under it.
+        // Entries go stale in a few seconds so a run that moved on stops blocking
+        // anyone.
+        //
+        // The WANTER is recorded, not its dispatch number, because seniority is not
+        // dispatch order alone — see Outranks. Keeping a bare seq here meant the queue
+        // and the reach-ahead reservation ranked the same pair opposite ways: L-046
+        // (a loading move) held rail against L-011 by rank while L-011's want held the
+        // same rail against L-046 by seq, and each stood waiting for the other with the
+        // log saying, of one track, that each of them had it.
+        private static readonly Dictionary<object, (string guid, float time)> blockWants =
+            new Dictionary<object, (string, float)>();
         private const float WantFreshSeconds = 3f;
+        // How far up its own plan a run may hold rail against a lower-ranked one, m.
+        // Dispatch order only ever settled arguments between trains ALREADY at the same
+        // frog; a senior train two blocks away had no standing at all, so the throat went
+        // to whoever arrived first. Far enough that a train approaching a junction takes
+        // it, short enough that a run cannot lock a yard from the other end of it.
+        private const double PriorityReachMeters = 400.0;
 
         // Movement authority: how much rail to hold ahead. Distance-based — enough
         // to brake from the current speed with headroom — because a count of tracks
@@ -539,10 +653,31 @@ namespace DvMod.Autopilot
         /// at the old 7 m a leader was cleared to swing through with a queued
         /// follower's nose just off the points, and they traded paint.</summary>
         private const double JunctionGrantClearance = 15.0;
+        /// <summary>Room left beyond a track's MARKED clearance point when a hold is
+        /// placed there, m. Covers the coast between the brake command and the stand.
+        /// The marker is where the game says the two legs are far enough apart to
+        /// pass; stopping a couple of metres short of it is what makes that true of
+        /// the car body and not merely of the bogie the span is measured at.</summary>
+        private const double ClearancePad = 3.0;
 
         // A train blocked this long gives its reservations up, so two trains that have
         // each half of a throat cannot sit there holding it against one another, m/s.
         private const float ClaimDeadlockSeconds = 20f;
+
+        // How long a track written off for being fouled stays written off, s. Whatever
+        // shut the road — a shunter, a rake left on a lead, another autopilot holding a
+        // frog — is usually gone inside a minute, and the ban used to outlive it by the
+        // whole job.
+        private const float AvoidSeconds = 90f;
+        // ...but rail that defeats the run this many times is written off for good.
+        // Without the backstop a genuinely shut road is re-tried until the run times
+        // out, which is a slower way of failing and says less about why.
+        private const int AvoidStrikes = 3;
+        // How long the rail under a train we gave way to is written off, s, multiplied
+        // by the number of times we have given way to that same train. Shorter than the
+        // general ban to start with: the other run is moving, so its road frees itself,
+        // and we only need this plan to bend round where it stands NOW.
+        private const float GiveWaySeconds = 45f;
 
         // The longest road a SHUNT may accept, m. Generous — a runaround over a big
         // yard's own 8 km line is real yard work — but it shuts the door on the
@@ -1216,6 +1351,7 @@ namespace DvMod.Autopilot
                     viaLocked = viaEnd != null,
                     arrive = arrive,
                     destTrack = path[path.Count - 1],
+                    originTrack = path[0],
                     detail = $"routing to {destId} ({path.Count} tracks, {legs.Count} leg(s))",
                     couple = couple,
                     carsAtStart = car.trainset?.cars?.Count ?? 1,

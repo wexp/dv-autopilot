@@ -15,11 +15,33 @@ namespace DvMod.Autopilot
 
         /// <summary>Top speed a new road command starts at, km/h. Only the
         /// tablet's opening figure — each command can be changed on its own.</summary>
-        public float tabletCruiseKmh = 80f;
+        public float tabletCruiseKmh = 60f;
 
-        /// <summary>Whether a held tablet stays tucked low until looked down at.
-        /// Off, it sits in the read pose the whole time it is held.</summary>
+        /// <summary>Where the hands hold the tablet, written to the item's own
+        /// CustomNonVrGrabAnchor. The frame is the game's, so these were tuned
+        /// by eye off the map's own values (-0.1, 0.1, 0 / -90, 0, 0).</summary>
+        public float tabletHoldX = -0.16f;
+        public float tabletHoldY = 0.14f;
+        public float tabletHoldZ = -0.08f;
+        public float tabletHoldPitch = -90f;
+        public float tabletHoldYaw = 0f;
+        public float tabletHoldRoll = 0f;
+
+        /// <summary>Whether a held tablet drops out of the way until looked
+        /// down at. Off, it stays in the hold pose above the whole time.</summary>
         public bool tabletGlance = true;
+        /// <summary>How far the head has to be looking down before the tablet
+        /// starts coming up, degrees below the horizon.</summary>
+        public float tabletGlanceStart = 20f;
+        /// <summary>How far down it has to be for the tablet to be all the way
+        /// up, degrees below the horizon.</summary>
+        public float tabletGlanceFull = 30f;
+        /// <summary>How far below the hold pose the tucked tablet sits.</summary>
+        public float tabletTuckDrop = 0.12f;
+        /// <summary>How far back (or forward) the tucked tablet sits.</summary>
+        public float tabletTuckPush = 0.11f;
+        /// <summary>How far it leans away while tucked, degrees.</summary>
+        public float tabletTuckLean = 20f;
 
         // What the autopilot bolts on while it drives. Each part switches off on
         // its own, and its bracket goes with it. The headlights are not part of
@@ -30,6 +52,19 @@ namespace DvMod.Autopilot
         public LocoProfiles autopilot = new LocoProfiles();
 
         public bool enableLogging = false;
+
+        // The interlocking trace, kept apart from enableLogging above. That one
+        // writes occasional notes into a log the whole game shares; this one
+        // writes every metre and every claim into a file of its own, which is
+        // the only way a lock-up between two trains can be read back afterwards
+        // rather than argued about.
+        // ON by default while the interlocking is under investigation: a recorder
+        // that has to be remembered is a recorder that is off for the run you
+        // needed it for. Untick it when the locks are fixed.
+        public bool traceEnabled = true;
+        /// <summary>Metres of travel between movement lines. Smaller is finer and
+        /// bigger; 1 m keeps a whole Harbour session inside a few tens of MB.</summary>
+        public float traceStepMeters = 1.0f;
 
         public readonly string? version = Main.mod?.Info.Version;
 
@@ -74,25 +109,97 @@ namespace DvMod.Autopilot
         {
             GUILayout.BeginVertical("box", GUILayout.ExpandWidth(false));
             GUILayout.Label("Press <b>" + tabletKey + "</b> for a tablet — it goes in the "
-                + "inventory and is held like any item. Point at a window: <b>left click</b> "
-                + "acts on a row, <b>right click</b> goes back, the <b>wheel</b> changes the "
-                + "value under the cursor. The red button stops every run. "
+                + "inventory and is held like any item, and there is only ever one. With "
+                + "the cursor showing, point at a window: <b>left click</b> acts on a row, "
+                + "the <b>wheel</b> changes the value under the cursor. "
+                + "The red button stops every run. "
                 + "Key editable in Settings.xml.");
-            GUILayout.BeginHorizontal();
-            GUILayout.Label("Default road speed", GUILayout.Width(140));
-            tabletCruiseKmh = Mathf.Round(
-                GUILayout.HorizontalSlider(tabletCruiseKmh, 20f, 120f, GUILayout.Width(120)) / 5f) * 5f;
-            GUILayout.Label($"{tabletCruiseKmh:0} km/h", GUILayout.Width(70));
-            GUILayout.EndHorizontal();
+            tabletCruiseKmh = Num("Default road speed",
+                tabletCruiseKmh, 20f, 120f, 5f, "0", "km/h");
             GUILayout.Label("What a new road command opens at; shunts are held to yard "
                 + "pace whatever this says.");
+
+            GUILayout.Space(8);
+            GUILayout.Label("<b>Where it sits in the hands</b> — the game's own hold pose "
+                + "for the item, so it still swings in and away on its own. Applies while "
+                + "you watch.");
+            tabletHoldX = Num("Left / right", tabletHoldX, -0.5f, 0.5f, 0.01f, "0.00", "m");
+            tabletHoldY = Num("Down / up", tabletHoldY, -0.5f, 0.5f, 0.01f, "0.00", "m");
+            tabletHoldZ = Num("Back / forward", tabletHoldZ, -0.5f, 0.5f, 0.01f, "0.00", "m");
+            tabletHoldPitch = Num("Pitch", tabletHoldPitch, -180f, 180f, 1f, "0", "°");
+            tabletHoldYaw = Num("Yaw", tabletHoldYaw, -180f, 180f, 1f, "0", "°");
+            tabletHoldRoll = Num("Roll", tabletHoldRoll, -180f, 180f, 1f, "0", "°");
             GUILayout.Space(6);
             tabletGlance = GUILayout.Toggle(tabletGlance,
-                " Tuck the tablet away until glanced at");
-            GUILayout.Label(tabletGlance
-                ? "Held low while looking ahead, rising to the read pose as you look down."
-                : "Always held up in the read pose while carried.");
+                " Drop the tablet out of the way until glanced at");
+            if (tabletGlance)
+            {
+                GUILayout.Label("Carried low while looking ahead, coming up to the hold "
+                    + "pose above as you look down at it.");
+                tabletGlanceStart = Num("Starts at",
+                    tabletGlanceStart, 0f, 80f, 1f, "0", "° down");
+                tabletGlanceFull = Num("Fully up at",
+                    tabletGlanceFull, 1f, 89f, 1f, "0", "° down");
+                tabletTuckDrop = Num("Tucked drop",
+                    tabletTuckDrop, 0f, 0.6f, 0.01f, "0.00", "m");
+                tabletTuckPush = Num("Tucked back / fwd",
+                    tabletTuckPush, -0.5f, 0.5f, 0.01f, "0.00", "m");
+                tabletTuckLean = Num("Tucked lean",
+                    tabletTuckLean, -90f, 90f, 1f, "0", "°");
+            }
+            else
+            {
+                GUILayout.Label("Always held in the pose above while carried.");
+            }
+
+            GUILayout.Space(6);
+            if (GUILayout.Button("Reset the hold pose", GUILayout.Width(200)))
+            {
+                tabletHoldX = -0.16f;
+                tabletHoldY = 0.14f;
+                tabletHoldZ = -0.08f;
+                tabletHoldPitch = -90f;
+                tabletHoldYaw = 0f;
+                tabletHoldRoll = 0f;
+                tabletGlanceStart = 20f;
+                tabletGlanceFull = 30f;
+                tabletTuckDrop = 0.12f;
+                tabletTuckPush = 0.11f;
+                tabletTuckLean = 20f;
+            }
             GUILayout.EndVertical();
+        }
+
+        /// <summary>
+        /// A number row: minus, slider, plus, value. Everything is snapped to
+        /// the step, so a drag lands on whole values instead of skipping the
+        /// one wanted, and the buttons walk to an exact figure the slider
+        /// cannot be aimed at.
+        /// </summary>
+        internal static float Num(string label, float value, float min, float max,
+            float step, string format, string unit = "")
+        {
+            GUILayout.BeginHorizontal();
+            GUILayout.Label(label, GUILayout.Width(120));
+            if (GUILayout.Button("−", GUILayout.Width(24)))
+                value -= step;
+            // What the slider was HANDED, not what the value is by the end of
+            // the row: the plus button comes after it and moves the value on,
+            // and comparing against that made every press look like a drag
+            // back to where it started.
+            float shown = value;
+            float dragged = GUILayout.HorizontalSlider(
+                shown, min, max, GUILayout.Width(130));
+            if (GUILayout.Button("+", GUILayout.Width(24)))
+                value += step;
+            // A slider that has not been touched hands back what it was given,
+            // so any change to it is a drag and wins over the buttons.
+            if (Mathf.Abs(dragged - shown) > step * 0.001f)
+                value = dragged;
+            value = Mathf.Clamp(Mathf.Round(value / step) * step, min, max);
+            GUILayout.Label(value.ToString(format) + " " + unit, GUILayout.Width(60));
+            GUILayout.EndHorizontal();
+            return value;
         }
 
         private void DrawMarkings()
@@ -128,6 +235,34 @@ namespace DvMod.Autopilot
             GUILayout.BeginVertical("box", GUILayout.ExpandWidth(false));
             enableLogging = GUILayout.Toggle(enableLogging,
                 " Write debug detail to the mod log (Player.log)");
+
+            GUILayout.Space(8);
+            bool wantTrace = GUILayout.Toggle(traceEnabled,
+                " Trace every movement and every claim to autopilot-trace.log");
+            GUILayout.Label("    One file per session in the mod folder: position each "
+                + "metre, every block asked for, the rule that refused it, and every "
+                + "change of owner. Large — tens of MB an hour with trains out.");
+            if (wantTrace != traceEnabled)
+            {
+                traceEnabled = wantTrace;
+                // Opened here rather than only on load, so the switch takes effect
+                // in the session it was thrown in — the lock you want to catch is
+                // usually already brewing by the time you come looking for it.
+                if (wantTrace)
+                    Trace.Open();
+                else
+                    Trace.Close();
+            }
+            GUILayout.BeginHorizontal();
+            GUILayout.Label("    Movement line every", GUILayout.Width(150));
+            traceStepMeters = Mathf.Clamp(
+                float.TryParse(
+                    GUILayout.TextField(
+                        traceStepMeters.ToString("F2"), GUILayout.Width(60)),
+                    out float step) ? step : traceStepMeters,
+                0.1f, 50f);
+            GUILayout.Label("m");
+            GUILayout.EndHorizontal();
 
             GUILayout.Space(8);
             DrawDump("Dump map + state",
@@ -258,16 +393,6 @@ namespace DvMod.Autopilot
                     d.minMoveThrottle, d.maneuverKmh));
         }
 
-        /// <summary>A labelled slider with its current value shown in real units.</summary>
-        private static float Slider(
-            string label, float value, float min, float max, string unit, string format)
-        {
-            GUILayout.Label(label, GUILayout.Width(120));
-            float v = GUILayout.HorizontalSlider(value, min, max, GUILayout.Width(120));
-            GUILayout.Label(v.ToString(format) + " " + unit, GUILayout.Width(70));
-            return v;
-        }
-
         /// <summary>"LocoDE6" → "DE6"; the empty livery is the catch-all.</summary>
         private static string FriendlyName(string livery) =>
             livery.Length == 0 ? "All other locos"
@@ -286,19 +411,13 @@ namespace DvMod.Autopilot
             {
                 GUILayout.BeginVertical("box", GUILayout.ExpandWidth(false));
                 GUILayout.Label("<b>" + FriendlyName(p.livery) + "</b>");
-                GUILayout.BeginHorizontal();
                 // Stored per 0.1 s tick; shown as % of the handle per second.
-                p.throttleUp = Slider("Throttle response",
-                    p.throttleUp * 1000f, 2f, 40f, "%/s", "0") / 1000f;
-                GUILayout.EndHorizontal();
-                GUILayout.BeginHorizontal();
-                p.minMoveThrottle = Slider("Throttle to start",
-                    p.minMoveThrottle * 100f, 5f, 60f, "%", "0") / 100f;
-                GUILayout.EndHorizontal();
-                GUILayout.BeginHorizontal();
-                p.maneuverKmh = Mathf.Round(Slider("Yard speed",
-                    p.maneuverKmh, 10f, 40f, "km/h", "0"));
-                GUILayout.EndHorizontal();
+                p.throttleUp = Settings.Num("Throttle response",
+                    p.throttleUp * 1000f, 2f, 40f, 1f, "0", "%/s") / 1000f;
+                p.minMoveThrottle = Settings.Num("Throttle to start",
+                    p.minMoveThrottle * 100f, 5f, 60f, 1f, "0", "%") / 100f;
+                p.maneuverKmh = Settings.Num("Yard speed",
+                    p.maneuverKmh, 10f, 40f, 1f, "0", "km/h");
                 GUILayout.EndVertical();
             }
             GUILayout.Space(4);

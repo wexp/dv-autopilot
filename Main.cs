@@ -34,6 +34,10 @@ namespace DvMod.Autopilot
             // defaults for ever, since the file is written back on every unload.
             settings.autopilot.MigrateDefaults();
 
+            // Truncates any file from a previous session: a trace from the build
+            // before last reads exactly like one from this build and is worthless.
+            Trace.Open();
+
             mod.OnGUI = OnGUI;
             mod.OnSaveGUI = OnSaveGUI;
             mod.OnToggle = OnToggle;
@@ -44,7 +48,11 @@ namespace DvMod.Autopilot
 
         private static bool OnUnload(UnityModManager.ModEntry modEntry)
         {
-            return OnToggle(modEntry, false);
+            bool ok = OnToggle(modEntry, false);
+            // Last, and after the runs are stopped, so the tail of the file holds
+            // the final state rather than ending mid-buffer.
+            Trace.Close();
+            return ok;
         }
 
         private static void OnGUI(UnityModManager.ModEntry modEntry)

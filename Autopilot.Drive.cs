@@ -104,7 +104,7 @@ namespace DvMod.Autopilot
                 var planClock = System.Diagnostics.Stopwatch.StartNew();
                 var path = Routing.FindPath(
                     track, destId, car, run.arriveEnteredIn,
-                    run.arrive, run.avoid, run.reversalPenalty);
+                    run.arrive, run.avoid.Live(), run.reversalPenalty);
                 planClock.Stop();
                 if (path == null)
                 {
@@ -129,21 +129,35 @@ namespace DvMod.Autopilot
                 // a plan that still runs through it means there IS no way round. Say so
                 // and stop, rather than shuffling between waiting and re-planning until
                 // someone notices.
-                if (run.avoid.Count > 0 && path.Any(t => run.avoid.Contains(t)))
+                var banned = path.Where(t => run.avoid.Contains(t)).Distinct().ToList();
+                if (banned.Count > 0)
                 {
-                    overrider.Throttle?.Set(0f);
-                    overrider.Brake?.Set(1f);
-                    // Name the rail that beat us either way. "Blocked and no way
-                    // round" on its own is unactionable: it does not say what to
-                    // clear, and a dispatcher reading it has nothing to go on.
-                    string beatenBy = string.Join(", ", path
-                        .Where(t => run.avoid.Contains(t))
-                        .Select(t => t.LogicTrack()?.ID?.ToString() ?? "?")
-                        .Distinct());
-                    Finish(run, "error", run.blockedReason.Length > 0
-                        ? run.blockedReason + " — and there is no way round; clear it and start again"
-                        : $"no way round {beatenBy}; clear it and start again");
-                    yield break;
+                    // Rail written off for GOOD, with the only road running through it,
+                    // is the end of the run. Name what beat us either way: "blocked and
+                    // no way round" on its own is unactionable — it does not say what
+                    // to clear, and a dispatcher reading it has nothing to go on.
+                    var dead = banned.Where(run.avoid.Permanent).ToList();
+                    if (dead.Count > 0)
+                    {
+                        overrider.Throttle?.Set(0f);
+                        overrider.Brake?.Set(1f);
+                        string beatenBy = string.Join(", ", dead
+                            .Select(t => t.LogicTrack()?.ID?.ToString() ?? "?"));
+                        Finish(run, "error", run.blockedReason.Length > 0
+                            ? run.blockedReason + " — and there is no way round; clear it and start again"
+                            : $"no way round {beatenBy}; clear it and start again");
+                        yield break;
+                    }
+                    // A ban that is merely on the clock is not worth dying over: the
+                    // road may well have cleared since, and the drive loop stops short
+                    // of whatever is actually there. Forgive it and go and look.
+                    // Killing the run here is how a shunter that moved a minute ago
+                    // still ended the job.
+                    foreach (var t in banned)
+                        run.avoid.Forgive(t);
+                    run.Note("no way round "
+                        + string.Join(", ", banned.Select(t => t.LogicTrack()?.ID?.ToString() ?? "?"))
+                        + " — taking that road again and holding for whatever is on it");
                 }
 
                 // Turntables. The router pretends the bridge reaches every stall;
@@ -265,6 +279,26 @@ namespace DvMod.Autopilot
                 if (run.mode == AutopilotMode.Shunt)
                 {
                     double len = path.Sum(t => t.GetKinkedPointSet().span);
+                    // Before condemning the move: the long way round may be long only
+                    // because WE wrote the short way off. Giving way to another train
+                    // bans the rail it is standing on, and the next plan then measured
+                    // 16.2 km round the valley and killed the run outright — the road
+                    // home was there the whole time with a train on it. Take our own
+                    // bans back and stand instead; waiting is what giving way meant.
+                    if (len > ShuntMaxRouteMeters && run.avoid.Live() is HashSet<RailTrack> mine
+                        && mine.Count > 0)
+                    {
+                        foreach (var t in mine)
+                            run.avoid.Forgive(t);
+                        overrider.Throttle?.Set(0f);
+                        overrider.Brake?.Set(1f);
+                        run.detail = $"{destId}: the way round is {len / 1000:F1} km — "
+                            + "waiting for the short road instead";
+                        run.Note($"the way round what we wrote off is {len / 1000:F1} km — "
+                            + "taking those roads back and waiting for them to clear");
+                        yield return WaitForSecondsRealtime(1f);
+                        continue;
+                    }
                     if (len > ShuntMaxRouteMeters)
                     {
                         overrider.Throttle?.Set(0f);
@@ -276,6 +310,11 @@ namespace DvMod.Autopilot
                     }
                 }
 
+                // Logged BEFORE the release, so the trace shows what the new plan is
+                // and then which blocks the change handed back — in that order, which
+                // is the order the questions get asked in.
+                Trace.Line("PLAN", () => $"{run.id} -> {destId} legs, {path.Count} tracks:"
+                    + $" {Trace.Ids(path)}");
                 ReleaseOffPlan(run, path);
                 var legs = ComputeLegs(path);
                 run.steps = CompileSteps(path, legs, run.arriveEnteredIn, destId);
@@ -565,6 +604,12 @@ namespace DvMod.Autopilot
             string cachedAuthorityAt = "";
             RailTrack? cachedAuthorityBlocked = null;
             float authorityStallFor = 0f;
+            // Where the movement trace last wrote a line. Lines come out per metre
+            // covered rather than ten a second, and always on a change of track —
+            // a log that ticks with the clock instead of with the train makes a
+            // creeping approach unreadable and a fast run under-sampled.
+            RailTrack? tracedTrack = null;
+            double tracedSpan = 0;
             float throttle = 0f;
             float fullPowerFor = 0f;
             float lastSpeedMs = Mathf.Abs(run.car.GetForwardSpeed());
@@ -694,6 +739,7 @@ namespace DvMod.Autopilot
                     run.routeRemaining = RouteRemaining(
                         path, authIdx, track, bogie.traveller.Span, towardOut);
                     PreemptWantedBlocks(run);
+                    TraceLedger();
 
                     // Tripwire: any of our wheels on rail somebody else holds is a
                     // violation of the whole model - name the moment, the rail, the
@@ -1438,7 +1484,7 @@ namespace DvMod.Autopilot
                             if (authorityStallFor >= BlockedGiveUpSeconds
                                 && cachedAuthorityBlocked != null)
                             {
-                                if (run.avoid.Add(cachedAuthorityBlocked))
+                                if (run.avoid.Strike(cachedAuthorityBlocked, AvoidSeconds))
                                 {
                                     run.detail = $"{phase}: {cachedAuthorityAt} is fouled"
                                         + " - looking for another way round";
@@ -1457,6 +1503,11 @@ namespace DvMod.Autopilot
                                 yield break;
                             }
                         }
+                        // A block held by a LIVE run gets no timer and no way out: that
+                        // run will release it when it moves, and if it never moves the
+                        // interlocking is wrong. Waiting here forever is the correct
+                        // behaviour for a train — it is also the symptom that makes the
+                        // underlying fault visible instead of papering over it.
                     }
                     else
                     {
@@ -1490,7 +1541,11 @@ namespace DvMod.Autopilot
                         overrider.Brake?.Set(1f);
                         throttle = 0f;
                         stuckFor = 0f;
-                        run.detail = $"{phase}: HOLDING - car {clearAhead:F0} m ahead ({blockedFor:F0}s)";
+                        bool following = LiveRunAhead(run, corridor, out var leader);
+                        run.detail = following
+                            ? $"{phase}: trailing {leader?.id ?? "another autopilot"} - "
+                                + $"{clearAhead:F0} m behind ({blockedFor:F0}s)"
+                            : $"{phase}: HOLDING - car {clearAhead:F0} m ahead ({blockedFor:F0}s)";
                         // Two autopilots can block each other outright: ours is stopped by
                         // their cars, theirs is stopped waiting for rail we hold. Neither
                         // can ever move, because each is the other's reason for standing
@@ -1498,10 +1553,31 @@ namespace DvMod.Autopilot
                         // this, so one of them must give way — the run that has been
                         // holding longest hands its rail back and looks for another road.
                         blockedFor += DriveTick;
-                        if (blockedFor >= ClaimDeadlockSeconds && BlockedByWaitingRun(run, corridor))
+                        if (blockedFor >= ClaimDeadlockSeconds
+                            && BlockedByWaitingRun(run, corridor, out var blocker))
                         {
                             ReleaseClaims(run);
+                            // Handing the rail back is not enough on its own: the
+                            // re-plan that follows reads the same network at the same
+                            // costs and lays the SAME road, so the two trains are back
+                            // nose to nose twenty seconds later. Write off the rail the
+                            // other train is actually STANDING on, briefly, so this
+                            // plan has to bend round it — longer each time we give way
+                            // to the same train, and never our own destination, which
+                            // is where we are going.
+                            int yields = 0;
+                            if (blocker != null)
+                            {
+                                run.yielded.TryGetValue(blocker.guid, out yields);
+                                run.yielded[blocker.guid] = ++yields;
+                                foreach (var t in TracksUnder(blocker.car, corridor))
+                                    if (t != run.destTrack)
+                                        run.avoid.Hold(t, GiveWaySeconds * yields);
+                            }
                             run.detail = $"{phase}: deadlocked with another autopilot — giving way";
+                            run.Note($"gave way to {blocker?.id ?? "another autopilot"}"
+                                + (yields > 1 ? $" ({yields} times now)" : "")
+                                + " — handed the rail back, looking for another road");
                             done(true); // hand back to Drive, which re-plans from here
                             yield break;
                         }
@@ -1548,12 +1624,20 @@ namespace DvMod.Autopilot
                         // clear exists, and the guard then refuses to drive it — so the
                         // run would sit here for ever saying "HOLDING". Try once to go
                         // round; if there is no way round, say so and stop.
-                        if (blockedFor >= BlockedGiveUpSeconds)
+                        //
+                        // Never for a train that IS going somewhere. Two consists sent the
+                        // same way share the road all the way out of the yard, and the one
+                        // behind sits at buffer distance for minutes at a time — writing
+                        // the road off after thirty seconds sent it round the houses to
+                        // reach rail the leader was about to clear anyway. A leader that
+                        // has stopped is a deadlock, and that branch fires ten seconds
+                        // earlier than this one.
+                        if (blockedFor >= BlockedGiveUpSeconds && !following)
                         {
                             overrider.Throttle?.Set(0f);
                             overrider.Brake?.Set(1f);
                             var here = track.LogicTrack()?.ID?.ToString() ?? "the line";
-                            if (run.avoid.Add(track))
+                            if (run.avoid.Strike(track, AvoidSeconds))
                             {
                                 run.detail = $"{phase}: cars ahead on {here} — looking for another way round";
                                 run.blockedReason = $"cars standing on {here}";
@@ -1604,7 +1688,7 @@ namespace DvMod.Autopilot
                         // find another one.
                         if (blockedTrack != null && switchHold > SwitchDetourSeconds)
                         {
-                            run.avoid.Add(blockedTrack);
+                            run.avoid.Strike(blockedTrack, AvoidSeconds);
                             run.blockedReason = badReason;
                             run.detail = $"{phase}: {badReason} — looking for another way round";
                             run.Note($"gave up on {blockedTrack.LogicTrack()?.ID} after "
@@ -1658,6 +1742,47 @@ namespace DvMod.Autopilot
 
                 run.limitKmh = limit;
                 float signedSpeed = car.GetForwardSpeed() * 3.6f;
+
+                // Where the train is, what it is allowed, and what it is being told to
+                // do — one line, every metre. Everything above has run by now, so a
+                // MOVE line is the state the tick actually acted on.
+                if (Trace.On)
+                {
+                    double tspan = bogie.traveller.Span;
+                    bool newTrack = tracedTrack != track;
+                    if (newTrack)
+                    {
+                        var from = tracedTrack;
+                        double entered = tspan;
+                        Trace.Line("ENTER", () => $"{run.id} trk={Trace.Id(track)}"
+                            + $" len={Trace.M(PhysicalSpan(track))}"
+                            + $" inJ={Jn(track.inJunction)} outJ={Jn(track.outJunction)}"
+                            + $" from={Trace.Id(from)} at={Trace.M(entered)}"
+                            + $" dir={(towardOut ? "out" : "in")}");
+                    }
+                    if (newTrack
+                        || Math.Abs(tspan - tracedSpan) >= Main.settings.traceStepMeters)
+                    {
+                        tracedTrack = track;
+                        tracedSpan = tspan;
+                        double auth = cachedAuthority;
+                        double clr = clearAhead;
+                        float tgt = target, lim = limit, th = throttle, v = signedSpeed;
+                        int at = pathIdx;
+                        string where = cachedAuthorityAt, who = cachedAuthorityHolder;
+                        Trace.Line("MOVE", () => $"{run.id} trk={Trace.Id(track)}"
+                            + $" span={Trace.M(tspan)}/{Trace.M(PhysicalSpan(track))}"
+                            + $" dir={(towardOut ? "out" : "in")} v={Trace.Ms(v)}"
+                            + $" nose=+{Trace.M(ownLead)}"
+                            + $" auth={Trace.M(auth)} clr={Trace.M(clr)}"
+                            + $" tgt={Trace.Ms(tgt)} lim={Trace.Ms(lim)} th={th:F2}"
+                            + $" path={at}/{path.Count}"
+                            + $" next={(at >= 0 && at + 1 < path.Count ? Trace.Id(path[at + 1]) : "-")}"
+                            + (where.Length > 0 ? $" held-at={where} by={who}" : "")
+                            + $" state={run.state}");
+                    }
+                }
+
                 run.detail += $" [{track.LogicTrack()?.ID} rev{reverser:F0} v{signedSpeed:+0;-0;0} "
                     + $"tgt{target:F0} lim{limit:F0} th{throttle:F2} clr{(clearAhead == double.MaxValue ? 999 : clearAhead):F0}"
                     + $" auth{(cachedAuthority == double.MaxValue ? 9999 : cachedAuthority):F0}]";

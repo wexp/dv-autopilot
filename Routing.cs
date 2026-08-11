@@ -52,6 +52,27 @@ namespace DvMod.Autopilot
         // fifteen kilometres — but the figure is high enough that a genuinely short way
         // round still wins.
         private const double BusyTrackPenalty = 250.0;
+        // What it costs to fall in BEHIND another run instead of crossing it, m of
+        // equivalent rail. Two trains out of Harbour for the same line share one road
+        // and always will; the second is not obstructed by the first, it is following
+        // it. Priced at nothing much: a second consist sent from HB-D7L after one from
+        // HB-D6I put itself round the whole 255-262 ladder and back onto the same road
+        // at J-494 — eight tracks and a change of ends — to dodge the single track the
+        // leader stood on. Trailing costs a gap, not a lap.
+        private const double TrailingPenalty = 40.0;
+        // What a track with PARKED stock costs once the strict search has already come
+        // back empty, m of equivalent rail.
+        //
+        // The old fallback ignored occupancy altogether, and a search that cannot see
+        // stock returns the SHORTEST road — which is the one through the nearest
+        // blocked siding. The train then found the blockages the only way that plan
+        // left it: drive up, hold thirty seconds, write the track off, re-plan into the
+        // next blocked siding. L-047 worked through D5I, D4I, D3O and D2I like that
+        // before a road via D1S — clear the whole time — was finally the shortest one
+        // left. Pricing the blocked roads instead of hiding them puts the clear one
+        // first, and where every road is blocked the cheapest is the one with the
+        // fewest blockages. High enough that no yard detour can outweigh one blockage.
+        private const double ParkedTrackPenalty = 9000.0;
         // Above this a train counts as under way rather than parked, m/s.
         private const float MovingMs = 0.3f;
 
@@ -249,12 +270,13 @@ namespace DvMod.Autopilot
         {
             if (loco == null)
                 return Search(start, destId, null, null, arriveEnteredIn, null, avoid,
-                    reversalPenalty, null, out _);
+                    reversalPenalty, null, 0, null, out _);
 
             var occupancy = Occupancy.Build(loco.trainset);
             // What the other autopilots' roads cost to cross — their claims and the
-            // rail their plans still have to cover.
-            var foreign = Autopilot.ForeignRoadCosts(loco);
+            // rail their plans still have to cover — and which steps along them are
+            // following moves rather than crossings.
+            var foreign = Autopilot.ForeignRoadCosts(loco, out var trailing);
             // The occupancy-blind fallback exists so a plan is always produced — the
             // drive's own guard then stops short of whatever is in the way. Callers can
             // tell the two apart through BlockedRoute, which describes the path actually
@@ -264,23 +286,66 @@ namespace DvMod.Autopilot
             List<RailTrack>? Try(bool? facing)
             {
                 var strict = Search(start, destId, loco, occupancy, arriveEnteredIn, facing,
-                    avoid, reversalPenalty, foreign, out var cost);
+                    avoid, reversalPenalty, foreign, 0, trailing, out var cost);
                 if (strict != null)
                     return Divert(strict, cost, facing);
+                // No clear road. Rank the blocked ones rather than falling straight to a
+                // search that cannot see stock at all: the shortest road through a full
+                // siding is the worst answer of the lot, and it is the one that plan
+                // always gave.
+                var priced = Search(start, destId, loco, occupancy, arriveEnteredIn, facing,
+                    avoid, reversalPenalty, foreign, ParkedTrackPenalty, trailing, out _);
+                if (priced != null)
+                    return priced;
                 return Search(start, destId, loco, null, arriveEnteredIn, facing,
-                    avoid, reversalPenalty, foreign, out _);
+                    avoid, reversalPenalty, foreign, 0, trailing, out _);
             }
 
             // The tracks of a path that cross live traffic: someone's claim or plan,
             // or stock under way. The destination does not count — meeting others
             // THERE is the drive loop's queueing problem, not a routing one.
+            // Following a run down its own road is not a conflict, so the tracks it is
+            // about to cover are not banned from the alternate — banning them is how a
+            // second train bound the same way was sent round the ladder.
+            bool Trails(List<RailTrack> path, int i) =>
+                i > 0 && trailing.TryGetValue(path[i - 1], out var nexts)
+                && nexts.Contains(path[i]);
+
             List<RailTrack> Conflicts(List<RailTrack> path)
             {
                 var conflicted = new List<RailTrack>();
                 for (int i = 1; i < path.Count - 1; i++)
-                    if (foreign.ContainsKey(path[i]) || occupancy.Any(path[i]))
+                    if ((foreign.ContainsKey(path[i]) || occupancy.Any(path[i]))
+                        && !Trails(path, i))
                         conflicted.Add(path[i]);
                 return conflicted;
+            }
+
+            // What of a path's cost is surcharge for crossing other runs rather than
+            // rail actually covered. Mirrors the charge Search levies: only the step
+            // from clear rail onto theirs pays.
+            double ForeignPaid(List<RailTrack> p)
+            {
+                double paid = 0;
+                for (int i = 1; i < p.Count; i++)
+                {
+                    bool live = foreign.ContainsKey(p[i])
+                        || (occupancy.Any(p[i]) && !occupancy.Parked(p[i]));
+                    bool wasLive = foreign.ContainsKey(p[i - 1])
+                        || (occupancy.Any(p[i - 1]) && !occupancy.Parked(p[i - 1]));
+                    if (!live || wasLive)
+                        continue;
+                    if (Trails(p, i))
+                    {
+                        paid += TrailingPenalty;
+                        continue;
+                    }
+                    foreign.TryGetValue(p[i], out var fc);
+                    if (occupancy.Any(p[i]) && !occupancy.Parked(p[i]))
+                        fc = System.Math.Max(fc, BusyTrackPenalty);
+                    paid += fc;
+                }
+                return paid;
             }
 
             // Second look: the best path under soft costs may still cross other
@@ -288,6 +353,12 @@ namespace DvMod.Autopilot
             // that plans CLEAN and costs no more than CleanDetourMax on top, take
             // it. (A partial dodge would just re-answer the question the soft
             // costs already answered, so there is no ladder to descend.)
+            //
+            // The budget is measured on the roads THEMSELVES, with the traffic
+            // surcharge taken off both sides. Comparing raw costs meant the dearer
+            // the direct road was priced for being busy, the further afield the
+            // "modest" detour was allowed to wander — the penalty paid for the
+            // detour it was supposed to be weighed against.
             List<RailTrack> Divert(List<RailTrack> path, double cost, bool? facing)
             {
                 // A forced entry end (via) or facing (shove/pull) IS the corridor:
@@ -305,8 +376,9 @@ namespace DvMod.Autopilot
                 foreach (var c in conflicted)
                     avoidMore.Add(c);
                 var alt = Search(start, destId, loco, occupancy, arriveEnteredIn, facing,
-                    avoidMore, reversalPenalty, foreign, out var altCost);
-                if (alt != null && Conflicts(alt).Count == 0 && altCost <= cost + CleanDetourMax)
+                    avoidMore, reversalPenalty, foreign, 0, trailing, out var altCost);
+                if (alt != null && Conflicts(alt).Count == 0
+                    && altCost - ForeignPaid(alt) <= cost - ForeignPaid(path) + CleanDetourMax)
                     return alt;
                 return path;
             }
@@ -364,9 +436,16 @@ namespace DvMod.Autopilot
             RailTrack start, string destId, TrainCar? loco, Occupancy? occupancy,
             bool? arriveEnteredIn, bool? requireFacing,
             HashSet<RailTrack>? avoid, double reversalPenalty,
-            IReadOnlyDictionary<RailTrack, double>? foreignCost, out double totalCost)
+            IReadOnlyDictionary<RailTrack, double>? foreignCost, double parkedPenalty,
+            IReadOnlyDictionary<RailTrack, HashSet<RailTrack>>? trailing,
+            out double totalCost)
         {
             totalCost = 0;
+            // Rail another run is on, or is about to be on. One test, used wherever the
+            // traffic charge is levied, so rail already paid for is not paid for twice.
+            bool Live(RailTrack t) =>
+                (foreignCost != null && foreignCost.ContainsKey(t))
+                || (occupancy != null && occupancy.Any(t) && !occupancy.Parked(t));
             // How long the train is, for the turntable fit test. No loco (a bare
             // debug route) plans as a light engine would.
             double trainLength = 0;
@@ -541,18 +620,26 @@ namespace DvMod.Autopilot
                     {
                         // Standing stock shuts the road; a train under way only makes it
                         // expensive, because it will have gone by the time we get there.
+                        // Only STANDING stock is priced here, on the track being left.
+                        // A train under way is priced on ENTRY in the hop loop, where the
+                        // step being taken says whether we are meeting it or following it.
                         double busy = 0;
                         if (occupancy != null && occupancy.Any(track))
                         {
                             if (occupancy.Parked(track))
-                                continue;
-                            busy = BusyTrackPenalty;
+                            {
+                                // Shut, unless this pass is the priced one — see
+                                // ParkedTrackPenalty. Then it is merely very dear, so a
+                                // clear road anywhere still wins and the blocked roads
+                                // are ranked instead of being picked by length alone.
+                                if (parkedPenalty <= 0)
+                                    continue;
+                                busy = parkedPenalty;
+                            }
                         }
-                        // Another autopilot's claimed or planned rail: dearer to cross,
-                        // so a new plan bends around live traffic where a sane detour
-                        // exists, instead of meeting it nose to nose and queueing.
-                        if (foreignCost != null && foreignCost.TryGetValue(track, out var fc))
-                            busy += fc;
+                        // (Another autopilot's rail is charged on ENTRY, in the hop loop
+                        // below, so a shared road costs the same whether it is one track
+                        // or ten.)
                         // Leaving by the end we came in = a reversal: no ground covered,
                         // but a stop and a change of ends - and only possible at all
                         // where the train can draw its whole length clear past the
@@ -562,8 +649,14 @@ namespace DvMod.Autopilot
                         // WIND swaps the ends, no room needed and no shunt to pay
                         // for — its cost is already on the virtual hops.
                         bool onBridgeTrack = Turntables.AsBridge(track) != null;
+                        // On the priced pass the pivots are judged the way the old blind
+                        // fallback judged them — on room alone. A yard where every pivot
+                        // has something standing on it otherwise has no legal reversal
+                        // at all, which is the other way this search comes back empty
+                        // and hands the job to a plan that cannot see stock.
                         if (exitIn == enteredIn && !onBridgeTrack
-                            && !ReversalRoom(track, enteredIn, trainLength, occupancy))
+                            && !ReversalRoom(track, enteredIn, trainLength,
+                                parkedPenalty > 0 ? null : occupancy))
                             continue;
                         // What a reversal COSTS depends on how long the train is: before
                         // the points can be thrown the whole consist must be drawn past
@@ -597,7 +690,37 @@ namespace DvMod.Autopilot
                         var next = (hop.track, hop.enteredIn, false, nextPushing);
                         if (visited.Contains(next))
                             continue;
-                        double nd = d + cost + hop.extra;
+                        // Live traffic: another run's reservation, its remaining plan, or
+                        // stock actually under way. Charged once, on the step from clear
+                        // rail ONTO theirs — the penalty stands for the wait at the
+                        // meeting point, and a yard throat is chopped into a dozen frog
+                        // stubs, so charging every one of them priced a single shared
+                        // throat at kilometres. Running along their road after that is
+                        // free: the wait has been paid for.
+                        //
+                        // And what is paid for depends on the step. Taking the same step
+                        // their plan takes is not meeting them at all — it is falling in
+                        // behind, which costs a following gap and nothing else.
+                        double traffic = 0;
+                        if (!Live(track) && Live(hop.track))
+                        {
+                            if (trailing != null && trailing.TryGetValue(track, out var nexts)
+                                && nexts.Contains(hop.track))
+                            {
+                                traffic = TrailingPenalty;
+                            }
+                            else
+                            {
+                                // One train, one wait — the leader shows up as a claim, as
+                                // rail on its plan AND as stock on the move, and adding
+                                // all three billed a single following move at 770 m.
+                                foreignCost?.TryGetValue(hop.track, out traffic);
+                                if (occupancy != null && occupancy.Any(hop.track)
+                                    && !occupancy.Parked(hop.track))
+                                    traffic = System.Math.Max(traffic, BusyTrackPenalty);
+                            }
+                        }
+                        double nd = d + cost + hop.extra + traffic;
                         if (!dist.TryGetValue(next, out var old) || nd < old)
                         {
                             dist[next] = nd;

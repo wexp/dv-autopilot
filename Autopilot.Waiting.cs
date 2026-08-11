@@ -109,8 +109,12 @@ namespace DvMod.Autopilot
             return false;
         }
 
-        private static bool BlockedByWaitingRun(Run ours, HashSet<RailTrack> corridor)
+        /// <summary>Another run standing still in our corridor — the train we are
+        /// deadlocked with. Named, because giving way means routing round where THAT
+        /// train is, and a bool cannot say where that is.</summary>
+        private static bool BlockedByWaitingRun(Run ours, HashSet<RailTrack> corridor, out Run? blocker)
         {
+            blocker = null;
             foreach (var other in runs.Values)
             {
                 if (other == ours || other.car == null)
@@ -125,9 +129,60 @@ namespace DvMod.Autopilot
                 foreach (var c in trainset.cars)
                     foreach (var b in c.Bogies)
                         if (b?.track != null && corridor.Contains(b.track))
+                        {
+                            blocker = other;
                             return true;
+                        }
             }
             return false;
+        }
+
+        /// <summary>A live run whose train is in our corridor — the one we are following.
+        /// Standing behind a train that is going somewhere is not a blocked road, however
+        /// long it takes: it is a following move, and the gap opens again as soon as the
+        /// leader draws ahead. Only stock that will never move is worth routing round. A
+        /// leader that has itself come to a stand is the deadlock branch's business, and
+        /// that fires first.</summary>
+        private static bool LiveRunAhead(Run ours, HashSet<RailTrack> corridor, out Run? leader)
+        {
+            leader = null;
+            foreach (var other in runs.Values)
+            {
+                if (other == ours || other.car == null || other.coroutine == null)
+                    continue;
+                var trainset = other.car.trainset;
+                if (trainset?.cars == null)
+                    continue;
+                foreach (var c in trainset.cars)
+                    foreach (var b in c.Bogies)
+                        if (b?.track != null && corridor.Contains(b.track))
+                        {
+                            leader = other;
+                            return true;
+                        }
+            }
+            return false;
+        }
+
+        /// <summary>The corridor tracks this consist is actually STANDING on. What a
+        /// run giving way has to bend round is where the other train is, not
+        /// everything that run happens to hold: its claims reach far up the road it
+        /// has not driven yet, and routing round all of them is routing round its
+        /// whole journey.</summary>
+        private static IEnumerable<RailTrack> TracksUnder(TrainCar? car, HashSet<RailTrack> corridor)
+        {
+            var cars = car?.trainset?.cars;
+            if (cars == null)
+                yield break;
+            var seen = new HashSet<RailTrack>();
+            foreach (var c in cars)
+            {
+                if (c == null)
+                    continue;
+                foreach (var b in c.Bogies)
+                    if (b?.track != null && corridor.Contains(b.track) && seen.Add(b.track))
+                        yield return b.track;
+            }
         }
     }
 }

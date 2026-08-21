@@ -246,6 +246,111 @@ namespace DvMod.Autopilot
                     },
                     leadingNotch: 2,
                     trailingNotch: -1),
+
+                // Measured on L-075, spot by spot: a small mount is parked where
+                // each piece goes and dumped, so the POSITIONS are real. X zeroed
+                // to the centreline as everywhere (the placements came back
+                // 0.010-0.016 off). What is NOT measured is the derived bits, each
+                // taken from the measured pairs above and called out where used —
+                // if something sits crooked, place the actual piece by hand, dump,
+                // and copy the numbers.
+                //
+                // The beacons sit 8 mm below the mount's own origin: that is the
+                // beacon-to-bracket drop BOTH measured pairs above came back with,
+                // not a number of ours — only the mount was dumped on the DE6.
+                //
+                // Rear board: the marker-spot mount read euler 0,0,270 — a small
+                // mount's own frame on a vertical wall, not the board's. The board
+                // and its long bracket take the rear-facing orientation the DE2's
+                // measured rear pair carries (identity), and the 27 mm
+                // board-off-bracket standoff both measured liveries agree on.
+                ["LocoDE6"] = new LiveryProfile(
+                    new[]
+                    {
+                        // Both ends rounded to 1.5 / 8.8 by request — the dumps
+                        // read 1.467-1.503 and 8.785-8.805, so the boards sit
+                        // symmetric within 35 mm of every measurement.
+                        //
+                        // Front (+z).
+                        Mount(MountLong, new Vector3(0f, 1.5f, 8.8f), new Vector3(0f, 180f, 0f)),
+                        Light(new Vector3(0f, 1.5f, 8.827f), new Vector3(0f, 180f, 0f), atFront: true),
+
+                        // Rear (-z).
+                        Mount(MountLong, new Vector3(0f, 1.5f, -8.8f), Vector3.zero),
+                        Light(new Vector3(0f, 1.5f, -8.827f), Vector3.zero, atFront: false),
+
+                        Mount(MountSmall, new Vector3(0f, 3.934f, 6.813f), new Vector3(90f, 270f, 0f)),
+                        Beacon(new Vector3(0f, 3.926f, 6.813f), new Vector3(90f, 270f, 0f), BeaconBlueHue, BeaconBlueItem),
+                        Beacon(new Vector3(0f, 3.926f, 6.813f), new Vector3(90f, 270f, 0f), BeaconGreenHue, BeaconBlueItem),
+                    },
+                    leadingNotch: 2,
+                    trailingNotch: -1),
+
+                // Measured on L-029 (the BE2): one marker spot dumped at the
+                // front, the rear is its mirror by request; the beacon spot's
+                // height is dumped and the beacons sit centred on the roof both
+                // ways. X zeroed throughout, board orientation and 27 mm standoff
+                // derived as on the DE6, beacon drop the measured 8 mm. The
+                // headlight switch has 4 positions with off at 1, so the notches
+                // still fit: +2 is high beam, -1 the markers.
+                ["LocoMicroshunter"] = new LiveryProfile(
+                    new[]
+                    {
+                        // Front (+z).
+                        Mount(MountLong, new Vector3(0f, 1.448f, 1.520f), new Vector3(0f, 180f, 0f)),
+                        Light(new Vector3(0f, 1.448f, 1.547f), new Vector3(0f, 180f, 0f), atFront: true),
+
+                        // Rear (-z).
+                        Mount(MountLong, new Vector3(0f, 1.448f, -1.520f), Vector3.zero),
+                        Light(new Vector3(0f, 1.448f, -1.547f), Vector3.zero, atFront: false),
+
+                        // Roof centre, blue and green as everywhere.
+                        Mount(MountSmall, new Vector3(0f, 2.855f, 0f), new Vector3(90f, 0f, 0f)),
+                        Beacon(new Vector3(0f, 2.847f, 0f), new Vector3(90f, 0f, 0f), BeaconBlueHue, BeaconBlueItem),
+                        Beacon(new Vector3(0f, 2.847f, 0f), new Vector3(90f, 0f, 0f), BeaconGreenHue, BeaconBlueItem),
+                    },
+                    leadingNotch: 2,
+                    trailingNotch: -1),
+
+                // Measured on L-005, BOTH ends dumped — mirroring the front spot
+                // did not fit this body either, so the rear has its own numbers. X
+                // zeroed (read -0.011 and 0.024), orientation and standoff derived.
+                // Its switch is 3 positions with off at 1, so the +2 clamps to the
+                // one white setup it has.
+                ["LocoDM1U"] = new LiveryProfile(
+                    new[]
+                    {
+                        // Front (+z).
+                        Mount(MountLong, new Vector3(0f, 1.546f, 6.641f), new Vector3(0f, 180f, 0f)),
+                        Light(new Vector3(0f, 1.546f, 6.668f), new Vector3(0f, 180f, 0f), atFront: true),
+
+                        // Rear (-z). Distance along the car measured at this end;
+                        // height shared with the front boards.
+                        Mount(MountLong, new Vector3(0f, 1.546f, -6.471f), Vector3.zero),
+                        Light(new Vector3(0f, 1.546f, -6.498f), Vector3.zero, atFront: false),
+                    },
+                    leadingNotch: 2,
+                    trailingNotch: -1),
+
+                // Measured on L-066, BOTH ends dumped — the DM3 is not symmetric:
+                // mirroring the front spot put the rear board inside the cab, so
+                // the rear got its own measurement, further back and lower on the
+                // hood. X zeroed (read 0.003 both times), orientation and standoff
+                // derived.
+                ["LocoDM3"] = new LiveryProfile(
+                    new[]
+                    {
+                        // Front (+z).
+                        Mount(MountLong, new Vector3(0f, 2.760f, 3.402f), new Vector3(0f, 180f, 0f)),
+                        Light(new Vector3(0f, 2.760f, 3.429f), new Vector3(0f, 180f, 0f), atFront: true),
+
+                        // Rear (-z). Distance along the car measured at this end;
+                        // height shared with the front boards.
+                        Mount(MountLong, new Vector3(0f, 2.760f, -3.705f), Vector3.zero),
+                        Light(new Vector3(0f, 2.760f, -3.732f), Vector3.zero, atFront: false),
+                    },
+                    leadingNotch: 2,
+                    trailingNotch: -1),
             };
 
         /// <summary>The markings for this livery, or null when none are measured

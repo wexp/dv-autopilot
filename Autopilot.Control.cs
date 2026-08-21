@@ -172,10 +172,8 @@ namespace DvMod.Autopilot
                 if (c == null)
                     continue;
                 var observer = c.GetComponentInChildren<MultipleUnitStateObserver>();
-                var simFlow = c.SimController?.simFlow;
-                if (observer == null || simFlow == null
-                    || string.IsNullOrEmpty(observer.temperaturePortId)
-                    || !simFlow.TryGetPort(observer.temperaturePortId, out var port, true))
+                var port = Ports.Find(c, observer?.temperaturePortId);
+                if (observer == null || port == null)
                     continue;
                 float t = port.Value;
                 warning |= t >= observer.overheatStandardThreshold;
@@ -207,10 +205,8 @@ namespace DvMod.Autopilot
                 if (c == null)
                     continue;
                 var observer = c.GetComponentInChildren<MultipleUnitStateObserver>();
-                var simFlow = c.SimController?.simFlow;
-                if (observer == null || simFlow == null
-                    || string.IsNullOrEmpty(observer.temperaturePortId)
-                    || !simFlow.TryGetPort(observer.temperaturePortId, out var port, true))
+                var port = Ports.Find(c, observer?.temperaturePortId);
+                if (observer == null || port == null)
                     continue;
                 if (observer.overheatStandardThreshold - port.Value < margin)
                 {
@@ -301,35 +297,21 @@ namespace DvMod.Autopilot
         /// TM (steam, hydraulic) simply lack these ports and read as never overheating.
         /// Checked on every loco of the consist, like the engine temperature.
         /// </summary>
-        /// <summary>Locos known to lack a given TM port — cached PER PORT, because
-        /// e.g. the DE2 carries one of the pair and not the other, and every probe
-        /// of a missing port writes a "Port not defined" line into Player.log.
-        /// Ask once per loco per port, remember the misses.</summary>
-        private static readonly HashSet<string> noTmLamp = new HashSet<string>();
-        private static readonly HashSet<string> noTmFuse = new HashSet<string>();
-
+        /// <summary>A loco carrying neither port — steam, hydraulic — simply reads
+        /// as never overheating, and the DE2 carries one of the pair and not the
+        /// other. Asked through Ports, so a machine without them costs nothing and
+        /// says nothing in the log.</summary>
         private static (bool warning, bool critical) TmOverheatState(TrainCar loco)
         {
             bool warning = false, critical = false;
             foreach (var c in MuGroup(loco))
             {
-                var simFlow = c?.SimController?.simFlow;
-                if (c == null || simFlow == null)
-                    continue;
-                if (!noTmLamp.Contains(c.CarGUID))
-                {
-                    if (simFlow.TryGetPort("tmOverheatLamp.LAMP_STATE", out var lamp, true))
-                        warning |= lamp.Value > 0.5f;
-                    else
-                        noTmLamp.Add(c.CarGUID);
-                }
-                if (!noTmFuse.Contains(c.CarGUID))
-                {
-                    if (simFlow.TryGetPort("tm.OVERHEAT_POWER_FUSE_OFF", out var fuse, true))
-                        critical |= fuse.Value > 0.5f;
-                    else
-                        noTmFuse.Add(c.CarGUID);
-                }
+                var lamp = Ports.Find(c, "tmOverheatLamp.LAMP_STATE");
+                if (lamp != null)
+                    warning |= lamp.Value > 0.5f;
+                var fuse = Ports.Find(c, "tm.OVERHEAT_POWER_FUSE_OFF");
+                if (fuse != null)
+                    critical |= fuse.Value > 0.5f;
             }
             return (warning, critical);
         }
@@ -352,7 +334,25 @@ namespace DvMod.Autopilot
                 dynHandle = 0f;
                 overrider.Throttle?.Set(0f);
                 overrider.DynamicBrake?.Set(0f);
-                overrider.Brake?.Set(1f);
+                Brakes.Train(car, overrider, 1f);
+                // Standing still is when a gearbox may be worked freely: no load on
+                // the dogs, nothing to grind. Calibration and the drop back to first
+                // both want to happen here rather than against a moving train.
+                Transmissions.HoldsThrottle(car, target, speed);
+                return;
+            }
+
+            // A machine with a gearbox chooses its ratio before it chooses a
+            // throttle, and while it is changing one the handle must be SHUT — the
+            // DM3 has no clutch and a shift under power grinds the box. Placed
+            // ahead of every other hand on the throttle so no branch below can open
+            // it mid-shift.
+            if (Transmissions.HoldsThrottle(car, target, speed))
+            {
+                throttle = 0f;
+                dynHandle = 0f;
+                overrider.Throttle?.Set(0f);
+                overrider.DynamicBrake?.Set(0f);
                 return;
             }
 
@@ -430,7 +430,7 @@ namespace DvMod.Autopilot
                 // speed on a wet grade; releasing it on each slip tick let L-066 run
                 // 11 km/h past its limit downhill and derail on stress. Keep the
                 // service air the overspeed asks for; only loco-side handles ease.
-                overrider.Brake?.Set(error < -1.0f
+                Brakes.Train(car, overrider, error < -1.0f
                     ? Mathf.Min(ServiceBrakeMax, Mathf.Clamp01(-error / 8f))
                     : 0f);
             }
@@ -446,7 +446,7 @@ namespace DvMod.Autopilot
                 overrider.Throttle?.Set(throttle);
                 dynHandle = 0f;
                 overrider.DynamicBrake?.Set(0f);
-                overrider.Brake?.Set(error < -1.0f
+                Brakes.Train(car, overrider, error < -1.0f
                     ? Mathf.Min(ServiceBrakeMax, Mathf.Clamp01(-error / 8f))
                     : 0f);
             }
@@ -461,7 +461,7 @@ namespace DvMod.Autopilot
                 // overspeed here too — it costs no heat.
                 throttle = Mathf.Max(0f, throttle - profile.throttleUp);
                 overrider.Throttle?.Set(throttle);
-                overrider.Brake?.Set(error < -1.0f
+                Brakes.Train(car, overrider, error < -1.0f
                     ? Mathf.Min(ServiceBrakeMax, Mathf.Clamp01(-error / 8f))
                     : 0f);
             }
@@ -511,7 +511,7 @@ namespace DvMod.Autopilot
                 overrider.Throttle?.Set(throttle);
                 dynHandle = 0f;
                 overrider.DynamicBrake?.Set(0f);
-                overrider.Brake?.Set(0f);
+                Brakes.Train(car, overrider, 0f);
             }
             else if (error < -1.0f)
             {
@@ -554,14 +554,14 @@ namespace DvMod.Autopilot
                         dynStallFor = 0f;
                     bool needAir = -error > DynamicBrakeAirBackupKmh
                         || dynStallFor >= DynamicBrakeStallSeconds;
-                    overrider.Brake?.Set(needAir ? service : 0f);
+                    Brakes.Train(car, overrider, needAir ? service : 0f);
                 }
                 else
                 {
                     dynamic?.Set(0f);
                     dynHandle = 0f;
                     dynStallFor = 0f;
-                    overrider.Brake?.Set(throttle <= 0.01f ? service : 0f);
+                    Brakes.Train(car, overrider, throttle <= 0.01f ? service : 0f);
                 }
             }
             else
@@ -570,7 +570,7 @@ namespace DvMod.Autopilot
                 dynHandle = 0f;
                 dynStallFor = 0f;
                 overrider.Throttle?.Set(throttle);
-                overrider.Brake?.Set(0f);
+                Brakes.Train(car, overrider, 0f);
             }
         }
 

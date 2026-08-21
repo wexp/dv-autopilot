@@ -270,12 +270,22 @@ namespace DvMod.Autopilot
         {
             var end = tt.GetTrackEnd(stall);
             if (end == null)
+            {
+                // Asked to reach a stall this table does not have. Silent until
+                // now: the caller fires and forgets, so a wind that was never
+                // ordered looked exactly like one that was ordered and ignored.
+                Main.mod?.Logger.Log(
+                    $"[TURNTABLE] {IdOf(tt)}: no track end for {stall.LogicTrack()?.ID?.ToString() ?? "?"} — not winding");
                 return;
+            }
             float current = TurntableRailTrack.AngleRange0To360(tt.currentYRotation);
             float a = TurntableRailTrack.AngleRange0To360(end.angle);
             float b = TurntableRailTrack.AngleRange0To360(end.angle + 180f);
             float goal = Mathf.Abs(TurntableRailTrack.AngleRangeNeg180To180(a - current))
                 <= Mathf.Abs(TurntableRailTrack.AngleRangeNeg180To180(b - current)) ? a : b;
+            Main.mod?.Logger.Log(
+                $"[TURNTABLE] {IdOf(tt)}: winding {current:F1} -> {goal:F1} deg "
+                + $"for {stall.LogicTrack()?.ID?.ToString() ?? "?"}");
             Rotate(IdOf(tt), goal);
         }
 
@@ -285,7 +295,10 @@ namespace DvMod.Autopilot
         /// end of the CONSIST meets the stall, and half a turn swaps it.</summary>
         public static void RotateBy180(TurntableRailTrack tt)
         {
-            Rotate(IdOf(tt), TurntableRailTrack.AngleRange0To360(tt.currentYRotation + 180f));
+            float goal = TurntableRailTrack.AngleRange0To360(tt.currentYRotation + 180f);
+            Main.mod?.Logger.Log(
+                $"[TURNTABLE] {IdOf(tt)}: winding half round, {tt.currentYRotation:F1} -> {goal:F1} deg");
+            Rotate(IdOf(tt), goal);
         }
 
         /* ------------------------------------------- who drives the table -- */
@@ -372,10 +385,12 @@ namespace DvMod.Autopilot
         {
             var controller = Find(id);
             if (controller == null)
+            {
+                // Said out loud: the callers fire and forget, so an id that names
+                // no table used to end the wind here in silence.
+                Main.mod?.Logger.Log($"[TURNTABLE] no turntable {id} — not winding");
                 return new JObject { ["error"] = $"no turntable {id}" }.ToString(Formatting.None);
-
-            if (turning.TryGetValue(id, out var previous) && previous != null)
-                Updater.StopRun(previous);
+            }
 
             float goal = TurntableRailTrack.AngleRange0To360(angle);
 
@@ -393,9 +408,24 @@ namespace DvMod.Autopilot
             var handOver = RemoteDispatchRotate();
             if (handOver != null)
             {
+                string? refusal = null;
                 try
                 {
-                    handOver.Invoke(null, new object[] { id, goal });
+                    // Its ANSWER, not just the fact that it was called. It reports
+                    // a table it cannot find as {"error": ...} and returns
+                    // normally, so a wind that never happened was indistinguishable
+                    // here from one that did — the bridge simply never moved and
+                    // the run stood waiting for a join that was not coming.
+                    refusal = Refusal(handOver.Invoke(null, new object[] { id, goal }), id, goal);
+                }
+                catch (Exception e)
+                {
+                    // Its signature moved, or it threw. Turning the table matters
+                    // more than who does it — fall through and drive it here.
+                    refusal = e.GetBaseException().Message;
+                }
+                if (refusal == null)
+                {
                     Changed?.Invoke();
                     return new JObject
                     {
@@ -406,18 +436,11 @@ namespace DvMod.Autopilot
                         ["by"] = "remote-dispatch",
                     }.ToString(Formatting.None);
                 }
-                catch (Exception e)
-                {
-                    // Its signature moved, or it threw. Turning the table matters
-                    // more than who does it — fall through and drive it here.
-                    Main.mod?.Logger.Log(
-                        $"[TURNTABLE] could not hand {id} to remote-dispatch, turning it here: {e.GetBaseException().Message}");
-                }
+                Main.mod?.Logger.Log(
+                    $"[TURNTABLE] remote-dispatch would not turn {id} ({refusal}) — turning it here");
             }
 
-            goals[id] = goal;
-            turning[id] = Updater.Run(Turn(controller, id, goal))!;
-            Changed?.Invoke();
+            DriveHere(controller, id, goal);
             return new JObject
             {
                 ["id"] = id,
@@ -426,6 +449,61 @@ namespace DvMod.Autopilot
                     controller.turntable.currentYRotation), 2),
             }.ToString(Formatting.None);
         });
+
+        /// <summary>Drive the table from this mod: our own coroutine, replacing any
+        /// turn of ours already running on that table.</summary>
+        private static void DriveHere(TurntableController controller, string id, float goal)
+        {
+            if (turning.TryGetValue(id, out var previous) && previous != null)
+                Updater.StopRun(previous);
+            goals[id] = goal;
+            turning[id] = Updater.Run(Turn(controller, id, goal))!;
+            Changed?.Invoke();
+        }
+
+        /// <summary>
+        /// What remote-dispatch complained about, or null when it took the turn on.
+        /// Its Rotate answers with a JSON string wrapped in a Task; called from the
+        /// main thread that task is normally already finished, and when it is not,
+        /// the answer is chased up asynchronously rather than waited for — blocking
+        /// the main thread on it would deadlock its own queue.
+        /// </summary>
+        private static string? Refusal(object? answer, string id, float goal)
+        {
+            if (answer is Task<string> task)
+            {
+                if (task.IsCompleted)
+                    return task.IsFaulted
+                        ? task.Exception?.GetBaseException().Message ?? "faulted"
+                        : Complaint(task.Result);
+                task.ContinueWith(finished =>
+                {
+                    string? late = finished.IsFaulted
+                        ? finished.Exception?.GetBaseException().Message ?? "faulted"
+                        : Complaint(finished.Result);
+                    if (late == null)
+                        return;
+                    // It answered too late to fall through to, so the recovery has
+                    // to be made from here: back onto the main thread and turn the
+                    // table ourselves, or the run waits for ever on a bridge that
+                    // nobody is moving.
+                    Updater.RunOnMainThread(() =>
+                    {
+                        Main.mod?.Logger.Log(
+                            $"[TURNTABLE] remote-dispatch refused {id} after the fact"
+                            + $" ({late}) — turning it here");
+                        var controller = Find(id);
+                        if (controller != null)
+                            DriveHere(controller, id, goal);
+                    });
+                });
+                return null;
+            }
+            return Complaint(answer as string);
+        }
+
+        private static string? Complaint(string? said) =>
+            said != null && said.Contains("\"error\"") ? said : null;
 
         /// <summary>
         /// The turn itself: shortest way round, lever-speed steps every frame,
@@ -464,6 +542,11 @@ namespace DvMod.Autopilot
             }
             turning.Remove(id);
             goals.Remove(id);
+            Main.mod?.Logger.Log(
+                $"[TURNTABLE] {id}: stopped at "
+                + (controller == null || controller.turntable == null
+                    ? "— the table is gone"
+                    : $"{TurntableRailTrack.AngleRange0To360(controller.turntable.currentYRotation):F1} deg"));
             Changed?.Invoke();
         }
     }

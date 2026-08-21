@@ -21,6 +21,9 @@
   <ItemGroup>
     <PackageReference Include="Krafs.Publicizer" Version="2.2.1"/>
     <Publicize Include="Assembly-CSharp" IncludeCompilerGeneratedMembers="false"/>
+    <!-- For SimulationFlow.fullPortIdToPort: the port dictionary its own
+         TryGetPort logs an error against on a miss. See Ports.cs. -->
+    <Publicize Include="DV.Simulation" IncludeCompilerGeneratedMembers="false"/>
     <!-- Lets net48 build with only the .NET SDK, no Framework dev pack installed. -->
     <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="all"/>
   </ItemGroup>
@@ -29,6 +32,7 @@
     <Reference Include="Assembly-CSharp"/>
     <Reference Include="DV.BrakeSystem"/>
     <Reference Include="DV.Simulation"/>
+    <Reference Include="DV.CabControls.Spec"/>
     <Reference Include="DV.Common"/>
     <Reference Include="DV.Interaction"/>
     <Reference Include="DV.PointSet"/>

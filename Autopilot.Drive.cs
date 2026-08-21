@@ -51,7 +51,7 @@ namespace DvMod.Autopilot
                 var track = bogie.track;
                 if (track == null)
                 {
-                    overrider.Brake?.Set(1f);
+                    Brakes.Train(car, overrider, 1f);
                     Finish(run, "error", "loco left the rails");
                     yield break;
                 }
@@ -73,26 +73,35 @@ namespace DvMod.Autopilot
                     || (run.path.Count > 0
                         && run.path[run.path.Count - 1] == run.destTrack
                         && EntryEndIsIn(run.path, run.destTrack) == run.arriveEnteredIn);
-                if (run.couple && !run.coupledDone && Coupled(run))
+                if (run.couple && Coupled(run))
                 {
-                    // Hooked on. From here it is an ordinary spot, with the cars we
-                    // just joined being shoved up the track ahead of us.
+                    // Hooked on. If that was the last cut on the destination it is an
+                    // ordinary spot from here, with what we just joined being shoved up
+                    // the track ahead of us; if another cut is still standing there we
+                    // go on and pick that up too.
                     run.coupledDone = true;
+                    // Re-arm the gain test against the train we now have. Coupled()
+                    // reads "more cars than we set off with", so without this it stays
+                    // true for ever after the first join and the NEXT cut never
+                    // registers as a pick-up of its own.
+                    run.carsAtStart = car.trainset?.cars?.Count ?? run.carsAtStart;
                     // The train we just picked up may be tied down — our own
                     // finishing tie-down pins a handbrake on every cut it leaves.
                     ReleaseHandbrakes(car);
-                    run.detail = $"coupled; tucking the train into {destId}";
+                    run.detail = MoreToCouple(run)
+                        ? $"coupled; going on for the rest of {destId}"
+                        : $"coupled; tucking the train into {destId}";
                     // If what we just hooked onto includes locos, they must not
                     // fight the lead unit's brake handle.
                     EnsureOneBrakeCutIn(car, car);
                 }
-                bool there = run.couple && !run.coupledDone
+                bool there = MoreToCouple(run)
                     ? false
                     : mayArrive && ConsistClearWithinDest(car, destId, run.destTrack);
                 if (there)
                 {
                     overrider.Throttle?.Set(0f);
-                    overrider.Brake?.Set(1f);
+                    Brakes.Train(car, overrider, 1f);
                     Finish(run, run.coupledDone ? "coupled" : "arrived", destId);
                     yield break;
                 }
@@ -108,7 +117,7 @@ namespace DvMod.Autopilot
                 planClock.Stop();
                 if (path == null)
                 {
-                    overrider.Brake?.Set(1f);
+                    Brakes.Train(car, overrider, 1f);
                     Finish(run, "error", "no route to " + destId);
                     yield break;
                 }
@@ -140,7 +149,7 @@ namespace DvMod.Autopilot
                     if (dead.Count > 0)
                     {
                         overrider.Throttle?.Set(0f);
-                        overrider.Brake?.Set(1f);
+                        Brakes.Train(car, overrider, 1f);
                         string beatenBy = string.Join(", ", dead
                             .Select(t => t.LogicTrack()?.ID?.ToString() ?? "?"));
                         Finish(run, "error", run.blockedReason.Length > 0
@@ -173,7 +182,7 @@ namespace DvMod.Autopilot
                     {
                         bool onBridge = Turntables.AsBridge(path[0]) != null;
                         overrider.Throttle?.Set(0f);
-                        overrider.Brake?.Set(1f);
+                        Brakes.Train(car, overrider, 1f);
                         if (onBridge && !AllOnTrack(car, path[0]))
                         {
                             Finish(run, "error",
@@ -236,7 +245,7 @@ namespace DvMod.Autopilot
                     if (wagonsOut != null && (wagonsOut.Value == stallAtOut) != wantWagons)
                     {
                         overrider.Throttle?.Set(0f);
-                        overrider.Brake?.Set(1f);
+                        Brakes.Train(car, overrider, 1f);
                         while (car != null && Mathf.Abs(car.GetForwardSpeed()) * 3.6f > 0.3f)
                             yield return WaitForSecondsRealtime(0.2f);
                         if (!TurnFor(run, tt0, () => Turntables.RotateBy180(tt0),
@@ -291,7 +300,7 @@ namespace DvMod.Autopilot
                         foreach (var t in mine)
                             run.avoid.Forgive(t);
                         overrider.Throttle?.Set(0f);
-                        overrider.Brake?.Set(1f);
+                        Brakes.Train(car, overrider, 1f);
                         run.detail = $"{destId}: the way round is {len / 1000:F1} km — "
                             + "waiting for the short road instead";
                         run.Note($"the way round what we wrote off is {len / 1000:F1} km — "
@@ -302,7 +311,7 @@ namespace DvMod.Autopilot
                     if (len > ShuntMaxRouteMeters)
                     {
                         overrider.Throttle?.Set(0f);
-                        overrider.Brake?.Set(1f);
+                        Brakes.Train(car, overrider, 1f);
                         Finish(run, "error",
                             $"the only road to {destId} is {len / 1000:F1} km — that is not a "
                             + "yard move; clear what is blocking the short way and start again");
@@ -348,7 +357,7 @@ namespace DvMod.Autopilot
                         // Already inside the marks (or as close as an oversize cut
                         // will ever get). Stand, rather than shuffling on for ever.
                         overrider.Throttle?.Set(0f);
-                        overrider.Brake?.Set(1f);
+                        Brakes.Train(car, overrider, 1f);
                         Finish(run, "arrived", destId);
                         yield break;
                     }
@@ -356,7 +365,7 @@ namespace DvMod.Autopilot
                     // Coupling on our own track: head for the nearest cars that are
                     // not ours, wherever they stand — the markers say where to park,
                     // not where the train to pick up is.
-                    if (run.couple && !run.coupledDone)
+                    if (MoreToCouple(run))
                     {
                         double target = NearestForeignCarSpan(car, track, bogie.traveller.Span);
                         if (!double.IsNaN(target))
@@ -397,7 +406,7 @@ namespace DvMod.Autopilot
                     run.Note($"cannot use J-{JunctionIndex(wrongJ)} — {blockedWhy}; backing clear");
                     overrider.Throttle?.Set(0f);
                     overrider.DynamicBrake?.Set(0f);
-                    overrider.Brake?.Set(1f);
+                    Brakes.Train(car, overrider, 1f);
                     while (Mathf.Abs(car.GetForwardSpeed()) * 3.6f > MovingKmh)
                         yield return WaitForSecondsRealtime(0.1f);
                     overrider.Reverser?.Set(backRev);
@@ -457,7 +466,7 @@ namespace DvMod.Autopilot
                             break; // pinned against something behind — cannot back further
                     }
                     overrider.Throttle?.Set(0f);
-                    overrider.Brake?.Set(1f);
+                    Brakes.Train(car, overrider, 1f);
                     while (car != null && Mathf.Abs(car.GetForwardSpeed()) * 3.6f > MovingKmh)
                         yield return WaitForSecondsRealtime(0.1f);
                     if (!backedClear)
@@ -500,7 +509,7 @@ namespace DvMod.Autopilot
                     // Full application: the train must actually STOP before the reverser
                     // moves, and a graduated one just drags the stop out over hundreds of
                     // metres while the leg waits.
-                    overrider.Brake?.Set(1f);
+                    Brakes.Train(car, overrider, 1f);
                     while (Mathf.Abs(car.GetForwardSpeed()) * 3.6f > MovingKmh)
                         yield return WaitForSecondsRealtime(0.1f);
                     overrider.Reverser?.Set(reverser);
@@ -546,7 +555,7 @@ namespace DvMod.Autopilot
                         if (HeldByUs(i) && HeldByUs(i + 1) && JunctionOurs(i))
                             SetSwitchBetween(path[i], path[i + 1]);
 
-                overrider.Brake?.Set(0f);
+                Brakes.Train(car, overrider, 0f);
 
                 bool ok = false;
                 yield return DriveLeg(run, bogie, path, s, e, lastLeg, reverser, destId, cruiseKmh, r => ok = r);
@@ -559,7 +568,7 @@ namespace DvMod.Autopilot
                 prevReverser = reverser;
             }
 
-            overrider.Brake?.Set(1f);
+            Brakes.Train(car, overrider, 1f);
             Finish(run, "error", "gave up after too many moves");
         }
 
@@ -610,6 +619,14 @@ namespace DvMod.Autopilot
             // creeping approach unreadable and a fast run under-sampled.
             RailTrack? tracedTrack = null;
             double tracedSpan = 0;
+            // The last place the train was seen ON rails. "loco left the rails" was
+            // the entire account of a derailment: by the time the bogie's track reads
+            // null, where it happened, how fast it was going and what it was being
+            // asked to do are all gone. Kept per tick, printed only if it comes to it.
+            RailTrack? lastTrack = null;
+            double lastSpan = 0;
+            float lastSpeed = 0f;
+            float lastTarget = 0f;
             float throttle = 0f;
             float fullPowerFor = 0f;
             float lastSpeedMs = Mathf.Abs(run.car.GetForwardSpeed());
@@ -636,7 +653,7 @@ namespace DvMod.Autopilot
             // Road runs slow on the dynamic, which pulls far more gently than air —
             // every planned slowing must start correspondingly earlier or the air
             // ends up doing the work anyway.
-            float planDecel = UseDynamicBrake && run.mode == AutopilotMode.Drive
+            float planDecel = run.profile.dynamicBrake && run.mode == AutopilotMode.Drive
                 ? DynamicPlanDecel : StopDecel;
 
             while (true)
@@ -657,8 +674,12 @@ namespace DvMod.Autopilot
                 var track = bogie.track;
                 if (track == null)
                 {
-                    overrider.Brake?.Set(1f);
-                    Finish(run, "error", "loco left the rails");
+                    Brakes.Train(car, overrider, 1f);
+                    Finish(run, "error", "loco left the rails"
+                        + (lastTrack == null
+                            ? ""
+                            : $" — last on {Trace.Id(lastTrack)} at {lastSpan:F1} m"
+                                + $" doing {lastSpeed:F1} km/h (asked for {lastTarget:F1})"));
                     done(false);
                     yield break;
                 }
@@ -715,7 +736,7 @@ namespace DvMod.Autopilot
                     float here = ConsistLimitKmh(car);
                     cachedLimit = PlannedLimitKmh(
                         track, bogie.traveller.Span, towardOut, ownLeadHint, here, LimitLookahead,
-                        UseDynamicBrake && run.mode == AutopilotMode.Drive
+                        run.profile.dynamicBrake && run.mode == AutopilotMode.Drive
                             ? DynamicPlanDecel : (float?)null);
                     cachedNearSwitch = NearDivergingSwitch(car, path);
 
@@ -790,7 +811,7 @@ namespace DvMod.Autopilot
                 // for the train to couple to from the far side of the map finds nothing
                 // — cars that far away are not even streamed in — and the run then spent
                 // the whole journey at coupling approach speed, "looking for the train".
-                bool nearDest = !run.couple || run.coupledDone
+                bool nearDest = !MoreToCouple(run)
                     || AnyCarOnTrack(car, destId)
                     || DistanceToDest(path, track, bogie.traveller.Span, towardOut) <= ApproachDistance;
 
@@ -912,7 +933,7 @@ namespace DvMod.Autopilot
                     airStop = toClear < ApproachDistance;
                     run.detail = $"{phase}: pulling clear, {toClear:F0} m";
                 }
-                else if (run.couple && !run.coupledDone && nearDest)
+                else if (MoreToCouple(run) && nearDest)
                 {
                     airStop = true;
                     // Buffer up to whatever is standing on the destination. The train we
@@ -964,7 +985,7 @@ namespace DvMod.Autopilot
                     {
                         // Close enough for the coupler to take: stop shoving and hook on.
                         overrider.Throttle?.Set(0f);
-                        overrider.Brake?.Set(1f);
+                        Brakes.Train(car, overrider, 1f);
                         throttle = 0f;
                         CouplerLogic.CoupleFirstInRange(hook!,
                             ExternalCouplingHandler.COUPLING_RANGE,
@@ -1077,7 +1098,7 @@ namespace DvMod.Autopilot
                                     if (speed < 0.5f)
                                     {
                                         overrider.Throttle?.Set(0f);
-                                        overrider.Brake?.Set(1f);
+                                        Brakes.Train(car, overrider, 1f);
                                         Finish(run, "arrived", $"{destId} — backed onto the marks");
                                         done(false);
                                         yield break;
@@ -1099,7 +1120,7 @@ namespace DvMod.Autopilot
                                     if (overrun <= OvershootAcceptMeters)
                                     {
                                         overrider.Throttle?.Set(0f);
-                                        overrider.Brake?.Set(1f);
+                                        Brakes.Train(car, overrider, 1f);
                                         Finish(run, "arrived",
                                             $"{destId} — {overrun:F0} m past the marks, left there");
                                         done(false);
@@ -1352,7 +1373,7 @@ namespace DvMod.Autopilot
                             && (LocoOnTrack(car, destId) || AnyCarOnTrack(car, destId)))
                         {
                             overrider.Throttle?.Set(0f);
-                            overrider.Brake?.Set(1f);
+                            Brakes.Train(car, overrider, 1f);
                             Finish(run, "arrived", $"{destId} — pulled up at the end of the rail");
                             done(false);
                             yield break;
@@ -1381,7 +1402,7 @@ namespace DvMod.Autopilot
                                     // a bogie is STILL off the bridge: it does not
                                     // fit, and turning would drag it into the pit.
                                     overrider.Throttle?.Set(0f);
-                                    overrider.Brake?.Set(1f);
+                                    Brakes.Train(car, overrider, 1f);
                                     Finish(run, "error",
                                         "the consist does not fit on the turntable bridge");
                                     done(false);
@@ -1538,7 +1559,7 @@ namespace DvMod.Autopilot
                     if (clearAhead < buffer)
                     {
                         overrider.Throttle?.Set(0f);
-                        overrider.Brake?.Set(1f);
+                        Brakes.Train(car, overrider, 1f);
                         throttle = 0f;
                         stuckFor = 0f;
                         bool following = LiveRunAhead(run, corridor, out var leader);
@@ -1612,7 +1633,7 @@ namespace DvMod.Autopilot
                             && !AutopilotStockAhead(corridor, car.trainset))
                         {
                             overrider.Throttle?.Set(0f);
-                            overrider.Brake?.Set(1f);
+                            Brakes.Train(car, overrider, 1f);
                             Finish(run, "arrived",
                                 destId + " - pulled up behind the stock standing there");
                             done(false);
@@ -1635,7 +1656,7 @@ namespace DvMod.Autopilot
                         if (blockedFor >= BlockedGiveUpSeconds && !following)
                         {
                             overrider.Throttle?.Set(0f);
-                            overrider.Brake?.Set(1f);
+                            Brakes.Train(car, overrider, 1f);
                             var here = track.LogicTrack()?.ID?.ToString() ?? "the line";
                             if (run.avoid.Strike(track, AvoidSeconds))
                             {
@@ -1679,7 +1700,7 @@ namespace DvMod.Autopilot
                     if (badDist < ObstacleBuffer)
                     {
                         overrider.Throttle?.Set(0f);
-                        overrider.Brake?.Set(1f);
+                        Brakes.Train(car, overrider, 1f);
                         throttle = 0f;
                         stuckFor = 0f;
                         switchHold += 0.1f;
@@ -1733,15 +1754,21 @@ namespace DvMod.Autopilot
                     // restrictions at line speed. A shunt never gets fast enough
                     // for it to bite and just wants the air — and even on the
                     // road, a planned STOP is the air's job (see airStop).
-                    // Currently held off entirely by UseDynamicBrake: see the
-                    // constant for why the DH4 could not live with it.
-                    UseDynamicBrake && run.mode == AutopilotMode.Drive && !airStop,
+                    // Off unless this machine's profile says it has one worth
+                    // using: see LocoProfile.dynamicBrake for why the DH4 could
+                    // not live with it.
+                    run.profile.dynamicBrake && run.mode == AutopilotMode.Drive && !airStop,
                     run.heatCap,
                     tempWarning || tmWarning,
                     tempCritical || tmCritical);
 
                 run.limitKmh = limit;
                 float signedSpeed = car.GetForwardSpeed() * 3.6f;
+
+                lastTrack = track;
+                lastSpan = bogie.traveller.Span;
+                lastSpeed = signedSpeed;
+                lastTarget = target;
 
                 // Where the train is, what it is allowed, and what it is being told to
                 // do — one line, every metre. Everything above has run by now, so a
@@ -1817,13 +1844,19 @@ namespace DvMod.Autopilot
                         overrider.IndependentBrake?.Set(0f);
                         indepPinned = false;
                     }
-                    if (run.coupledDone && stuckFor > 10f)
+                    if (run.coupledDone && !MoreToCouple(run) && stuckFor > 10f)
                     {
                         // The train is coupled and being shoved in, but has stopped
                         // moving: the siding has no more room. That is a finished job
                         // with a caveat, not a failure.
+                        //
+                        // Not while a cut is still standing on the destination: what we
+                        // are pressed against then is the next thing to pick up, and
+                        // calling that "no room" would end the run one coupling short.
+                        // If the hook genuinely will not take, the stuck timer below
+                        // still catches it, and says so honestly.
                         overrider.Throttle?.Set(0f);
-                        overrider.Brake?.Set(1f);
+                        Brakes.Train(car, overrider, 1f);
                         Finish(run, "coupled",
                             $"coupled, but {destId} has no room for the whole consist");
                         done(false);
@@ -1832,7 +1865,7 @@ namespace DvMod.Autopilot
                     if (fullPowerFor > StuckAtFullPowerSeconds || stuckFor > StuckGiveUpSeconds)
                     {
                         overrider.Throttle?.Set(0f);
-                        overrider.Brake?.Set(1f);
+                        Brakes.Train(car, overrider, 1f);
                         Finish(run, "error", fullPowerFor > StuckAtFullPowerSeconds
                             ? "stuck — full power will not move it (handbrake, grade or obstruction)"
                             : "stuck — check direction or obstruction");

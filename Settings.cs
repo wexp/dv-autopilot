@@ -320,17 +320,59 @@ namespace DvMod.Autopilot
         public float minMoveThrottle = 0.25f;
         /// <summary>Top speed for yard moves, km/h.</summary>
         public float maneuverKmh = 25f;
+        /// <summary>Ceiling on road cruise for this machine, km/h; 0 = no ceiling of
+        /// its own, so only the line's limits and the command's own figure apply.
+        /// This is autopilot policy, not a statement about the prototype: a shunter
+        /// sent down the main line should not be asked for 80 just because the
+        /// lineside signs allow it.</summary>
+        public float topKmh = 0f;
+        /// <summary>Whether the autopilot may brake this machine on its dynamic.
+        /// Off everywhere by default — the DH4's retarder churns the same oil its
+        /// temperature gauge reads, and slowing on it cooked the loco, so dynamic
+        /// braking was switched off wholesale. Kept per machine now so it can come
+        /// back on the ones that have a real dynamic without touching the DH4.</summary>
+        public bool dynamicBrake = false;
+
+        /* --------------------------------------------------------- gearbox -- */
+
+        /// <summary>Change up when the engine is this far from max-power revs toward
+        /// the redline, as a fraction of that remaining band. Geared machines only
+        /// (DM1U, DM3); ignored by everything else.</summary>
+        public float upshiftBand = 0.5f;
+        /// <summary>Throttle at or below which the engine is not being asked for
+        /// power, so peak revs mean a gear too low rather than a gear working. See
+        /// Transmissions.Choose.</summary>
+        public float cruiseThrottle = 0.5f;
+        /// <summary>What the gear levers want written for each position, learned by
+        /// calibration on the first machine of this livery and kept here so the
+        /// sweep — the lever dance before the first start — happens once per install
+        /// rather than once per session. Empty = not learned yet. leverB is used
+        /// only by the two-box DM3.</summary>
+        public List<float> gearLeverA = new List<float>();
+        public List<float> gearLeverB = new List<float>();
 
         public LocoProfile() { }
 
         public LocoProfile(string livery, float throttleUp,
-            float minMoveThrottle, float maneuverKmh)
+            float minMoveThrottle, float maneuverKmh, float topKmh = 0f)
         {
             this.livery = livery;
             this.throttleUp = throttleUp;
             this.minMoveThrottle = minMoveThrottle;
             this.maneuverKmh = maneuverKmh;
+            this.topKmh = topKmh;
         }
+
+        /// <summary>A fresh copy of the built-in defaults; the learned gear map is
+        /// deliberately NOT copied, being a property of the install and not of the
+        /// default.</summary>
+        public LocoProfile Copy() => new LocoProfile(livery, throttleUp,
+            minMoveThrottle, maneuverKmh, topKmh)
+        {
+            dynamicBrake = dynamicBrake,
+            upshiftBand = upshiftBand,
+            cruiseThrottle = cruiseThrottle,
+        };
     }
 
     public class LocoProfiles
@@ -341,25 +383,43 @@ namespace DvMod.Autopilot
         /// default could never reach an existing install: the reload saved the stale
         /// values back over it every time.
         /// </summary>
-        private const int CurrentVersion = 4;
+        private const int CurrentVersion = 5;
 
         public int version;
         public List<LocoProfile> profiles = new List<LocoProfile>();
 
         /// <summary>Replace saved profiles with the current defaults when those defaults
         /// have moved on. Hand-tuned values are lost at that point, which is the price
-        /// of being able to ship a better starting point at all.</summary>
+        /// of being able to ship a better starting point at all. A learned gear map
+        /// survives: it is not a tuning choice but a measurement of the machine, and
+        /// throwing it away only means dancing the levers again for nothing.</summary>
         public void MigrateDefaults()
         {
             if (version >= CurrentVersion && profiles.Count > 0)
                 return;
+            var maps = new Dictionary<string, (List<float> a, List<float> b)>();
+            foreach (var p in profiles)
+            {
+                if (p.gearLeverA.Count > 0)
+                    maps[p.livery] = (p.gearLeverA, p.gearLeverB);
+            }
             profiles.Clear();
             EnsureDefaults();
+            foreach (var p in profiles)
+            {
+                if (maps.TryGetValue(p.livery, out var map))
+                {
+                    p.gearLeverA = map.a;
+                    p.gearLeverB = map.b;
+                }
+            }
             version = CurrentVersion;
         }
 
         /// <summary>Sensible starting points per stock loco. Anything not listed —
-        /// including custom (CCL) locos — falls back to the empty-livery default.</summary>
+        /// including custom (CCL) locos — falls back to the empty-livery default.
+        /// The road ceiling (last figure) is a policy cap, left at 0 — line limits
+        /// only — for the machines that belong on the main line.</summary>
         private static readonly LocoProfile[] Defaults =
         {
             new LocoProfile("", 0.012f, 0.25f, 25f),
@@ -369,9 +429,24 @@ namespace DvMod.Autopilot
             // wheels down.
             new LocoProfile("LocoDE2", 0.006f, 0.22f, 20f),
             new LocoProfile("LocoDE6", 0.012f, 0.25f, 25f),
+            // The DH4 opens quicker than the electrics: the converter absorbs the
+            // step rather than putting it straight through to the rail. Its dynamic
+            // stays off — see LocoProfile.dynamicBrake for why that is where the
+            // switch lives now.
             new LocoProfile("LocoDH4", 0.015f, 0.30f, 25f),
+            // Geared, two boxes, eight ratios. Shifts are clutchless, so the box is
+            // walked one ratio at a time and the throttle shuts for each.
             new LocoProfile("LocoDM3", 0.015f, 0.30f, 25f),
-            new LocoProfile("LocoBE2", 0.025f, 0.40f, 20f),
+            // Geared, one box. Small enough that a road cap is worth having: it will
+            // be sent down the line, and asking a shunter for main-line speed is how
+            // it ends up screaming in top gear.
+            new LocoProfile("LocoDM1U", 0.015f, 0.30f, 20f, 45f),
+            // Battery shunters: coarse controllers, so they need a big share of the
+            // handle before anything happens at all, and they stay in the yard.
+            new LocoProfile("LocoBE2", 0.025f, 0.40f, 20f, 30f),
+            new LocoProfile("LocoMicroshunter", 0.025f, 0.40f, 15f, 20f),
+            // Steam: the regulator is worked gently and the cut-off is not ours to
+            // touch, so both get the slow hand.
             new LocoProfile("LocoS060", 0.010f, 0.25f, 20f),
             new LocoProfile("LocoS282A", 0.010f, 0.25f, 20f),
         };
@@ -384,14 +459,42 @@ namespace DvMod.Autopilot
                 ?? Defaults[0];
         }
 
+        /// <summary>Keep what calibration worked out about a livery's gear levers, so
+        /// the next machine of that kind — and the next session — starts already
+        /// knowing. Written straight to Settings.xml rather than waiting for the
+        /// unload: a crash mid-journey should not cost the measurement.</summary>
+        public void LearnGears(string? livery, float[] leverA, float[] leverB)
+        {
+            if (livery == null || livery.Length == 0 || leverA.Length == 0)
+                return;
+            EnsureDefaults();
+            var profile = profiles.Find(p => p.livery == livery);
+            if (profile == null)
+            {
+                // A livery with no profile of its own — a CCL loco — drives on the
+                // catch-all's numbers, but its gear map belongs to it alone.
+                var fallback = For(livery);
+                profile = fallback.Copy();
+                profile.livery = livery;
+                profiles.Add(profile);
+            }
+            profile.gearLeverA = new List<float>(leverA);
+            profile.gearLeverB = new List<float>(leverB);
+        }
+
         internal void EnsureDefaults()
         {
             if (profiles.Count > 0)
                 return;
             foreach (var d in Defaults)
-                profiles.Add(new LocoProfile(d.livery, d.throttleUp,
-                    d.minMoveThrottle, d.maneuverKmh));
+                profiles.Add(d.Copy());
         }
+
+        /// <summary>Stock liveries with a gearbox, so the panel offers their shift
+        /// settings before the first calibration has happened. Anything else that
+        /// turns out to be geared gets them once its map is learned.</summary>
+        private static readonly HashSet<string> Geared =
+            new HashSet<string> { "LocoDM1U", "LocoDM3" };
 
         /// <summary>"LocoDE6" → "DE6"; the empty livery is the catch-all.</summary>
         private static string FriendlyName(string livery) =>
@@ -405,7 +508,10 @@ namespace DvMod.Autopilot
             GUILayout.Label(
                 "Throttle response: how quickly the handle opens (higher = livelier, "
                 + "more wheelslip risk).\nThrottle to start: the least that gets that "
-                + "machine rolling.\nYard speed: top speed for shunting moves.");
+                + "machine rolling.\nYard speed: top speed for shunting moves.\n"
+                + "Road ceiling: never asked for more than this on the line; 0 means "
+                + "the line's own limits only.\nUpshift point and cruise throttle are "
+                + "for geared machines (DM1U, DM3) and do nothing on the rest.");
             GUILayout.Space(4);
             foreach (var p in profiles)
             {
@@ -418,6 +524,32 @@ namespace DvMod.Autopilot
                     p.minMoveThrottle * 100f, 5f, 60f, 1f, "0", "%") / 100f;
                 p.maneuverKmh = Settings.Num("Yard speed",
                     p.maneuverKmh, 10f, 40f, 1f, "0", "km/h");
+                p.topKmh = Settings.Num("Road ceiling",
+                    p.topKmh, 0f, 120f, 5f, "0", "km/h (0 = no cap)");
+                p.dynamicBrake = GUILayout.Toggle(p.dynamicBrake,
+                    "  Brake on the dynamic as well as the air");
+                if (p.gearLeverA.Count > 0 || Geared.Contains(p.livery))
+                {
+                    p.upshiftBand = Settings.Num("Upshift point",
+                        p.upshiftBand * 100f, 0f, 100f, 5f, "0",
+                        "% of the band above peak power") / 100f;
+                    p.cruiseThrottle = Settings.Num("Cruise throttle",
+                        p.cruiseThrottle * 100f, 0f, 100f, 5f, "0",
+                        "% — at or below this, peak revs mean a gear too low") / 100f;
+                    GUILayout.BeginHorizontal();
+                    GUILayout.Label(p.gearLeverA.Count > 0
+                        ? "  Gear map: learned"
+                        : "  Gear map: not learned yet", GUILayout.Width(180));
+                    // The sweep is the lever dance before a first start. Forgetting
+                    // is the only way to redo it after a game update moves the ports.
+                    if (p.gearLeverA.Count > 0
+                        && GUILayout.Button("Forget", GUILayout.Width(70)))
+                    {
+                        p.gearLeverA.Clear();
+                        p.gearLeverB.Clear();
+                    }
+                    GUILayout.EndHorizontal();
+                }
                 GUILayout.EndVertical();
             }
             GUILayout.Space(4);

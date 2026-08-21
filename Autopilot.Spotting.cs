@@ -535,6 +535,32 @@ namespace DvMod.Autopilot
             return now > run.carsAtStart && GainedIsTarget(run);
         }
 
+        /// <summary>
+        /// Is there still something on the destination to pick up?
+        ///
+        /// Coupling used to be a ONE-SHOT: the first join latched coupledDone and every
+        /// coupling gate went dead with it, so a second cut standing on the same track
+        /// was demoted to an ordinary obstacle — the loco shoved the first cut up
+        /// against it, stopped a buffer short and called that the arrival. E4O holds
+        /// two cuts close together as a matter of course, and only one of them ever
+        /// came away.
+        ///
+        /// The terminator costs nothing: a cut we have joined is part of OUR trainset
+        /// from that moment, so it stops reading as foreign and this goes false by
+        /// itself once the track is picked clean.
+        ///
+        /// Before the first join the answer is an unconditional yes, which is exactly
+        /// what !coupledDone used to mean. That keeps the awkward cases the old test
+        /// covered — a cut lying on the lead outside the siding, or a jobless wagon
+        /// filed under no track at all, neither of which counts as stock on the
+        /// destination — behaving as they did.
+        /// </summary>
+        private static bool MoreToCouple(Run run) =>
+            run.couple
+            && (!run.coupledDone
+                || (run.destTrack != null
+                    && ForeignStockOn(run.destTrack, run.car?.trainset)));
+
         /// <summary>True when no bogie of our consist is on the given track.</summary>
         private static bool AllOffTrack(TrainCar loco, RailTrack track)
         {

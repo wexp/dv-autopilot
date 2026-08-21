@@ -327,6 +327,34 @@ namespace DvMod.Autopilot
         private static string RunNameOf(string guid) =>
             runs.TryGetValue(guid, out var r) ? r.id : guid;
 
+        /// <summary>The live run this car belongs to, if any.
+        ///
+        /// Everything downstream turns on the difference between "a train is in the
+        /// way" and "something is parked in the way": the first clears itself and is
+        /// waited for, the second never will and the road is written off after thirty
+        /// seconds. Refusals used to name the offending CAR — CFF663 — which matches no
+        /// run name, so another autopilot fouling a frog read as abandoned stock and
+        /// L-006 re-routed round the whole of Harbour rather than wait ten seconds for
+        /// L-000 to pull forward.</summary>
+        private static Run? RunOwning(TrainCar? car)
+        {
+            if (car?.trainset == null)
+                return null;
+            foreach (var r in runs.Values)
+                if (r.coroutine != null && r.car != null && r.car.trainset == car.trainset)
+                    return r;
+            return null;
+        }
+
+        /// <summary>The live run with stock standing on this track, if any.</summary>
+        private static Run? RunStandingOn(RailTrack track)
+        {
+            foreach (var r in runs.Values)
+                if (r.coroutine != null && r.car != null && OurCarsOn(r.car, track))
+                    return r;
+            return null;
+        }
+
         /// <summary>A junction as the trace and the run notes name it — the same number
         /// the game's own switch signs carry, so a line can be walked to on the ground.
         /// Lives here rather than in Trace because the index is ours, not the game's.</summary>
@@ -373,7 +401,7 @@ namespace DvMod.Autopilot
                             b = x;
                             break;
                         }
-                sb.Append($"\n  {r.id} seq={r.seq} load={LoadingMove(r)} state={r.state}")
+                sb.Append($"\n  {r.id} seq={r.seq} rank={RankName(r)} state={r.state}")
                   .Append($" trk={Trace.Id(b?.track)}")
                   .Append($" span={(b == null ? "-" : Trace.M(b.traveller.Span))}")
                   .Append($" v={(r.car == null ? "-" : Trace.Ms(Mathf.Abs(r.car.GetForwardSpeed()) * 3.6f))}")
@@ -427,21 +455,44 @@ namespace DvMod.Autopilot
                 && wanter.coroutine != null;
         }
 
-        /// <summary>A move onto or off a LOADING track. Those are the moves the yard
-        /// exists to make; a run crossing the throat on its way somewhere else waits for
-        /// them.</summary>
-        private static bool LoadingMove(Run run) =>
-            run.originTrack?.LogicTrack()?.ID?.trackType == "L"
-            || run.destTrack?.LogicTrack()?.ID?.trackType == "L";
+        /// <summary>
+        /// Where a run stands in the yard's order of business. Lower takes the rail.
+        ///
+        ///   0 — LEAVING a loading track. Highest, and above dispatch order: that track
+        ///       cannot be used by anything else until this train is off it, so every
+        ///       minute it is held short is a minute the loader stands idle. A train on
+        ///       its way IN to the same road is waiting for this one by definition.
+        ///   1 — going TO a loading track. The work the yard exists to do.
+        ///   2 — everything else: crossing the throat on the way somewhere.
+        ///
+        /// A run both leaving and heading for a loading road counts as leaving; it is
+        /// clearing a berth either way.
+        /// </summary>
+        private static int LoadingRank(Run run)
+        {
+            if (run.originTrack?.LogicTrack()?.ID?.trackType == "L")
+                return 0;
+            if (run.destTrack?.LogicTrack()?.ID?.trackType == "L")
+                return 1;
+            return 2;
+        }
 
-        /// <summary>Which of two runs takes the rail. Loading moves first; between two of
-        /// the same kind, the one dispatched first. Fixed order, both ways round — a rule
-        /// that can call each of a pair the senior is how two trains take turns giving way
-        /// and neither arrives.</summary>
+        /// <summary>Which of two runs takes the rail: the yard's order of business
+        /// first, then the one dispatched first. Fixed order, both ways round — a rule
+        /// that can call each of a pair the senior is how two trains take turns giving
+        /// way and neither arrives.</summary>
         private static bool Outranks(Run other, Run ours) =>
-            LoadingMove(other) != LoadingMove(ours)
-                ? LoadingMove(other)
+            LoadingRank(other) != LoadingRank(ours)
+                ? LoadingRank(other) < LoadingRank(ours)
                 : other.seq < ours.seq;
+
+        /// <summary>The rank as one word, for the trace.</summary>
+        private static string RankName(Run run) => LoadingRank(run) switch
+        {
+            0 => "leaving-L",
+            1 => "to-L",
+            _ => "through",
+        };
 
         /// <summary>How much rail a run still has to cover before it reaches this block,
         /// m, or -1 if its plan does not reach it inside the priority range. Measured in
@@ -505,12 +556,12 @@ namespace DvMod.Autopilot
                 var q = queued;
                 Trace.Line("WANT", () => $"{run.id} {KeyName(key)} NOT queued —"
                     + $" {q.id} already there and senior"
-                    + $" (load={LoadingMove(q)}/{LoadingMove(run)} seq={q.seq}/{run.seq})");
+                    + $" ({RankName(q)}/{RankName(run)} seq={q.seq}/{run.seq})");
                 return; // a senior run is already queued here
             }
             blockWants[key] = (run.guid, Time.realtimeSinceStartup);
             Trace.Line("WANT", () => $"{run.id} {KeyName(key)} queued"
-                + $" (load={LoadingMove(run)} seq={run.seq})");
+                + $" ({RankName(run)} seq={run.seq})");
         }
 
         /// <summary>May we take this block off the run that holds it?
@@ -567,7 +618,7 @@ namespace DvMod.Autopilot
                 return "holder-standing-at-it";
             return Outranks(run, other)
                 ? "we-outrank"
-                : $"holder-senior(load={LoadingMove(other)}/{LoadingMove(run)}"
+                : $"holder-senior({RankName(other)}/{RankName(run)}"
                     + $" seq={other.seq}/{run.seq})";
         }
 
@@ -612,7 +663,9 @@ namespace DvMod.Autopilot
             // to) what stands there is the drive loop's job.
             if (track != run.destTrack && ForeignStockOn(track, run.car?.trainset))
             {
-                holder = "stock standing on " + (track.LogicTrack()?.ID?.ToString() ?? "it");
+                // Same again: a run standing there is named, so the wait is a wait.
+                holder = RunStandingOn(track)?.id
+                    ?? "stock standing on " + (track.LogicTrack()?.ID?.ToString() ?? "it");
                 Trace.Line("GRANT", () => $"{run.id} trk={Trace.Id(track)} -> DENIED"
                     + " rule=foreign-stock");
                 return false;
@@ -719,7 +772,11 @@ namespace DvMod.Autopilot
                 // drawn this distinction; the car check never did.
                 if (ParkedBehindUsAt(junction, fouler, ours))
                     continue;
-                holder = fouler.ID;
+                // Name the RUN when the fouling stock is being driven by one. The caller
+                // waits for a name it recognises and writes the road off for one it does
+                // not, so calling another autopilot by its car number is the difference
+                // between queueing and touring the valley.
+                holder = RunOwning(fouler)?.id ?? fouler.ID;
                 var f = fouler;
                 Trace.Line("JUNC", () => $"{run.id} {Jn(junction)} -> DENIED rule=fouled"
                     + $" car={f.ID} dNode={Trace.M(BodyDistanceToJunction(junction, f))}"
@@ -1295,12 +1352,33 @@ namespace DvMod.Autopilot
         {
             if (run.car == null)
                 return;
+            // The rail this run still has to cover. Anything it holds that is NOT in
+            // here is a block it will never drive over — a junction grant takes all
+            // three legs, and the third leg is the one the train coming the other way
+            // is standing on.
+            var ahead = new HashSet<RailTrack>();
+            for (int i = Math.Max(0, run.pathFrom); i < run.path.Count; i++)
+                if (run.path[i] != null)
+                    ahead.Add(run.path[i]);
+
             List<RailTrack>? giveTracks = null;
             foreach (var track in run.claimed)
             {
                 if (OurCarsOn(run.car, track))
                     continue;
                 if (WantedByOlder(track, run, out _))
+                {
+                    (giveTracks ??= new List<RailTrack>()).Add(track);
+                    continue;
+                }
+                // A leg we are not going to use goes to whoever asks, senior or not.
+                // Rank decides who takes rail that BOTH trains need; it has no business
+                // deciding rail only one of them needs. L-006 outranked L-000 and so
+                // kept #Y-#S1637#T, which its own route never touches — and L-000 could
+                // not pull forward off the frog that was blocking L-006. Seniority held
+                // the senior train up.
+                if (!ahead.Contains(track) && Wanter(track, out var asker) && asker != run
+                    && asker.coroutine != null)
                     (giveTracks ??= new List<RailTrack>()).Add(track);
             }
             if (giveTracks != null)
@@ -1309,9 +1387,11 @@ namespace DvMod.Autopilot
                     if (claims.TryGetValue(track, out var guid) && guid == run.guid)
                         claims.Remove(track);
                     run.claimed.Remove(track);
-                    WantedByOlder(track, run, out var to);
+                    string to = Wanter(track, out var asked) ? asked.id : "someone";
+                    bool onRoute = ahead.Contains(track);
                     Trace.Line("RELEASE", () => $"{run.id} -trk {Trace.Id(track)}"
-                        + $" via=preempt (wanted by {to})");
+                        + $" via=preempt (wanted by {to}"
+                        + (onRoute ? ", senior" : ", and not on our road") + ")");
                 }
 
             List<Junction>? giveJunctions = null;

@@ -377,6 +377,12 @@ namespace DvMod.Autopilot
                     // Where it is and what it is doing, so a stopped train can be
                     // told apart from a slow one without watching it.
                     ["dest"] = destTrack?.LogicTrack()?.ID?.ToString(),
+                    // Where it started and what that makes it in the yard's order
+                    // of business (leaving-L beats to-L beats through, then
+                    // dispatch order). Both were invisible from outside, so "why
+                    // did THAT one get the road" could not be answered at all.
+                    ["origin"] = originTrack?.LogicTrack()?.ID?.ToString(),
+                    ["rank"] = RankName(this),
                     ["track"] = bogie?.track?.LogicTrack()?.ID?.ToString(),
                     ["span"] = bogie == null ? null : (JToken)Math.Round(bogie.traveller.Span, 1),
                     // `car != null` and NOT `car?.`: a loco cleared out from under a
@@ -468,10 +474,8 @@ namespace DvMod.Autopilot
                     foreach (var c in MuGroup(car))
                     {
                         var observer = c?.GetComponentInChildren<MultipleUnitStateObserver>();
-                        var simFlow = c?.SimController?.simFlow;
-                        if (observer == null || simFlow == null
-                            || string.IsNullOrEmpty(observer.temperaturePortId)
-                            || !simFlow.TryGetPort(observer.temperaturePortId, out var port, true))
+                        var port = Ports.Find(c, observer?.temperaturePortId);
+                        if (observer == null || port == null)
                             continue;
                         temps.Add(new JObject
                         {
@@ -693,19 +697,18 @@ namespace DvMod.Autopilot
         // ended as an air stop. Plan gentler and the braking starts earlier
         // instead, far enough out that the dynamic alone usually makes it.
         private const float DynamicPlanDecel = 0.18f;
-        // ...but the dynamic is SWITCHED OFF for now. On the DH4 the retarder
+        // ...but the dynamic is SWITCHED OFF by default. On the DH4 the retarder
         // churns the same transmission oil the temperature gauge reads, so
         // slowing on it cooked the loco - and the overheat handling then
         // alternated air and dynamic without ever settling into a real brake
         // application, because the tempWarning branch below only bites while
         // the throttle is still open and during braking it is already shut.
-        // Nothing is deleted: flip this back to true to have it all again.
-        private const bool UseDynamicBrake = false;
+        // That is one machine's problem, so the switch now lives in each loco's
+        // profile (LocoProfile.dynamicBrake) rather than across the whole fleet.
+        // Nothing is deleted: tick it on a machine to have it all again there.
 
-        // Never open the throttle past this — a full-power launch spins the wheels
-        // and cooks the traction motors. Notch up/down at these rates per 0.1 s
-        // tick; back off hard the instant the wheels slip.
-        private const float ThrottleUp = 0.012f;
+        // Notch down at this rate per 0.1 s tick when the wheels slip; the rate the
+        // handle OPENS at is the loco's own (LocoProfile.throttleUp).
         private const float ThrottleDown = 0.1f;
         private const float SlipThreshold = 0.06f;
         // Slip this bad is a break-away, not an edge case of adhesion: the wheels
@@ -812,9 +815,6 @@ namespace DvMod.Autopilot
         // as blocked, s. Long enough for another train to pull clear, short enough that
         // a run does not sit in front of a parked rake until somebody notices.
         private const float BlockedGiveUpSeconds = 30f;
-        // Below this the coarsest loco has no notch at all, so a command to move that
-        // lands under it does nothing.
-        private const float MinMoveThrottle = 0.25f;
         // Smoothing applied to the measured acceleration, per tick (about a second of
         // memory), and how far over the adhesion limit counts as really over.
         private const float AccelSmoothing = 0.1f;
@@ -1191,6 +1191,9 @@ namespace DvMod.Autopilot
                     return Json("error", "loco not on a track");
 
                 var start = bogies[1].track;
+                // Every speed below is this machine's to give or refuse: a road
+                // ceiling and a yard pace are per locomotive, not per fleet.
+                var profile = Main.settings.autopilot.For(car.carLivery?.id);
 
                 // The two modes are not the same move with different numbers: each
                 // decides its own destination, its own speed and its own idea of what a
@@ -1207,6 +1210,11 @@ namespace DvMod.Autopilot
                     couple = false;
                     viaJunction = null;
                     arrive = ArriveMode.Auto;
+                    // A shunter sent down the main line is still a shunter. The
+                    // command's own figure and the lineside limits both still apply
+                    // — this only ever lowers what was asked for.
+                    if (profile.topKmh > 0f && cruiseKmh > profile.topKmh)
+                        cruiseKmh = profile.topKmh;
                     if (string.IsNullOrEmpty(destId))
                     {
                         destId = Yards.MainLineFor(yardId, start, car, reversalPenalty, out var mainError);
@@ -1221,7 +1229,10 @@ namespace DvMod.Autopilot
                     // Yard pace whatever was asked for: a shunt is measured in metres,
                     // and line speed between two sidings is how stock gets shoved
                     // through the stop blocks.
-                    cruiseKmh = cruiseKmh <= 0f ? ManeuverKmh : Mathf.Min(cruiseKmh, ManeuverKmh);
+                    // Yard pace is the LOCO's, not one figure for the whole fleet:
+                    // a battery shunter and a DE6 do not shove at the same speed.
+                    float yard = profile.maneuverKmh > 0f ? profile.maneuverKmh : ManeuverKmh;
+                    cruiseKmh = cruiseKmh <= 0f ? yard : Mathf.Min(cruiseKmh, yard);
                 }
 
                 var path = Routing.FindPath(start, destId, car, null, arrive, null, reversalPenalty);
@@ -1400,7 +1411,7 @@ namespace DvMod.Autopilot
                     // The old run has already been dropped, so there is nothing left
                     // driving this loco. Leave it braked rather than rolling.
                     controller.controlsOverrider.Throttle?.Set(0f);
-                    controller.controlsOverrider.Brake?.Set(1f);
+                    Brakes.Train(car, controller.controlsOverrider, 1f);
                     return Json("error", $"could not start: {e.Message}");
                 }
             }).Result;
@@ -1523,7 +1534,7 @@ namespace DvMod.Autopilot
             }
             var o = controller.controlsOverrider;
             o.Throttle?.Set(0f);
-            o.Brake?.Set(1f);
+            Brakes.Train(car, o, 1f);
             float before = o.Reverser?.Value ?? -99f;
             o.Reverser?.Set(v);
             var trace = new JArray();
@@ -1776,7 +1787,7 @@ namespace DvMod.Autopilot
             if (brake && run.car != null && run.controller != null)
             {
                 run.controller.controlsOverrider.Throttle?.Set(0f);
-                run.controller.controlsOverrider.Brake?.Set(1f);
+                Brakes.Train(run.car, run.controller.controlsOverrider, 1f);
             }
             return true;
         }

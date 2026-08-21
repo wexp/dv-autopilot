@@ -184,6 +184,7 @@ namespace DvMod.Autopilot
         {
             Updater.Create();
             Tablet.Attach();
+            Transmissions.Start();
             TryAttachCommsRadio();
         }
 
@@ -214,6 +215,7 @@ namespace DvMod.Autopilot
             // Brake anything under autopilot BEFORE the updater goes away. Destroying
             // it kills the drive coroutines where they stand, which would leave a loco
             // rolling with its throttle open.
+            Transmissions.Stop();
             Autopilot.StopAllHere();
             // Belt and braces: stopping the runs strips their markings, but a set
             // left behind by a run that died some other way would outlive the mod

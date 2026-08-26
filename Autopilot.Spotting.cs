@@ -210,10 +210,36 @@ namespace DvMod.Autopilot
             double needDown = mx - (hi - m); // front beyond the high marker
             // A train longer than the track can never satisfy both markers, so it is
             // driven until its LEADING end reaches the far one and the tail is left
-            // where it falls. Whichever end that is, the other term is negative — the
-            // marker we have already run past — so the max picks the live one.
+            // where it falls.
+            //
+            // WHICH end is leading has to come from the direction of travel. This
+            // used to be Math.Max(-needUp, -needDown) on the reasoning that the
+            // mark already run past gives a negative term, leaving the max to pick
+            // the live one. That holds only while the cut is a little longer than
+            // the window. Once it is several times longer BOTH terms start
+            // positive, and the max then picks the end that is FURTHER away — the
+            // trailing one — so the train is driven on until its TAIL reaches the
+            // near mark, which puts its head clean off the end of the track.
+            //
+            // HB-A2P, 72.7 m of rail with a 22.5 m sign window at 25.0..47.5, is
+            // what that costs: L-030 coupled onto the slug already standing there,
+            // making 73.1 m, and was then shoved until the tail sat on the low
+            // mark — max(28.1 - 27.5, 45.0 - 65.7) = 0.6 m "still to run", arrival
+            // declared — with some 24 m of train, the slug included, hanging out
+            // the far end across J-484. The leading end had passed its own mark
+            // twenty metres earlier.
             if (Oversize(loco, destTrack))
+            {
+                bool? lead = towardHigh ?? SpotDirection(loco, destTrack)
+                    ?? HangsOffLowEnd(destTrack, mn, mx);
+                if (lead == true)
+                    return Math.Max(0, -needDown); // running up the spans: head is mx
+                if (lead == false)
+                    return Math.Max(0, -needUp);   // running down them: head is mn
+                // No direction to be had — a stand with nothing hanging off either
+                // end. Fall back to the old reading rather than invent one.
                 return Math.Max(0, Math.Max(-needUp, -needDown));
+            }
 
             // DIRECTIONAL. This used to be Math.Max(0, Math.Max(needUp, needDown)) —
             // an unsigned "how far off the marks am I", handed to a caller that reads
@@ -624,10 +650,11 @@ namespace DvMod.Autopilot
         /// A consist too long for the track is judged the only way it can be: it has
         /// arrived once its leading end is at the far marker, tail wherever it ended up.
         /// </summary>
-        private static bool ConsistClearWithinDest(TrainCar loco, string destId, RailTrack? destTrack)
+        private static bool ConsistClearWithinDest(TrainCar loco, string destId,
+            RailTrack? destTrack, bool? towardHigh = null)
         {
             if (destTrack != null && Oversize(loco, destTrack))
-                return DistanceToSpot(loco, destTrack) <= ParkMargin;
+                return DistanceToSpot(loco, destTrack, towardHigh) <= ParkMargin;
 
             foreach (var c in CarsToSpot(loco))
                 foreach (var b in c.Bogies)

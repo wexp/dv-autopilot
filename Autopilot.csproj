@@ -9,13 +9,13 @@
     <Nullable>enable</Nullable>
     <RootNamespace>DvMod.Autopilot</RootNamespace>
     <AssemblyName>Autopilot</AssemblyName>
-    <InformationalVersion>0.2.0</InformationalVersion>
+    <InformationalVersion>0.3.0</InformationalVersion>
     <!--
       Give every build its own assembly version, so UMM's reload actually swaps
       in the new file instead of re-running Load on the one it already has.
     -->
     <Deterministic>false</Deterministic>
-    <AssemblyVersion>0.2.0.*</AssemblyVersion>
+    <AssemblyVersion>0.3.0.*</AssemblyVersion>
   </PropertyGroup>
 
   <ItemGroup>

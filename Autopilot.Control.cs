@@ -2,6 +2,7 @@ using DV.Logic.Job;
 using DV.MultipleUnit;
 using DV.RemoteControls;
 using DV.Simulation.Cars;
+using LocoSim.Implementations;
 using DV.Utils;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
@@ -290,30 +291,113 @@ namespace DvMod.Autopilot
         }
 
         /// <summary>
-        /// TM (traction motor) overheat, read straight off the loco's own simulation
-        /// ports rather than any TrainCar API — there isn't one. tmOverheatLamp mirrors
-        /// the cab warning lamp (pre-fuse, still recoverable); OVERHEAT_POWER_FUSE_OFF
-        /// is the fuse having actually blown, cutting power outright. Locos without a
-        /// TM (steam, hydraulic) simply lack these ports and read as never overheating.
-        /// Checked on every loco of the consist, like the engine temperature.
+        /// Traction motor protection. TWO mechanisms, not one, and they fail in
+        /// different ways on different timescales — the throttle needs both.
+        ///
+        /// OVERCURRENT is fast: too many amps at once. TractionGenerator's own
+        /// damage step compares tm.TOTAL_AMPS against the generator's serialized
+        /// maxAmps and, the instant it is exceeded, drops the power fuse. No
+        /// timer, no countdown, no warning — the fuse is simply gone on that tick,
+        /// so the only thing that can ever help is a margin BELOW the trip.
+        ///
+        /// OVERHEAT is slow: sustained amps that never reach the trip. The motors
+        /// heat at ampsPerTM² × resistance, and once the temperature is above the
+        /// set's own threshold an overheatingTimer counts down; when it runs out
+        /// the fuse goes too, damage is dealt, and a motor may be killed outright.
+        /// A current that is perfectly safe for a burst is what cooks the motors
+        /// when held — a stalled train on a bank, which is the whole failure.
+        ///
+        /// Each mechanism is watched three ways: the margin before it (amps toward
+        /// the trip, temperature toward the threshold), the one-tick port that
+        /// fires as it happens, and the fuse state it leaves behind. The ports are
+        /// worth having and worth nothing on their own: both are cleared at the
+        /// top of the next sim tick, so a 10 Hz poll usually misses them, and both
+        /// report a fuse that has already blown. The cab overheat lamp is watched
+        /// as well, where the machine carries one — on a DE6 it does not: that
+        /// port (tmOverheatLamp) belongs to the Microshunter alone, every
+        /// diesel-electric having tmOfflineLamp, which is a different signal.
+        ///
+        /// A machine with no traction motors — steam, hydraulic — carries none of
+        /// this and reads as never in trouble.
         /// </summary>
-        /// <summary>A loco carrying neither port — steam, hydraulic — simply reads
-        /// as never overheating, and the DE2 carries one of the pair and not the
-        /// other. Asked through Ports, so a machine without them costs nothing and
-        /// says nothing in the log.</summary>
-        private static (bool warning, bool critical) TmOverheatState(TrainCar loco)
+        private static (bool warning, bool critical) TmProtectionState(TrainCar loco)
         {
             bool warning = false, critical = false;
             foreach (var c in MuGroup(loco))
             {
+                /* ------------------------------------------- overcurrent -- */
+
+                var gen = SimComp<TractionGenerator>(c);
+                if (gen != null && gen.maxAmps > 0f && gen.totalAmpsReader != null)
+                {
+                    // The exact quantity the trip is made on, against the exact
+                    // figure it is tripped at.
+                    float frac = Mathf.Abs(gen.totalAmpsReader.Value) / gen.maxAmps;
+                    critical |= frac >= TmAmpsCritical;
+                    warning |= frac >= TmAmpsWarn;
+                    critical |= FuseBlown(c, gen.powerFuseRef);
+                }
+                var overcurrent = Ports.Find(c, "tractionGenerator.OVERCURRENT_POWER_FUSE_OFF");
+                if (overcurrent != null)
+                    critical |= overcurrent.Value > 0.5f;
+
+                /* ---------------------------------------------- overheat -- */
+
                 var lamp = Ports.Find(c, "tmOverheatLamp.LAMP_STATE");
                 if (lamp != null)
                     warning |= lamp.Value > 0.5f;
-                var fuse = Ports.Find(c, "tm.OVERHEAT_POWER_FUSE_OFF");
-                if (fuse != null)
-                    critical |= fuse.Value > 0.5f;
+                var blew = Ports.Find(c, "tm.OVERHEAT_POWER_FUSE_OFF");
+                if (blew != null)
+                    critical |= blew.Value > 0.5f;
+
+                var tms = SimComp<TractionMotorSet>(c);
+                if (tms == null)
+                    continue;
+                critical |= FuseBlown(c, tms.powerFuseRef);
+                // Never invent a restriction from silence: a machine that reports
+                // no threshold is a machine we know nothing about.
+                if (tms.tmTempReader == null || tms.overheatingTemperatureThreshold <= 0f)
+                    continue;
+                float temp = tms.tmTempReader.Value;
+                // At the threshold the countdown to the fuse starts. Off power
+                // well before then.
+                critical |= temp >= tms.overheatingTemperatureThreshold;
+                warning |= temp >= tms.overheatingTemperatureThreshold - TmWarnBand;
             }
             return (warning, critical);
+        }
+
+        /// <summary>Has this fuse gone? Off also covers one somebody pulled, which
+        /// wants the same answer: no power reaches the motors, so holding the
+        /// handle open against them achieves nothing.</summary>
+        private static bool FuseBlown(TrainCar? car, FuseReference? reference)
+        {
+            var fuses = car?.SimController?.simFlow?.AllFuses;
+            string? id = reference?.fuseId;
+            if (fuses == null || string.IsNullOrEmpty(id))
+                return false;
+            for (int i = 0; i < fuses.Count; i++)
+            {
+                if (fuses[i].id == id)
+                    return !fuses[i].State;
+            }
+            return false;
+        }
+
+        /// <summary>This car's simulation component of the given kind, or null
+        /// where it has none. The components are a flat list per car and there is
+        /// one of each at most, so the scan is over a couple of dozen entries.</summary>
+        private static T? SimComp<T>(TrainCar? car) where T : SimComponent
+        {
+            var comps = car?.SimController?.simFlow?.OrderedSimComps;
+            if (comps == null)
+                return null;
+            for (int i = 0; i < comps.Count; i++)
+            {
+                if (comps[i] is T found)
+                    return found;
+            }
+            return null;
         }
 
         private static void ApplyThrottle(
@@ -322,7 +406,7 @@ namespace DvMod.Autopilot
             ref float lastSpeedMs, ref float accelFilter, ref float accelBudget,
             ref float sanderHold, ref float dynStallFor,
             ref float dynHandle, ref float dynCap, bool allowDynamic,
-            float heatCap, bool tempWarning, bool tempCritical)
+            float heatCap, bool tempWarning, bool tempCritical, bool rollingBack)
         {
             var overrider = controller.controlsOverrider;
 
@@ -339,6 +423,24 @@ namespace DvMod.Autopilot
                 // the dogs, nothing to grind. Calibration and the drop back to first
                 // both want to happen here rather than against a moving train.
                 Transmissions.HoldsThrottle(car, target, speed);
+                return;
+            }
+
+            // Being dragged backwards with the reverser still set forward. The
+            // motors are then driven against their own rotation, which is the
+            // largest current they ever see and what actually kills a DE6's
+            // traction motors — and because `speed` below is a MAGNITUDE, a train
+            // sliding back down a bank at 35 km/h read as one doing 35 toward a
+            // target of 40 and got the handle opened wider the faster it fell.
+            // Shut off and stop it; the leg loop sets the reverser and starts
+            // again once it stands.
+            if (rollingBack)
+            {
+                throttle = 0f;
+                dynHandle = 0f;
+                overrider.Throttle?.Set(0f);
+                overrider.DynamicBrake?.Set(0f);
+                Brakes.Train(car, overrider, 1f);
                 return;
             }
 
@@ -756,9 +858,8 @@ namespace DvMod.Autopilot
             if (wagon == null)
             {
                 run.detail = info + " — handbrake set";
-                yield break;
             }
-            if (run.uncoupleOnFinish && cutAt != null)
+            else if (run.uncoupleOnFinish && cutAt != null)
             {
                 // Split the rake wherever the JOB changes before stepping away —
                 // the cut just delivered and the strays it was shoved against are
@@ -808,6 +909,28 @@ namespace DvMod.Autopilot
             else
             {
                 run.detail = info + " — handbrake set";
+            }
+
+            // Tied down and standing: nothing left for the engines to do. Only
+            // here — a run stopped by hand or one that failed is left running for
+            // whoever picks it up, and only machines the autopilot could start
+            // again, so a steam loco's fire is never put out from under it.
+            if (Main.settings.engineStopOnFinish)
+            {
+                // A dead engine runs no compressor, so the air the loco is
+                // standing on stops being topped up. Pin every driven unit's own
+                // handbrake before killing it — the wagon's pin above secures the
+                // rake, not the engine that may be about to be cut off it. Every
+                // leg winds the handbrakes off before moving, so this cannot
+                // strand the next dispatch.
+                foreach (var unit in MuGroup(car))
+                {
+                    var hb = unit?.brakeSystem;
+                    if (hb != null && hb.hasHandbrake)
+                        hb.SetHandbrakePosition(1f);
+                }
+                Engine.StopGroup(car);
+                run.detail += ", engine off";
             }
         }
 

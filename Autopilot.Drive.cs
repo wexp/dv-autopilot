@@ -61,6 +61,34 @@ namespace DvMod.Autopilot
                 // split-off loco), so every leg starts by winding them all off.
                 ReleaseHandbrakes(car);
 
+                // Giving way. The deadlock branch below picks a road home rather than
+                // another way round: routing round the train in front is what sent a
+                // yard shunt on a tour of the valley, and the rail we want is not
+                // blocked — it is spoken for by a train that outranks us. So back off
+                // to where we started, let the senior have it, and try again.
+                //
+                // While the retreat is on it IS the destination — planned to, spotted
+                // in, arrived at — so every guard downstream (coupling, the via end, the
+                // spot window) reads the move actually being driven. The real one is put
+                // back below.
+                if (run.retreatTo != null && run.destTrack != run.retreatTo)
+                {
+                    run.resumeDestId = destId;
+                    run.resumeDestTrack = run.destTrack;
+                    run.resumeCouple = run.couple;
+                    run.resumeArriveEnteredIn = run.arriveEnteredIn;
+                    run.resumeViaLocked = run.viaLocked;
+                    destId = run.retreatTo.LogicTrack()?.ID?.ToString() ?? destId;
+                    run.destTrack = run.retreatTo;
+                    // None of these belong to the retreat: there is nothing to couple to
+                    // at home, and a via end demanded of the real move would constrain
+                    // which way we are allowed to back out of the way.
+                    run.couple = false;
+                    run.arriveEnteredIn = null;
+                    run.viaLocked = false;
+                    run.Note($"backing off to {destId} to let {run.retreatFor} through");
+                }
+
                 // Done when the whole consist is fully within the destination — or,
                 // on a coupling run, as soon as our train has grown.
                 //
@@ -97,7 +125,31 @@ namespace DvMod.Autopilot
                 }
                 bool there = MoreToCouple(run)
                     ? false
-                    : mayArrive && ConsistClearWithinDest(car, destId, run.destTrack);
+                    : mayArrive && ConsistClearWithinDest(car, destId, run.destTrack, run.spotTowardHigh);
+                // Home again, or the senior got away before we finished backing off —
+                // either way the retreat has done its job. Put the real move back and
+                // start it again from here.
+                if (run.retreatTo != null && (there || !StillStopped(run.retreatFor)))
+                {
+                    if (there)
+                    {
+                        overrider.Throttle?.Set(0f);
+                        Brakes.Train(car, overrider, 1f);
+                    }
+                    string was = run.retreatFor;
+                    run.Note(there
+                        ? $"backed clear to {destId} — trying {run.resumeDestId} again"
+                        : $"{was} is moving again — trying {run.resumeDestId} again");
+                    destId = run.resumeDestId;
+                    run.destTrack = run.resumeDestTrack;
+                    run.couple = run.resumeCouple;
+                    run.arriveEnteredIn = run.resumeArriveEnteredIn;
+                    run.viaLocked = run.resumeViaLocked;
+                    run.retreatTo = null;
+                    run.retreatFor = "";
+                    run.detail = $"gave way to {was} — trying {destId} again";
+                    continue;
+                }
                 if (there)
                 {
                     overrider.Throttle?.Set(0f);
@@ -191,6 +243,18 @@ namespace DvMod.Autopilot
                         }
                         while (Mathf.Abs(car.GetForwardSpeed()) * 3.6f > 0.3f)
                             yield return WaitForSecondsRealtime(0.2f);
+                        // Backstop to the stand-off margin above: never wind a table
+                        // with our own iron inside the sweep. Refusing strands the
+                        // run, which is recoverable; winding breaks the loco, which
+                        // is not.
+                        if (!onBridge
+                            && Turntables.FoulingPit(car, overBridge, PitStandMargin))
+                        {
+                            Finish(run, "error",
+                                "standing too close to the turntable pit to wind the"
+                                + " table — back the train off and dispatch again");
+                            yield break;
+                        }
                         // Wind the table to whichever stall the rail must join:
                         // the road onward when we stand on the bridge, our own
                         // track when we are waiting to drive onto it.
@@ -461,7 +525,7 @@ namespace DvMod.Autopilot
                         ApplyThrottle(controller, ref bThrottle, car, tgt, sp,
                             run.profile, ref bLast, ref bAccel, ref run.accelBudget,
                             ref bSander, ref bDyn, ref bDynHandle, ref bDynCap,
-                            false, run.heatCap, false, false);
+                            false, run.heatCap, false, false, false);
                         if (tgt < 0.8f && sp < 0.5f && stopIn < 1)
                             break; // pinned against something behind — cannot back further
                     }
@@ -529,7 +593,7 @@ namespace DvMod.Autopilot
                 ExtendAuthority(
                     run, path, s, track, bogie.traveller.Span,
                     (reverser >= 0.5f) == (bogie.TrackDirectionSign > 0),
-                    ConsistLengthAhead(car, reverser >= 0.5f), AuthorityMinMeters,
+                    ConsistLengthAhead(car, reverser >= 0.5f), AuthorityMinMeters, 0.0,
                     out _, out _, out _, lastLeg ? int.MaxValue : e);
                 run.state = "driving";
 
@@ -649,7 +713,10 @@ namespace DvMod.Autopilot
             // which way along the destination the spot was travelling (true =
             // toward increasing span), learned while moving.
             bool backingUp = false;
-            bool? spotTowardHigh = null;
+            // Reset per leg — a leg that reverses out and comes back in approaches
+            // from the other end — but kept on the run so the arrival tests, which
+            // fire at a stand, can still see it.
+            run.spotTowardHigh = null;
             // Road runs slow on the dynamic, which pulls far more gently than air —
             // every planned slowing must start correspondingly earlier or the air
             // ends up doing the work anyway.
@@ -709,6 +776,12 @@ namespace DvMod.Autopilot
                 }
 
                 float speed = Mathf.Abs(car.GetForwardSpeed()) * 3.6f; // km/h
+                // A magnitude cannot tell a train climbing a bank at 35 from the
+                // same train being dragged back down it at 35, and every speed
+                // test below is built on one. Keep the sign here so the throttle
+                // can be told which of those is happening.
+                bool rollingBack =
+                    (reverser >= 0.5f ? -1f : 1f) * car.GetForwardSpeed() * 3.6f > RollbackKmh;
                 // The average the ETA is built on. Seeded from the first reading
                 // rather than crept up from zero, or every run would report a
                 // wildly pessimistic time for its first minute and a half.
@@ -748,10 +821,15 @@ namespace DvMod.Autopilot
                         AuthorityMinMeters,
                         (speed / 3.6) * (speed / 3.6) / (2f * StopDecel)
                             * AuthorityBrakeFactor + AuthorityPad));
+                    // The bare braking distance, no headroom: the shortest road this
+                    // train can be brought to a stand in from where it is now. `need`
+                    // above is what we would LIKE; this is what physics insists on, and
+                    // it is the floor the clear-stand rule may not reach under.
+                    double stopMeters = (speed / 3.6) * (speed / 3.6) / (2f * StopDecel);
                     int authIdx = IndexNear(path, track, s);
                     cachedAuthority = ExtendAuthority(
                         run, path, authIdx, track, bogie.traveller.Span, towardOut,
-                        ownLeadHint, needMeters,
+                        ownLeadHint, needMeters, stopMeters,
                         out cachedAuthorityHolder, out cachedAuthorityAt,
                         out cachedAuthorityBlocked,
                         lastLeg ? int.MaxValue : e);
@@ -941,8 +1019,40 @@ namespace DvMod.Autopilot
                     // the guard below is told to allow contact instead of holding off.
                     if (Coupled(run))
                     {
-                        // Let Drive pick it up as a spot; braking here would only have
-                        // to be undone a tick later.
+                        // Another cut still standing on the destination: the next one is
+                        // straight ahead up the same road, with the one we have just
+                        // taken between us and it. Shove on and pick that up too.
+                        //
+                        // Handing back to Drive here re-planned instead — and a re-plan
+                        // for a train ALREADY standing on its destination can only come
+                        // back as a reversal: out onto the neck and set back in. So
+                        // every cut after the first cost a pull of the whole growing
+                        // rake right out of the siding and a fresh approach, when all
+                        // that was wanted was to keep buffering up. L-055 dragged what
+                        // it had just coupled out of HB-E11O and five tracks up the
+                        // yard to come back for the rest of a train it was touching.
+                        //
+                        // So do the joining-up Drive would have done, and stay on the
+                        // leg. Re-arming carsAtStart is what makes the NEXT cut register
+                        // as a pick-up of its own: Coupled() reads "more cars than we
+                        // set off with", and without it this branch would fire again
+                        // every tick from here on.
+                        if (run.destTrack != null
+                            && ForeignStockOn(run.destTrack, car.trainset))
+                        {
+                            run.coupledDone = true;
+                            run.carsAtStart = car.trainset?.cars?.Count ?? run.carsAtStart;
+                            // The cut we have just taken may be tied down.
+                            ReleaseHandbrakes(car);
+                            EnsureOneBrakeCutIn(car, car);
+                            run.detail = $"{phase}: coupled; going on for the rest"
+                                + $" of {destId}";
+                            run.Note($"coupled a cut on {destId} — going straight on"
+                                + " for the rest of it");
+                            continue;
+                        }
+                        // Nothing left standing there. Let Drive pick it up as a spot;
+                        // braking here would only have to be undone a tick later.
                         done(true);
                         yield break;
                     }
@@ -1027,7 +1137,7 @@ namespace DvMod.Autopilot
                     // the destination — every car between the track's fouling points,
                     // clear of the switch. That is the in-game clearance marker, not a
                     // guessed distance, so the loco never ends up fouling the throat.
-                    if (ConsistClearWithinDest(car, destId, run.destTrack))
+                    if (ConsistClearWithinDest(car, destId, run.destTrack, run.spotTowardHigh))
                     {
                         target = 0f;
                         if (speed < 0.8f) { done(true); yield break; }
@@ -1071,9 +1181,9 @@ namespace DvMod.Autopilot
                             // measure the tail of a cut that is still coming on,
                             // and reading it live answers nothing at a stand.
                             if (run.destTrack != null && !backingUp)
-                                spotTowardHigh = SpotDirection(car, run.destTrack) ?? spotTowardHigh;
+                                run.spotTowardHigh = SpotDirection(car, run.destTrack) ?? run.spotTowardHigh;
                             double toSpot = run.destTrack != null
-                                ? DistanceToSpot(car, run.destTrack, spotTowardHigh)
+                                ? DistanceToSpot(car, run.destTrack, run.spotTowardHigh)
                                 : 0;
                             airStop = true;
                             // Overshoot is measured, not inferred: the spotted set
@@ -1087,8 +1197,8 @@ namespace DvMod.Autopilot
                             // but which way it was going decides which marker counts.
                             // FROZEN while backing: the overrun is measured against
                             // the direction the spot came in by, not the creep back.
-                            double overrun = run.destTrack != null && spotTowardHigh != null
-                                ? SpotOverrun(car, run.destTrack, spotTowardHigh.Value)
+                            double overrun = run.destTrack != null && run.spotTowardHigh != null
+                                ? SpotOverrun(car, run.destTrack, run.spotTowardHigh.Value)
                                 : 0;
                             if (backingUp)
                             {
@@ -1221,6 +1331,13 @@ namespace DvMod.Autopilot
                 // rule below (margin, band, all-aboard, wind, facing) apply as if
                 // the far end were open pit.
                 bool windPending = false;
+                // ...and whether the bridge is actually REACHABLE along connected
+                // rail. The two are not the same thing, and treating them as one is
+                // what drove L-040 at the open pit: a wind pending because the
+                // bridge's far end is not lined up looks identical, from this
+                // variable alone, to a wind pending because the bridge is not even
+                // joined to the rail we stand on.
+                bool bridgeJoined = false;
                 {
                     int ci = IndexNear(path, track, s);
                     int bi = -1;
@@ -1241,7 +1358,10 @@ namespace DvMod.Autopilot
                             lead.Value.bogie.track, lead.Value.bogie.traveller.Span,
                             lead.Value.towardOut, path[bi]);
                         if (toExit != double.MaxValue)
+                        {
+                            bridgeJoined = true;
                             railEnd = Math.Min(railEnd, toExit);
+                        }
 
                         // Boarding is done the moment EVERY bogie is aboard — stop
                         // there and wind, instead of creeping on toward the edge.
@@ -1347,8 +1467,14 @@ namespace DvMod.Autopilot
                 {
                     // Boarding a bridge mid-plan: the nose must go beyond the usual
                     // rail-end margin so EVERY bogie gets aboard before the wind.
-                    bool boarding = windPending;
-                    double endMargin = boarding ? BridgeBoardMargin : RailEndMargin;
+                    // Boarding is only boarding when the rail runs onto the bridge.
+                    // Where it stops at an unaligned pit the razor margin is exactly
+                    // wrong: the table is about to be WOUND, so stand well back and
+                    // let the girders swing through empty rail.
+                    bool boarding = windPending && bridgeJoined;
+                    bool atPit = windPending && !bridgeJoined;
+                    double endMargin = boarding ? BridgeBoardMargin
+                        : atPit ? PitStandMargin : RailEndMargin;
                     double endBand = boarding ? 1.5 : 3.0;
                     float vEnd = Mathf.Sqrt(
                         2f * ObstacleDecel * (float)Math.Max(0, railEnd - endMargin)) * 3.6f;
@@ -1428,6 +1554,19 @@ namespace DvMod.Autopilot
                                         : Turntables.FindBridgeAhead(
                                             track, bogie.traveller.Span, towardOut,
                                             TurntableSlowZone + ownLead);
+                                    if (ahead != null
+                                        && Turntables.FoulingPit(
+                                            car, ahead.Value.table, PitStandMargin))
+                                    {
+                                        overrider.Throttle?.Set(0f);
+                                        Brakes.Train(car, overrider, 1f);
+                                        Finish(run, "error",
+                                            "standing too close to the turntable pit to"
+                                            + " wind the table — back the train off and"
+                                            + " dispatch again");
+                                        done(false);
+                                        yield break;
+                                    }
                                     if (ahead != null)
                                         bridgeAsked = TurnFor(run, ahead.Value.table,
                                             () => Turntables.RotateBridgeTo(
@@ -1481,9 +1620,11 @@ namespace DvMod.Autopilot
                         // on X". Only the first can ever clear itself, which is the
                         // whole basis of the wait-or-go-round decision below.
                         string holderState = "not a run — standing in the way";
+                        Run? holderRun = null;
                         foreach (var r in runs.Values)
                             if (r.id == cachedAuthorityHolder)
                             {
+                                holderRun = r;
                                 liveHolder = r.coroutine != null;
                                 holderState = liveHolder
                                     ? $"running ({r.state})"
@@ -1524,11 +1665,47 @@ namespace DvMod.Autopilot
                                 yield break;
                             }
                         }
-                        // A block held by a LIVE run gets no timer and no way out: that
-                        // run will release it when it moves, and if it never moves the
-                        // interlocking is wrong. Waiting here forever is the correct
-                        // behaviour for a train — it is also the symptom that makes the
-                        // underlying fault visible instead of papering over it.
+                        // A block held by a LIVE run releases itself when that run
+                        // moves — so long as it IS going to move. One that has itself
+                        // come to a stand, and outranks us, never will while we are the
+                        // thing in its way. That is the deadlock, and it happens at the
+                        // length of a movement authority, not buffer to buffer: the
+                        // nose-to-nose branch below never sees it. L-048 and L-068 stood
+                        // 42 m and 66 m apart, each held at its own boundary, each named
+                        // by the other, with clearAhead reading 53 m and 46 m — so that
+                        // branch's clock never started and they looked at each other for
+                        // as long as anyone cared to watch.
+                        //
+                        // Same answer as there, for the same reason: the JUNIOR hands the
+                        // rail back and backs off to the road it came from, and tries
+                        // again once the senior is by. The senior stands where it is.
+                        else if (holderRun?.car != null
+                            && Mathf.Abs(holderRun.car.GetForwardSpeed()) * 3.6f <= MovingKmh)
+                        {
+                            authorityStallFor += DriveTick * LimitRecheckTicks;
+                            if (authorityStallFor >= ClaimDeadlockSeconds
+                                && CanGiveWay(run, holderRun, car, out var back, out string home))
+                            {
+                                ReleaseClaims(run);
+                                run.yielded.TryGetValue(holderRun.guid, out int yields);
+                                run.yielded[holderRun.guid] = ++yields;
+                                run.retreatTo = back;
+                                run.retreatFor = holderRun.id;
+                                run.detail = $"{phase}: giving way to {holderRun.id} — "
+                                    + $"backing off to {home}";
+                                run.Note($"gave way to {holderRun.id} at {cachedAuthorityAt}"
+                                    + (yields > 1 ? $" ({yields} times now)" : "")
+                                    + $" — handed the rail back, backing off to {home}");
+                                done(true); // hand back to Drive, which drives the retreat
+                                yield break;
+                            }
+                        }
+                        else
+                        {
+                            // The holder is moving: it is clearing the block for us, and
+                            // the clock must not run on a train that is on its way.
+                            authorityStallFor = 0f;
+                        }
                     }
                     else
                     {
@@ -1574,32 +1751,38 @@ namespace DvMod.Autopilot
                         // this, so one of them must give way — the run that has been
                         // holding longest hands its rail back and looks for another road.
                         blockedFor += DriveTick;
-                        if (blockedFor >= ClaimDeadlockSeconds
-                            && BlockedByWaitingRun(run, corridor, out var blocker))
+                        if (blockedFor >= ClaimDeadlockSeconds && run.retreatTo == null
+                            && BlockedByWaitingRun(run, corridor, out var blocker)
+                            && blocker != null)
                         {
-                            ReleaseClaims(run);
-                            // Handing the rail back is not enough on its own: the
-                            // re-plan that follows reads the same network at the same
-                            // costs and lays the SAME road, so the two trains are back
-                            // nose to nose twenty seconds later. Write off the rail the
-                            // other train is actually STANDING on, briefly, so this
-                            // plan has to bend round it — longer each time we give way
-                            // to the same train, and never our own destination, which
-                            // is where we are going.
-                            int yields = 0;
-                            if (blocker != null)
+                            // Only the JUNIOR backs off, and only if there is somewhere
+                            // to back off to. Both questions belong to CanGiveWay, which
+                            // the authority-hold branch above asks in the same words.
+                            if (!CanGiveWay(run, blocker, car, out var back, out string home))
                             {
-                                run.yielded.TryGetValue(blocker.guid, out yields);
-                                run.yielded[blocker.guid] = ++yields;
-                                foreach (var t in TracksUnder(blocker.car, corridor))
-                                    if (t != run.destTrack)
-                                        run.avoid.Hold(t, GiveWaySeconds * yields);
+                                run.detail = $"{phase}: HOLDING - nose to nose with "
+                                    + $"{blocker.id}"
+                                    + (Outranks(blocker, run)
+                                        ? " and no road back" : ", and we have the road")
+                                    + $" ({blockedFor:F0}s)";
+                                continue;
                             }
-                            run.detail = $"{phase}: deadlocked with another autopilot — giving way";
-                            run.Note($"gave way to {blocker?.id ?? "another autopilot"}"
+                            // Hand the rail back and go home. NOT a ban on the rail the
+                            // other train is standing on: writing that off made the next
+                            // plan measure 16 km round the valley for a road that was
+                            // clear the moment the senior moved. Backing to where we
+                            // started leaves the road intact and takes us out of its way.
+                            ReleaseClaims(run);
+                            run.yielded.TryGetValue(blocker.guid, out int yields);
+                            run.yielded[blocker.guid] = ++yields;
+                            run.retreatTo = back;
+                            run.retreatFor = blocker.id;
+                            run.detail = $"{phase}: giving way to {blocker.id} — "
+                                + $"backing off to {home}";
+                            run.Note($"gave way to {blocker.id}"
                                 + (yields > 1 ? $" ({yields} times now)" : "")
-                                + " — handed the rail back, looking for another road");
-                            done(true); // hand back to Drive, which re-plans from here
+                                + $" — handed the rail back, backing off to {home}");
+                            done(true); // hand back to Drive, which drives the retreat
                             yield break;
                         }
                         // A train that is simply passing is not an obstruction, and the
@@ -1704,6 +1887,41 @@ namespace DvMod.Autopilot
                         throttle = 0f;
                         stuckFor = 0f;
                         switchHold += 0.1f;
+                        // The third place a pair of trains can lock, and until now the
+                        // only one with no way out.
+                        //
+                        // The other two — the movement-authority hold and the nose-to-nose
+                        // obstacle guard — both let the junior hand its rail back and
+                        // back off. This branch had neither, only "wait, then write the
+                        // road off and go round", which is the touring-the-valley
+                        // behaviour and not an answer. So a pair held HERE stood for
+                        // ever: L-055 was stopped 13 m short of J-490 saying L-040 had
+                        // it, L-040 was stopped 6 m short saying L-055 held
+                        // #Y-#S795#T, each named by the other, for a full minute, until
+                        // they were re-dispatched by hand.
+                        //
+                        // Same rule as the other two, asked in the same words: only the
+                        // JUNIOR gives way, and only if there is a road back.
+                        if (switchHold >= ClaimDeadlockSeconds && run.retreatTo == null
+                            && blockedTrack != null
+                            && RunHolding(blockedTrack) is Run switchBlocker
+                            && switchBlocker != run
+                            && CanGiveWay(run, switchBlocker, car,
+                                out var switchBack, out string switchHome))
+                        {
+                            ReleaseClaims(run);
+                            run.yielded.TryGetValue(switchBlocker.guid, out int sYields);
+                            run.yielded[switchBlocker.guid] = ++sYields;
+                            run.retreatTo = switchBack;
+                            run.retreatFor = switchBlocker.id;
+                            run.detail = $"{phase}: giving way to {switchBlocker.id} — "
+                                + $"backing off to {switchHome}";
+                            run.Note($"gave way to {switchBlocker.id} at {badReason}"
+                                + (sYields > 1 ? $" ({sYields} times now)" : "")
+                                + $" — handed the rail back, backing off to {switchHome}");
+                            done(true); // hand back to Drive, which drives the retreat
+                            yield break;
+                        }
                         // Waiting is right while a wagon sits on the switch, but not for
                         // ever: after a while, write that road off and let the router
                         // find another one.
@@ -1742,11 +1960,12 @@ namespace DvMod.Autopilot
                 // mid-approach, and one place that always sees the live value cannot
                 // miss one of those. It costs nothing when the direction is unchanged.
                 Markings.SetDirection(car, reverser >= 0.5f);
-                // The traction motors run their own separate heat budget and blow
-                // their own fuse (DeadTractionMotorsController) with no relation to
-                // the engine temperature, so a heavy pull could trip that fuse with
-                // the throttle logic none the wiser.
-                var (tmWarning, tmCritical) = TmOverheatState(car);
+                // The traction motors fail two ways of their own, neither of them
+                // related to the engine temperature: an instant overcurrent trip
+                // when the handle is opened against a standing train, and a slow
+                // cook on a current that never reaches that trip. Both blow the
+                // power fuse and the throttle logic saw neither.
+                var (tmWarning, tmCritical) = TmProtectionState(car);
                 ApplyThrottle(controller, ref throttle, car, target, speed,
                     run.profile, ref lastSpeedMs, ref accelFilter, ref run.accelBudget,
                     ref sanderHold, ref dynStallFor, ref dynHandle, ref dynCap,
@@ -1760,7 +1979,8 @@ namespace DvMod.Autopilot
                     run.profile.dynamicBrake && run.mode == AutopilotMode.Drive && !airStop,
                     run.heatCap,
                     tempWarning || tmWarning,
-                    tempCritical || tmCritical);
+                    tempCritical || tmCritical,
+                    rollingBack);
 
                 run.limitKmh = limit;
                 float signedSpeed = car.GetForwardSpeed() * 3.6f;
@@ -1808,6 +2028,16 @@ namespace DvMod.Autopilot
                             + (where.Length > 0 ? $" held-at={where} by={who}" : "")
                             + $" state={run.state}");
                     }
+                }
+
+                // Under way from the first metre, and it stays that way. What this
+                // marks is that the run has taken rail and used it — the thing a later
+                // dispatch must not be allowed to bump. See Outranks.
+                if (!run.underway && speed > MovingKmh)
+                {
+                    run.underway = true;
+                    Trace.Line("RANK", () => $"{run.id} under way — dispatch order now"
+                        + " holds against anything started after it");
                 }
 
                 run.detail += $" [{track.LogicTrack()?.ID} rev{reverser:F0} v{signedSpeed:+0;-0;0} "

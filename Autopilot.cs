@@ -132,6 +132,13 @@ namespace DvMod.Autopilot
             public bool uncoupleOnFinish;
             /// <summary>Why the run gave up, if a blocked switch defeated it.</summary>
             public string blockedReason = "";
+            /// <summary>Which way along the destination this spot is travelling —
+            /// true toward increasing span. Learned while the train is still moving
+            /// and kept here rather than in the leg, because the arrival tests run
+            /// at a STAND, when nothing about the train's motion can be read any
+            /// more, and an over-length cut's stopping point depends entirely on
+            /// which of its ends is the leading one.</summary>
+            public bool? spotTowardHigh;
             /// <summary>Track we have found we cannot use: a junction there refuses to
             /// throw because someone has left a wagon on it. Fed back into the router so
             /// the next plan goes round rather than queueing behind it for ever. Every
@@ -141,6 +148,23 @@ namespace DvMod.Autopilot
             /// same train twice is not bad luck: its road is written off for longer each
             /// time, so the re-plan bends further out instead of walking back into it.</summary>
             public readonly Dictionary<string, int> yielded = new Dictionary<string, int>();
+            /// <summary>This run has actually turned a wheel. Set once and never
+            /// cleared — a re-plan does not un-start a move, and neither does coming to a
+            /// stand at a signal. Seniority reads it: see Outranks.</summary>
+            public bool underway;
+
+            /// <summary>Giving way: the road home this run is backing to while a senior
+            /// gets past, and the move it puts back once it is there. Set by the deadlock
+            /// branch in DriveLeg, cleared by Drive. Null when not giving way.</summary>
+            public RailTrack? retreatTo;
+            /// <summary>Which run we are backing out of the way of, so the retreat can be
+            /// abandoned the moment that train gets moving again.</summary>
+            public string retreatFor = "";
+            public string resumeDestId = "";
+            public RailTrack? resumeDestTrack;
+            public bool resumeCouple;
+            public bool? resumeArriveEnteredIn;
+            public bool resumeViaLocked;
             /// <summary>Track (and the side it is entered from) this run has reserved.
             /// Nobody else may drive over or throw a switch into one of these from the
             /// same side while it holds them — the OPPOSITE side of the same track is a
@@ -258,19 +282,6 @@ namespace DvMod.Autopilot
                     return strikes < AvoidStrikes;
                 }
 
-                /// <summary>Ban a track for a while WITHOUT counting it against the
-                /// track's strikes. Giving way to another train is a matter of timing,
-                /// not a road that is shut: three meets on the same rail must not bar
-                /// it for the rest of the job.</summary>
-                public void Hold(RailTrack track, float seconds)
-                {
-                    entries.TryGetValue(track, out var entry);
-                    if (entry.until == float.MaxValue)
-                        return;
-                    entries[track] = (
-                        Mathf.Max(Time.realtimeSinceStartup + seconds, entry.until),
-                        entry.strikes);
-                }
 
                 /// <summary>Written off for the rest of the run — no amount of waiting
                 /// will hand this road back.</summary>
@@ -630,6 +641,12 @@ namespace DvMod.Autopilot
         // it, short enough that a run cannot lock a yard from the other end of it.
         private const double PriorityReachMeters = 400.0;
 
+        // How far back a train giving way will look for somewhere to stand, m. Bounds
+        // the search only — the answer is the NEAREST clear road, not one this far off.
+        // Generous, because the alternative when nothing is found is the road the train
+        // came from, which can be the whole move back.
+        private const double RetreatSearchMeters = 600.0;
+
         // Movement authority: how much rail to hold ahead. Distance-based — enough
         // to brake from the current speed with headroom — because a count of tracks
         // means 100 m at a yard throat and 3 km on the main.
@@ -677,11 +694,6 @@ namespace DvMod.Autopilot
         // Without the backstop a genuinely shut road is re-tried until the run times
         // out, which is a slower way of failing and says less about why.
         private const int AvoidStrikes = 3;
-        // How long the rail under a train we gave way to is written off, s, multiplied
-        // by the number of times we have given way to that same train. Shorter than the
-        // general ban to start with: the other run is moving, so its road frees itself,
-        // and we only need this plan to bend round where it stands NOW.
-        private const float GiveWaySeconds = 45f;
 
         // The longest road a SHUNT may accept, m. Generous — a runaround over a big
         // yard's own 8 km line is real yard work — but it shuts the door on the
@@ -714,6 +726,27 @@ namespace DvMod.Autopilot
         // Slip this bad is a break-away, not an edge case of adhesion: the wheels
         // are spinning free and a gentle notch-down won't catch them. Cut hard.
         private const float SevereSlip = 0.25f;
+        // Moving this much AGAINST the reverser counts as a runaway rather than
+        // coupler slack or the last centimetre of a stop, km/h. Well clear of
+        // MovingKmh, which is the test for "has it stopped yet".
+        private const float RollbackKmh = 2f;
+        // How far below its own overheat threshold a set of traction motors is
+        // treated as warm enough to ease off, °C. A chosen band, not a measured
+        // one: the game gives the threshold and the temperature, and nothing says
+        // how much warning is enough.
+        private const float TmWarnBand = 10f;
+        // Share of the generator's own trip current at which the handle eases and
+        // at which it comes off outright. The trip is INSTANT — one tick over the
+        // figure and the fuse is gone — so these sit close to it and rely on
+        // reacting quickly rather than on a wide margin.
+        //
+        // Deliberately not wider: a heavy train on a long bank settles at a large
+        // steady current well short of the trip, and that is not an overcurrent —
+        // it is the overheat case, which the temperature guard above answers by
+        // easing off as the motors warm. A wide amps margin would forbid the climb
+        // outright on a current the machine can carry.
+        private const float TmAmpsWarn = 0.90f;
+        private const float TmAmpsCritical = 0.97f;
         // Once the sander triggers it keeps sanding this long after the last slip,
         // s. The slip signal flickers around the threshold as grip comes and goes,
         // and following it directly clicked the sander on and off every tick.
@@ -929,6 +962,12 @@ namespace DvMod.Autopilot
         // its bogies aboard before the wind, and the game is happy with the body
         // overhanging the pit. Metres from the bridge end the leading bogie stops.
         private const double BridgeBoardMargin = 1.0;
+        // The other side of that coin: rail that ends at a pit whose bridge is
+        // somewhere ELSE. Nothing is being boarded — the table is about to be wound,
+        // and a girder sweeping the rim takes the nose off whatever stands at it.
+        // L-040 was stopped with its leading bogie 5 m from the rim (nose 3.4 m) and
+        // the wind hit it. Metres from the end of rail the leading bogie stands.
+        private const double PitStandMargin = 12.0;
         // Turntables are taken at walking pace: the crossing cap, km/h, and how far
         // out (m, to the front of the train) it starts applying.
         private const float TurntableKmh = 8f;
@@ -1335,6 +1374,10 @@ namespace DvMod.Autopilot
                 // leaves every other loco alone. From here on the old run is gone, so
                 // anything that throws must not leave the loco coasting with its
                 // throttle open and nobody driving it — hence the catch below.
+                // Captured BEFORE the old run goes: LoadingOrigin needs it to keep a
+                // getaway from a loading road ranked as one across a re-route.
+                RailTrack? carriedOrigin =
+                    runs.TryGetValue(car.CarGUID, out var replaced) ? replaced.originTrack : null;
                 StopRun(car.CarGUID, brake: false);
                 try
                 {
@@ -1362,7 +1405,7 @@ namespace DvMod.Autopilot
                     viaLocked = viaEnd != null,
                     arrive = arrive,
                     destTrack = path[path.Count - 1],
-                    originTrack = path[0],
+                    originTrack = LoadingOrigin(car, path[0], carriedOrigin),
                     detail = $"routing to {destId} ({path.Count} tracks, {legs.Count} leg(s))",
                     couple = couple,
                     carsAtStart = car.trainset?.cars?.Count ?? 1,
@@ -1371,6 +1414,12 @@ namespace DvMod.Autopilot
                     reversalPenalty = reversalPenalty,
                 };
                 runs[run.guid] = run;
+                // Wake the machines up. A cold loco answers a dispatch by sitting
+                // there with the throttle open, which the drive loop reads as a
+                // train that will not move; better to turn the key than to time
+                // out. Every unit in the MU group, since they all have to pull.
+                if (Main.settings.engineStartOnDispatch)
+                    Engine.StartGroup(car);
                 // Mark the loco as driving itself, so anybody looking at the
                 // train from outside can see it without opening a status page.
                 Markings.Fit(car);

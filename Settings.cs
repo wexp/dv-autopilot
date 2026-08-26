@@ -49,6 +49,13 @@ namespace DvMod.Autopilot
         public bool markingBeacons = true;
         public bool markingLightBars = true;
 
+        // Whether the autopilot works the starter and the fuel cutoff itself. A
+        // dispatch to a cold loco is otherwise refused by physics rather than by
+        // the mod — it just sits there with the throttle open — and a run that
+        // ends leaves the machine idling at a siding for the rest of the session.
+        public bool engineStartOnDispatch = true;
+        public bool engineStopOnFinish = true;
+
         public LocoProfiles autopilot = new LocoProfiles();
 
         public bool enableLogging = false;
@@ -74,6 +81,7 @@ namespace DvMod.Autopilot
         // out of Settings.xml: panel state is not a setting.
         private bool showTablet = true;
         private bool showMarkings = true;
+        private bool showEngines = true;
         private bool showProfiles;
         private bool showTools;
 
@@ -85,6 +93,8 @@ namespace DvMod.Autopilot
                 DrawTablet();
             if (Section("Autopilot markings", ref showMarkings))
                 DrawMarkings();
+            if (Section("Locomotive engines", ref showEngines))
+                DrawEngines();
             if (Section("Driving profiles", ref showProfiles))
                 autopilot.Draw();
             if (Section("Diagnostics", ref showTools))
@@ -212,6 +222,24 @@ namespace DvMod.Autopilot
                 " Rotating beacons on the cab roof");
             markingLightBars = GUILayout.Toggle(markingLightBars,
                 " Marker boards at each end (white leading, red trailing)");
+            GUILayout.EndVertical();
+        }
+
+        private void DrawEngines()
+        {
+            GUILayout.BeginVertical("box", GUILayout.ExpandWidth(false));
+            GUILayout.Label("Whether the autopilot starts and shuts down what it drives — "
+                + "the lead loco and every unit MU'd to it. Nothing else is touched: no "
+                + "brakes are set, no air is handed out.");
+            engineStartOnDispatch = GUILayout.Toggle(engineStartOnDispatch,
+                " Start the engines when a run is dispatched");
+            GUILayout.Label("    Fuses in, then the starter held until it catches. A machine "
+                + "with no starter — steam, the battery shunters — gets its fuses only.");
+            engineStopOnFinish = GUILayout.Toggle(engineStopOnFinish,
+                " Shut the engines down when the run arrives");
+            GUILayout.Label("    Once the train stands and is tied down. Only machines the "
+                + "autopilot could start again: a steam loco's fire is left alone. A run "
+                + "stopped by hand or failed is left running for whoever takes over.");
             GUILayout.EndVertical();
         }
 

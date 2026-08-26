@@ -346,6 +346,18 @@ namespace DvMod.Autopilot
             return null;
         }
 
+        /// <summary>The live run that has this track CLAIMED, if any. Ownership in the
+        /// ledger, not stock on the ground — the run holding the block ahead of us is
+        /// usually nowhere near it yet, which is exactly why we are stopped short of
+        /// it. <see cref="RunStandingOn"/> answers the other question.</summary>
+        private static Run? RunHolding(RailTrack? track)
+        {
+            if (track == null || !claims.TryGetValue(track, out var guid))
+                return null;
+            return runs.TryGetValue(guid, out var run) && run.coroutine != null
+                ? run : null;
+        }
+
         /// <summary>The live run with stock standing on this track, if any.</summary>
         private static Run? RunStandingOn(RailTrack track)
         {
@@ -401,7 +413,8 @@ namespace DvMod.Autopilot
                             b = x;
                             break;
                         }
-                sb.Append($"\n  {r.id} seq={r.seq} rank={RankName(r)} state={r.state}")
+                sb.Append($"\n  {r.id} seq={r.seq} rank={RankName(r)}"
+                    + (r.underway ? " under-way" : " not-started") + $" state={r.state}")
                   .Append($" trk={Trace.Id(b?.track)}")
                   .Append($" span={(b == null ? "-" : Trace.M(b.traveller.Span))}")
                   .Append($" v={(r.car == null ? "-" : Trace.Ms(Mathf.Abs(r.car.GetForwardSpeed()) * 3.6f))}")
@@ -444,6 +457,38 @@ namespace DvMod.Autopilot
             return true;
         }
 
+        /// <summary>A senior is queued at this block, and it is not queued behind US.
+        ///
+        /// The grant sites ask this rather than WantedByOlder because a want is barred
+        /// for one more reason than a claim is. L-048 held J-499, L-068 queued for it,
+        /// and L-048 was then refused the junction it was already standing on the edge
+        /// of — by the queue of the train that was waiting for it to cross. Nothing could
+        /// move: the senior wanted the frog, the junior needed the same frog to get out
+        /// of the way, and the junior's own claim was no defence because this gate never
+        /// looked at who held the block.
+        ///
+        /// So: rail we already hold is not re-argued (the callers pass that), and a
+        /// senior queued behind a train standing on its road does not bar that train from
+        /// moving on — the same exception CanTakeOver and ReservedByOlder make, in the
+        /// third place it was needed. WantedByOlder itself is left alone:
+        /// PreemptWantedBlocks uses it to decide what to hand BACK, and a train in the
+        /// way should go on handing back blocks it has not reached.</summary>
+        private static bool QueuedAgainstUs(object key, Run run, out string byWho)
+        {
+            byWho = "";
+            if (!Wanter(key, out var wanter) || wanter == run || !Outranks(wanter, run))
+                return false;
+            if (FoulsPlanAhead(wanter, run))
+            {
+                var w = wanter;
+                Trace.Line("RESV", () => $"{run.id} {KeyName(key)} NOT barred by {w.id}'s"
+                    + " queue — it is queued behind us; our moving on is what frees it");
+                return false;
+            }
+            byWho = wanter.id;
+            return true;
+        }
+
         /// <summary>The run queued at this block, if one said so recently enough and is
         /// still about. A wanter that has finished leaves its entry to age out.</summary>
         private static bool Wanter(object key, out Run wanter)
@@ -477,14 +522,71 @@ namespace DvMod.Autopilot
             return 2;
         }
 
-        /// <summary>Which of two runs takes the rail: the yard's order of business
-        /// first, then the one dispatched first. Fixed order, both ways round — a rule
-        /// that can call each of a pair the senior is how two trains take turns giving
-        /// way and neither arrives.</summary>
-        private static bool Outranks(Run other, Run ours) =>
-            LoadingRank(other) != LoadingRank(ours)
+        /// <summary>The loading road this run is clearing, for <see cref="LoadingRank"/>.
+        ///
+        /// It used to be path[0], and path[0] is bogies[1].track — the LOCO's rail. A
+        /// train being pulled OFF a loading road has its wagons on that road and its loco
+        /// already out on the lead, so the one move the ranking exists to favour scored
+        /// as "through" and gave way to the train coming IN for the berth it was in the
+        /// middle of clearing. The whole consist is asked instead.
+        ///
+        /// <paramref name="carried"/> is the origin of the run this one replaces. A
+        /// re-route builds a NEW Run, and the origin is written only at construction, so
+        /// a train re-routed after drawing clear of the loading road lost its rank at
+        /// exactly the point it still needed it — the berth is not free until the getaway
+        /// has finished. An L origin is carried across the replacement; anything else is
+        /// re-read from the ground.</summary>
+        private static RailTrack? LoadingOrigin(
+            TrainCar car, RailTrack? locoTrack, RailTrack? carried)
+        {
+            var cars = car?.trainset?.cars;
+            if (cars != null)
+                foreach (var c in cars)
+                {
+                    if (c == null)
+                        continue;
+                    foreach (var b in c.Bogies)
+                        if (b?.track != null
+                            && b.track.LogicTrack()?.ID?.trackType == "L")
+                            return b.track;
+                }
+            if (carried?.LogicTrack()?.ID?.trackType == "L")
+                return carried;
+            return locoTrack;
+        }
+
+        /// <summary>Which of two runs takes the rail. In order:
+        ///
+        ///   1 — a move that has TURNED A WHEEL, over one that has not. Rank is for
+        ///       deciding who goes first, and once one of them has gone there is
+        ///       nothing left to decide. Without this the ranking could invert under a
+        ///       train that had already taken its road: L-048 was sent off first and
+        ///       was across the throat when L-068 was dispatched for a loading road,
+        ///       which outranked it from a standing start and left the two of them
+        ///       looking at each other across J-499 with no way out.
+        ///   2 — between two moves both under way: dispatch order, and nothing else.
+        ///       They are past the point where the yard's business can reorder them.
+        ///   3 — between two still standing: the order of business — clearing a
+        ///       loading road, then filling one — then dispatch order. This is where
+        ///       LoadingRank does its work, deciding the pecking order of trains that
+        ///       have not yet moved.
+        ///
+        /// Every test reads a property of ONE run, so this is a lexicographic order on
+        /// (under way, order of business, dispatch order) and is transitive by
+        /// construction. That matters as much as being fixed both ways round: an order
+        /// that can call each of a PAIR the senior is how two trains take turns giving
+        /// way and neither arrives, and one that is merely intransitive does the same
+        /// thing to three.</summary>
+        private static bool Outranks(Run other, Run ours)
+        {
+            if (other.underway != ours.underway)
+                return other.underway;
+            if (other.underway)
+                return other.seq < ours.seq;
+            return LoadingRank(other) != LoadingRank(ours)
                 ? LoadingRank(other) < LoadingRank(ours)
                 : other.seq < ours.seq;
+        }
 
         /// <summary>The rank as one word, for the trace.</summary>
         private static string RankName(Run run) => LoadingRank(run) switch
@@ -525,10 +627,21 @@ namespace DvMod.Autopilot
         /// Reading the senior's plan instead lets it hold the road it is about to need,
         /// and the junior stands at the last block it already holds.
         ///
-        /// Only a run that is MOVING reserves ahead. One that has come to a stand may be
-        /// stopped by the very train it would be reserving against, and holding rail for
-        /// it would leave neither able to move; a stopped pair is the deadlock branch's
-        /// business.</summary>
+        /// A senior that has come to a STAND reserves just the same. It used not to, and
+        /// that is how a junior drove onto rail a senior was about to need: a runaround
+        /// stands still at its reversal by definition, and a shunt stops to brake, to
+        /// throw a switch, to recharge the pipe. Every one of those moments handed the
+        /// senior's road to whoever happened to be nearest it. Once the junior's stock is
+        /// ON the block nothing recovers — ForeignStockOn is absolute and takes no rank —
+        /// so the reservation has to survive the senior's stops or it is not a
+        /// reservation at all. A senior that then never moves stands there for ever, and
+        /// should: that is a fault upstream showing itself, not a case to route around.
+        ///
+        /// The one exception is a junior ALREADY standing on the senior's road. Barring
+        /// it from the block ahead of it as well leaves it nowhere to go, and the junior
+        /// pulling forward is the only move that can ever free the senior — the same
+        /// reasoning PreemptWantedBlocks applies to claims, applied to the projection.
+        /// Rail we are fouling is rail we are entitled to leave by.</summary>
         private static bool ReservedByOlder(object key, Run run, out string byWho)
         {
             byWho = "";
@@ -536,15 +649,80 @@ namespace DvMod.Autopilot
             {
                 if (other == run || other.car == null || other.coroutine == null)
                     continue;
-                if (Mathf.Abs(other.car.GetForwardSpeed()) * 3.6f <= MovingKmh)
-                    continue;
                 if (!Outranks(other, run))
                     continue;
+                if (FoulsPlanAhead(other, run))
+                {
+                    var senior = other;
+                    Trace.Line("RESV", () => $"{run.id} {KeyName(key)} NOT reserved by"
+                        + $" {senior.id} — we stand on its road; pulling clear is the"
+                        + " only way it moves");
+                    continue;
+                }
                 double reach = PlanReach(other, key);
                 if (reach < 0)
                     continue;
                 byWho = other.id;
                 return true;
+            }
+            return false;
+        }
+
+        /// <summary>The rail a run has still to cover, out to the priority horizon. The
+        /// set form of the walk <see cref="PlanReach"/> and <see cref="FoulsPlanAhead"/>
+        /// do one track at a time — asked for when the question is not "is this block on
+        /// its road" but "where IS its road", which is what a train getting out of the
+        /// way has to know.</summary>
+        private static HashSet<RailTrack> PlanAhead(Run run, double reach)
+        {
+            var set = new HashSet<RailTrack>();
+            double d = 0;
+            for (int i = Math.Max(0, run.pathFrom); i < run.path.Count && d <= reach; i++)
+            {
+                var t = run.path[i];
+                if (t == null)
+                    continue;
+                set.Add(t);
+                d += PhysicalSpan(t);
+            }
+            return set;
+        }
+
+        /// <summary>Every track joined to this one, both ends, whatever the switches are
+        /// set to. The road a train backs down is not the road it drove up, and a search
+        /// for somewhere to stand must not be limited to the way the points happen to
+        /// lie at this instant — they can be thrown.</summary>
+        private static IEnumerable<RailTrack> Neighbours(RailTrack track)
+        {
+            var ins = track.GetAllInBranches();
+            if (ins != null)
+                foreach (var b in ins)
+                    if (b?.track != null)
+                        yield return b.track;
+            var outs = track.GetAllOutBranches();
+            if (outs != null)
+                foreach (var b in outs)
+                    if (b?.track != null)
+                        yield return b.track;
+        }
+
+        /// <summary>Is this run's stock standing on the road the other run has still to
+        /// cover? Walks the same stretch of plan as <see cref="PlanReach"/> and stops at
+        /// the same horizon, so a train is either inside the senior's reach-ahead
+        /// reservation or outside it, never counted by one test and not the other.</summary>
+        private static bool FoulsPlanAhead(Run other, Run run)
+        {
+            if (run.car == null)
+                return false;
+            double d = 0;
+            for (int i = other.pathFrom; i < other.path.Count && d <= PriorityReachMeters; i++)
+            {
+                var t = other.path[i];
+                if (t == null)
+                    continue;
+                if (OurCarsOn(run.car, t))
+                    return true;
+                d += PhysicalSpan(t);
             }
             return false;
         }
@@ -594,7 +772,32 @@ namespace DvMod.Autopilot
             if (track != null && other.pathFrom + 1 < other.path.Count
                 && other.path[other.pathFrom + 1] == track)
                 return false;
-            return Outranks(run, other);
+            // Rank decides who takes rail BOTH trains want. It has no business barring
+            // a train that is standing on the senior's own road from the block it needs
+            // to get off it: the senior is stopped (checked above), it is stopped
+            // because we are in its way, and our moving on is the only thing that can
+            // ever free it. Holding the frog against us there is the senior holding
+            // itself up — the same trap PreemptWantedBlocks was written for, one block
+            // further on.
+            //
+            // The two halves are ONE test, not two, and that is the whole point. Written
+            // as "rank OR we foul it", each of a pair could take the block off the other
+            // whenever each stood on the other's road: L-030 (senior) and L-042 each had
+            // cars on the other's plan, so #Y-#S1203#T changed hands about once a second
+            // for minutes on end. Every swap dropped the loser's authority to nothing,
+            // which is a target of zero, which is a FULL brake application — so the
+            // trains alternated notch three and an emergency-looking stop, over and
+            // over, and neither got anywhere. An interlocking rule that can call each of
+            // a pair the one to give way is the same fault as an order that can call
+            // each of them the senior; see Outranks.
+            //
+            // So: fouling does not ADD to rank, it INVERTS it. The train in the way is
+            // the one that may take the block, and the senior it is blocking may not
+            // take it back. Both readings are the negation of each other, so exactly one
+            // of any pair can ever take rail from the other, and the ledger settles.
+            if (Outranks(run, other))
+                return !FoulsPlanAhead(run, other); // it needs this rail to pull off ours
+            return FoulsPlanAhead(other, run);      // we stand on its road — let us move
         }
 
         /// <summary>Which test in <see cref="CanTakeOver"/> refused, in words. Built only
@@ -616,8 +819,12 @@ namespace DvMod.Autopilot
             if (track != null && other.pathFrom + 1 < other.path.Count
                 && other.path[other.pathFrom + 1] == track)
                 return "holder-standing-at-it";
-            return Outranks(run, other)
-                ? "we-outrank"
+            if (Outranks(run, other))
+                return FoulsPlanAhead(run, other)
+                    ? "holder-stands-on-our-road" // junior in the way: it goes first
+                    : "we-outrank";
+            return FoulsPlanAhead(other, run)
+                ? "holder-blocked-by-us"
                 : $"holder-senior({RankName(other)}/{RankName(run)}"
                     + $" seq={other.seq}/{run.seq})";
         }
@@ -639,7 +846,7 @@ namespace DvMod.Autopilot
                 }
                 takeFrom = guid;
             }
-            if (WantedByOlder(track, run, out holder))
+            if (!ours && QueuedAgainstUs(track, run, out holder))
             {
                 string who = holder;
                 Trace.Line("GRANT", () => $"{run.id} trk={Trace.Id(track)} -> DENIED"
@@ -738,7 +945,7 @@ namespace DvMod.Autopilot
                 }
                 takeFrom = guid;
             }
-            if (WantedByOlder(junction, run, out holder))
+            if (!held && QueuedAgainstUs(junction, run, out holder))
             {
                 string who = holder;
                 Trace.Line("JUNC", () => $"{run.id} {Jn(junction)} -> DENIED"
@@ -863,7 +1070,7 @@ namespace DvMod.Autopilot
         /// </summary>
         private static double ExtendAuthority(
             Run run, List<RailTrack> path, int idx, RailTrack track, double bogieSpan,
-            bool towardOut, double ownLead, double need,
+            bool towardOut, double ownLead, double need, double stopFloor,
             out string heldBy, out string atName, out RailTrack? blockedTrack,
             int legEnd = int.MaxValue)
         {
@@ -907,6 +1114,32 @@ namespace DvMod.Autopilot
                     next = path[i + 1];
                     junction = JunctionBetween(t, next);
                     nextOut = EnterIsIn(next, t);
+                }
+                else if (Turntables.AsBridge(t) != null)
+                {
+                    // A turntable bridge is where the road STOPS, off the plan.
+                    //
+                    // Everywhere else, "follow the switches as they lie" is right: the
+                    // train really will go where the points send it. A bridge is not
+                    // points. What lies beyond it is whichever stall it happens to be
+                    // pointed at this second, and the entire purpose of the move is to
+                    // turn it somewhere else — so the rail past it is rail this train
+                    // will never touch.
+                    //
+                    // Walking through it authorised L-009 into HB-T13P, a stall it was
+                    // not going to, with somebody's stock parked on it. That block cut
+                    // its authority to 18 m, which is a target of zero, which is a full
+                    // brake application — and it stuck there for good, because the
+                    // bridge is only ever turned by a train that is standing ON it and
+                    // L-009 was now forbidden to reach it.
+                    //
+                    // Authority therefore ends at the bridge, which is exactly where the
+                    // train is going: a wind is a dead stand aboard, every time.
+                    var bridge = t;
+                    Trace.Line("AUTH", () => $"{run.id} walk ends on the turntable bridge"
+                        + $" {Trace.Id(bridge)} — past the plan, and the road beyond a"
+                        + " bridge is not decided until it is turned");
+                    break;
                 }
                 else
                 {
@@ -1045,6 +1278,38 @@ namespace DvMod.Autopilot
                     && (!StandsClear(keep) || NoRoom(keep)))
                 {
                     var give = chain[keep - 1];
+                    // Never below the distance the train needs to STOP in.
+                    //
+                    // This rule picks where a train comes to rest, and at a yard throat
+                    // it can find nowhere at all: every block is a junction leg 3 to 50
+                    // metres long and no 89 m consist stands clear of a frog anywhere in
+                    // them. It then popped the whole road — L-055 went from 198.7 m of
+                    // authority to nothing in a single tick, at 25 km/h, with 138 m of
+                    // clear rail in front of it. Authority of nothing is a target of
+                    // nothing, which is a full brake application: the train stood on its
+                    // nose in the middle of the throat for no reason on the ground.
+                    //
+                    // Where to stop is a question about a train that is going to stop.
+                    // It cannot be allowed to answer with less road than the train
+                    // needs to stop in, because that answer is not "stop there", it is
+                    // "you should already have stopped" — and there is no braking a
+                    // train into rail it has passed. Keep those blocks: the train is
+                    // going over them whatever the ledger says, and holding rail it will
+                    // physically occupy is the honest reading. As it slows the floor
+                    // falls away with the square of the speed, and by the time it
+                    // matters where the train stands the rule has its full say again.
+                    if (granted - give.span - ownLead < stopFloor)
+                    {
+                        var kept = give.track;
+                        double keptSpan = give.span;
+                        int k1 = keep;
+                        Trace.Line("AUTH", () => $"{run.id} clear-stand: keeping"
+                            + $" {Trace.Id(kept)} and everything behind it — popping it"
+                            + $" leaves {Trace.M(granted - keptSpan - ownLead)} to stop"
+                            + $" in and this train needs {Trace.M(stopFloor)}"
+                            + $" (keep={k1}/{chain.Count})");
+                        break;
+                    }
                     granted -= give.span;
                     // Hand the rail back as well: holding a leg we have decided not to
                     // enter is the same blockage by another name.

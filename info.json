@@ -2,7 +2,7 @@
   "Id": "Autopilot",
   "DisplayName": "Autopilot",
   "Author": "Andrei-Alexandru Tudor",
-  "Version": "0.2.0",
+  "Version": "0.3.0",
   "AssemblyName": "Autopilot.dll",
   "EntryMethod": "DvMod.Autopilot.Main.Load",
   "Requirements": [ "CommsRadioAPI", "MessageBox" ],

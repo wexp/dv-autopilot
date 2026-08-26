@@ -162,6 +162,48 @@ namespace DvMod.Autopilot
         }
 
         /// <summary>
+        /// True when any car of this consist stands within <paramref name="clear"/>
+        /// metres of the pit, measured along its STALL track to the pit end. A bridge
+        /// girder sweeps the rim as it turns, so anything left standing at an
+        /// unaligned pit gets hit — which is what happened to L-040 at HB, stopped
+        /// with its nose 3.4 m short of the rim while the table was wound under it.
+        /// Bogies on the bridge itself do not count: a consist properly aboard turns
+        /// with the table.
+        /// </summary>
+        public static bool FoulingPit(TrainCar? loco, TurntableRailTrack tt, double clear)
+        {
+            var cars = loco?.trainset?.cars;
+            if (cars == null)
+                return false;
+            EnsureIndex();
+            foreach (var c in cars)
+            {
+                if (c == null)
+                    continue;
+                foreach (var b in c.Bogies)
+                {
+                    var t = b?.track;
+                    if (t == null || !stalls!.TryGetValue(t, out var controller))
+                        continue;
+                    if (controller.turntable != tt)
+                        continue;
+                    var end = tt.GetTrackEnd(t);
+                    if (end == null)
+                        continue;
+                    // isFirst: the stall's IN end is the one facing the pit, so the
+                    // pit is at span 0; otherwise it is at the far end of the span.
+                    double span = b!.traveller.Span;
+                    double toPit = end.isFirst
+                        ? span
+                        : t.GetKinkedPointSet().span - span;
+                    if (toPit < clear)
+                        return true;
+                }
+            }
+            return false;
+        }
+
+        /// <summary>
         /// The edges the rail graph does not show: a turntable bridge reaches every
         /// one of its stall tracks after a wind of the table, and a stall track
         /// reaches the bridge the same way. Only offered when the consist fits the

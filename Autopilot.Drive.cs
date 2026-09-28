@@ -34,6 +34,11 @@ namespace DvMod.Autopilot
             var controller = run.controller;
             var overrider = controller.controlsOverrider;
             var bogie = car.Bogies[1];
+            // A valid route is meaningless if the driven locomotive's train-brake
+            // valve is cut out: the stop curve commands air but produces no braking.
+            // Reassert one cut-in valve before releasing handbrakes or permitting
+            // any traction.
+            EnsureOneBrakeCutIn(car, car);
             overrider.IndependentBrake?.Set(0f);
             ReleaseHandbrakes(car);
             float prevReverser = float.NaN; // no leg driven yet
